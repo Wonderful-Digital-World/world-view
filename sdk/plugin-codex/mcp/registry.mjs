@@ -12,6 +12,8 @@ import { mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync, openSync, 
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { SAFE_LABEL_RE } from "./format.mjs";
+
 const DATA_DIR = process.env.TINYPLACE_CODEX_HOME ?? join(homedir(), ".tinyplace-codex");
 // A session is considered live within this window of its last heartbeat.
 const LIVE_WINDOW_MS = Number(process.env.TINYPLACE_SESSION_LIVE_MS) || 30_000;
@@ -128,7 +130,10 @@ export function allocateLabel(agentAddress, { requested, harnessSessionId } = {}
   const all = readSessions(agentAddress);
   const liveLabels = new Set(all.filter((e) => e.live).map((e) => e.label));
   const req = requested?.trim();
-  if (req && !liveLabels.has(req)) return req;
+  // Only honor a requested label that satisfies the routing contract (format.mjs
+  // drops anything else at encode/decode) — otherwise fall through to a generated
+  // safe `codex:<n>`.
+  if (req && SAFE_LABEL_RE.test(req) && !liveLabels.has(req)) return req;
   if (harnessSessionId) {
     const mine = all
       .filter((e) => e.harnessSessionId && e.harnessSessionId === harnessSessionId)
@@ -200,6 +205,13 @@ export function claimLabel(agentAddress, { requested, harnessSessionId, cwd, sta
 export function writePresence(agentAddress, { label, harnessSessionId, cwd, startedAt }) {
   const dir = sessionsDir(agentAddress);
   mkdirSync(dir, { recursive: true });
+  const path = join(dir, presenceFile(label));
+  // Ownership guard: a process that resumed after its heartbeat expired must not
+  // overwrite a label a newer live session has since reclaimed.
+  const existing = readEntryFile(path);
+  if (existing && existing.pid !== process.pid && isLive(existing)) {
+    throw new Error(`Session label ${label} is owned by another live process`);
+  }
   const now = new Date().toISOString();
   const entry = {
     label,
@@ -209,14 +221,19 @@ export function writePresence(agentAddress, { label, harnessSessionId, cwd, star
     startedAt: startedAt ?? now,
     updatedAt: now,
   };
-  writeFileSync(join(dir, presenceFile(label)), JSON.stringify(entry) + "\n", { mode: 0o600 });
+  writeFileSync(path, JSON.stringify(entry) + "\n", { mode: 0o600 });
   return entry;
 }
 
-// Remove this session's presence file (on switch/teardown). Best-effort.
+// Remove this session's presence file (on switch/teardown). Best-effort. Only
+// removes a file THIS process still owns, so we can't delete a label another
+// live session reclaimed after ours expired.
 export function removePresence(agentAddress, label) {
   try {
-    rmSync(join(sessionsDir(agentAddress), presenceFile(label)));
+    const path = join(sessionsDir(agentAddress), presenceFile(label));
+    const existing = readEntryFile(path);
+    if (!existing || existing.pid !== process.pid) return;
+    rmSync(path);
   } catch {
     /* already gone */
   }
