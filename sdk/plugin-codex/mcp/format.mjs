@@ -78,6 +78,10 @@ function minuteBucket(date) {
 export function encodeEnvelope(opts) {
   const now = new Date();
   const label = opts.fromSession || sessionLabel();
+  // decodeEnvelope() drops any label failing safeLabel(), so emitting an unsafe
+  // one silently strips routing (a targeted DM becomes untargeted). Fail here
+  // instead of shipping a non-routable envelope.
+  if (!safeLabel(label)) throw new Error(`Invalid session label: ${label}`);
   const role = opts.role === "user" ? "user" : "agent";
   const envelope = {
     envelope_version: SESSION_ENVELOPE_VERSION,
@@ -105,7 +109,11 @@ export function encodeEnvelope(opts) {
     source: { path: "plugin", record_type: "dm" },
     tp: { v: PLUGIN_TP_VERSION, from_session: label },
   };
-  if (opts.toSession) envelope.tp.to_session = opts.toSession;
+  if (opts.toSession) {
+    const toSession = safeLabel(opts.toSession);
+    if (!toSession) throw new Error(`Invalid target session label: ${opts.toSession}`);
+    envelope.tp.to_session = toSession;
+  }
   if (opts.inReplyTo) envelope.tp.in_reply_to = opts.inReplyTo;
   if (opts.auto) envelope.tp.auto = true;
   return JSON.stringify(envelope);
