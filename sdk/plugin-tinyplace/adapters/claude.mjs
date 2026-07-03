@@ -94,7 +94,13 @@ export const claudeAdapter = {
           "server:tinyplace",
           ...ctx.forwardedArgs,
         ],
-        env: { TINYPLACE_ACTIVE_WALLET: ctx.walletName },
+        // TINYPLACE_PLUGIN_ROOT is the shared token the hooks/hooks.json commands
+        // expand (`node "${TINYPLACE_PLUGIN_ROOT}/hooks/surface-inbound.mjs"`).
+        // Codex's installer substitutes it at install time; Claude consumes the
+        // shared hooks.json directly, so it must reach the hook subprocess as an
+        // env var or inbound surfacing + the Stop autoresponder break. Keep the
+        // shared token in hooks.json (codex depends on it) and set the env here.
+        env: { TINYPLACE_ACTIVE_WALLET: ctx.walletName, TINYPLACE_PLUGIN_ROOT: ctx.pluginDir },
       };
     },
   },
