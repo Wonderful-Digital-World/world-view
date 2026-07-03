@@ -22,7 +22,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -43,21 +43,27 @@ const REAL_CODEX_HOME = process.env.CODEX_HOME ?? join(homedir(), ".codex");
 // ── wallet store (mirrors mcp/server.mjs byte-for-byte) ──────────────────────
 function loadWallets() {
   if (!existsSync(WALLETS_FILE)) return [];
+  // Surface a corrupt/unreadable store instead of returning [] — a silent empty
+  // list would let the next create/import overwrite wallets.json and lose secrets.
   try {
     const parsed = JSON.parse(readFileSync(WALLETS_FILE, "utf8"));
     return Array.isArray(parsed?.wallets) ? parsed.wallets : [];
-  } catch {
-    return [];
+  } catch (error) {
+    throw new Error(`Could not read wallet store at ${WALLETS_FILE}: ${error.message}`);
   }
 }
 function saveWallets(wallets) {
   mkdirSync(DATA_DIR, { recursive: true });
-  writeFileSync(WALLETS_FILE, JSON.stringify({ wallets }, null, 2) + "\n", { mode: 0o600 });
+  // Write to a temp file then rename — an atomic publish so a crash/partial write
+  // can never truncate or clobber the existing wallets.json.
+  const tmp = join(DATA_DIR, `.wallets.${process.pid}.tmp`);
+  writeFileSync(tmp, JSON.stringify({ wallets }, null, 2) + "\n", { mode: 0o600 });
   try {
-    chmodSync(WALLETS_FILE, 0o600);
+    chmodSync(tmp, 0o600);
   } catch {
     /* best-effort */
   }
+  renameSync(tmp, WALLETS_FILE);
 }
 function hexToBytes(hex) {
   const out = new Uint8Array(hex.length / 2);
