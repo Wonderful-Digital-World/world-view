@@ -147,11 +147,13 @@ async function drainInbound() {
     const pendingByLabel = new Map(); // label -> [decoded]
     let headlessPending = false;
     for (const raw of messages) {
-      const { auto, inReplyTo, text, messageId, fromSession, role, toSession } = decodeBody(raw.text);
+      const { auto, inReplyTo, text, messageId, fromSession, fromSessionUuid, role, toSession, toSessionUuid } = decodeBody(raw.text);
       if (text === RESET_SENTINEL) continue; // handshake ping — consumed on decrypt
       // Correlate on the in-body envelope id when present, else the relay id.
       const id = messageId ?? raw.id;
-      const decoded = { id, from: raw.from, fromSession, role, text, inReplyTo, toSession, ts: raw.timestamp ?? new Date().toISOString() };
+      // Carry the conversation uuids so enqueueRouted can do reuse-proof routing and
+      // held/closed mail keeps the sender's conversation id for the notice.
+      const decoded = { id, from: raw.from, fromSession, fromSessionUuid, role, text, inReplyTo, toSession, toSessionUuid, ts: raw.timestamp ?? new Date().toISOString() };
       const { target } = enqueueRouted(AGENT, decoded); // route to the session inbox(es)
       // Non-auto messages need a reply (loop guard: an auto-tagged reply is never
       // itself answered).
@@ -161,7 +163,7 @@ async function drainInbound() {
           if (!pendingByLabel.has(label)) pendingByLabel.set(label, []);
           pendingByLabel.get(label).push(decoded);
         }
-      } else if (!decoded.toSession) {
+      } else if (!decoded.toSession && !decoded.toSessionUuid) {
         // Untargeted + no live session → isolated responder (headless agent still
         // auto-replies).
         enqueueForAutoResponse(decoded);

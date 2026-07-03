@@ -36,9 +36,39 @@ const TRIGGER =
 // injecting into one session never suppresses injecting into another.
 const COOLDOWN_MS = Number(process.env.TINYPLACE_INJECT_COOLDOWN_MS) || 4000;
 const lastInject = new Map(); // `${socket}\0${pane}` -> timestamp
+const pendingTimers = new Map(); // key -> deferred re-inject timer
 
 function enabled() {
   return process.env.TINYPLACE_FOREGROUND_RESOLVE !== "off";
+}
+
+// Type the trigger into a pane. Returns true if the keys were sent. Best-effort:
+// tmux missing / pane gone → false. `--` guards a trigger starting with '-'; -l
+// sends the string literally, a separate Enter submits the turn.
+function sendKeys(socket, pane) {
+  const S = socket ? ["-S", socket] : [];
+  try {
+    execFileSync("tmux", [...S, "send-keys", "-t", String(pane), "-l", "--", TRIGGER], { stdio: "ignore" });
+    execFileSync("tmux", [...S, "send-keys", "-t", String(pane), "Enter"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Suppressed by cooldown: a batch may have arrived AFTER the last wake's turn went
+// idle, so schedule ONE re-inject for when the window expires (guaranteeing the idle
+// pane wakes to drain it). Coalesced per pane; a redundant wake just drains an empty
+// inbox. unref so it never keeps the process alive.
+function scheduleDeferred(key, socket, pane) {
+  if (pendingTimers.has(key)) return;
+  const wait = Math.max(0, COOLDOWN_MS - (Date.now() - (lastInject.get(key) ?? 0))) + 50;
+  const t = setTimeout(() => {
+    pendingTimers.delete(key);
+    if (sendKeys(socket, pane)) lastInject.set(key, Date.now());
+  }, wait);
+  if (typeof t?.unref === "function") t.unref();
+  pendingTimers.set(key, t);
 }
 
 // Pure predicate: does the active harness opt into foreground inject? Unit-testable.
@@ -77,20 +107,16 @@ export function foregroundInject(address, messages, opts = {}) {
   const now = Date.now();
   const key = `${target.socket}\0${target.pane}`;
   const last = lastInject.get(key) ?? 0;
-  // Recently injected — the pending batch will be drained by that turn.
-  if (now - last < COOLDOWN_MS) return { injected: true, reason: "cooldown" };
-  // Target the SAME tmux server the session lives on (`-S <socket>`) — a wrapped
-  // plain terminal runs on a dedicated socket, not the default one.
-  const S = target.socket ? ["-S", target.socket] : [];
-  try {
-    // -l sends the string literally (so it isn't parsed as tmux key names); a
-    // separate Enter submits the turn. `--` guards a trigger that starts with '-'.
-    execFileSync("tmux", [...S, "send-keys", "-t", String(target.pane), "-l", "--", TRIGGER], { stdio: "ignore" });
-    execFileSync("tmux", [...S, "send-keys", "-t", String(target.pane), "Enter"], { stdio: "ignore" });
+  if (now - last < COOLDOWN_MS) {
+    // Recently injected — coalesce, but ensure THIS batch still gets a wake once the
+    // window passes (the earlier turn may have finished before it arrived).
+    scheduleDeferred(key, target.socket, target.pane);
+    return { injected: true, reason: "cooldown" };
+  }
+  if (sendKeys(target.socket, target.pane)) {
     lastInject.set(key, now);
     return { injected: true, reason: "sent" };
-  } catch {
-    // tmux missing / pane gone / not a tmux env → headless fallback.
-    return { injected: false, reason: "tmux-failed" };
   }
+  // tmux missing / pane gone / not a tmux env → headless fallback.
+  return { injected: false, reason: "tmux-failed" };
 }

@@ -342,7 +342,8 @@ async function maybeRecoverSession(peer) {
 // (→ fall back to label routing) if the original was already drained from the buffer.
 function replyConvUuid(inReplyTo) {
   if (!inReplyTo || !session) return null;
-  return session.buffer.find((m) => String(m.id) === String(inReplyTo))?.fromSessionUuid ?? null;
+  // Prefer the durable map (survives an inbox drain); fall back to a still-buffered msg.
+  return session.convByMsgId.get(String(inReplyTo)) ?? session.buffer.find((m) => String(m.id) === String(inReplyTo))?.fromSessionUuid ?? null;
 }
 
 async function dispatchSend({ to, text, role, toSession, toSessionUuid, inReplyTo, auto }) {
@@ -420,6 +421,12 @@ async function buildClient(seedHex) {
 //   "auto"           — an auto-tagged reply; buffered only (loop guard: never answered)
 //   "needs-response" — a fresh peer DM buffered and awaiting a reply
 function deliverToSession(msg, { auto }) {
+  // Remember the sender's conversation uuid keyed by message id, so a later reply
+  // (in_reply_to) can echo it as to_session_uuid even after `inbox` drained buffer.
+  if (msg.fromSessionUuid && msg.id != null) {
+    session.convByMsgId.set(String(msg.id), msg.fromSessionUuid);
+    if (session.convByMsgId.size > 500) session.convByMsgId.delete(session.convByMsgId.keys().next().value);
+  }
   const waiterIndex = session.waiters.findIndex((w) => w.match(msg));
   if (waiterIndex !== -1) {
     const [waiter] = session.waiters.splice(waiterIndex, 1);
@@ -630,6 +637,9 @@ async function adopt(walletName, { label } = {}) {
     client,
     store,
     buffer: [],
+    // msgId → sender conversation uuid, for reply echo. Kept SEPARATE from buffer so
+    // draining the inbox (which clears buffer) doesn't lose the reply-address binding.
+    convByMsgId: new Map(),
     waiters: [],
     ws: null,
     pollTimer: null,

@@ -333,6 +333,13 @@ function launch(walletName, forwardedArgs) {
   if (!canForegroundInject(ADAPTER) || process.env.TMUX) return launchDirect(plan);
   if (!tmuxAvailable()) {
     process.stdout.write(`  ${C.yellow}tmux not found${C.reset} — needed so the agent can answer inbound DMs in-context.\n`);
+    // Only auto-install (a privileged `sudo`/brew step) when interactive and not
+    // opted out — never from a scripted `--wallet`/CI invocation.
+    const mayInstall = Boolean(process.stdout.isTTY) && !process.env.TINYPLACE_NO_AUTO_INSTALL;
+    if (!mayInstall) {
+      process.stdout.write(`  ${C.dim}Skipping tmux auto-install (non-interactive or TINYPLACE_NO_AUTO_INSTALL set); launching without it (auto-replies use an isolated context).${C.reset}\n`);
+      return launchDirect(plan);
+    }
     if (!installTmux()) {
       process.stdout.write(`  ${C.dim}Could not install tmux; launching without it (auto-replies use an isolated context).${C.reset}\n`);
       return launchDirect(plan);

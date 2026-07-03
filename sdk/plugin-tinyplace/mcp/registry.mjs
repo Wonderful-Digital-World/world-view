@@ -25,29 +25,34 @@ const LIVE_WINDOW_MS = Number(process.env.TINYPLACE_SESSION_LIVE_MS) || 30_000;
 // Keyed by the harness session id (stable across `claude --resume`) so a resumed
 // session keeps its identity; when the harness exposes no session id we fall back to a
 // process-stable random (still unique + non-reusable, just not stable across restart).
-function uuidMapFile() {
-  return join(harnessDataDir(), "session-uuids.json");
+// One file per harness session id (not a shared blob), so concurrent first-writes
+// for different sessions can't clobber each other's mapping. Exclusive-create CAS:
+// on a race, the loser reads the winner's uuid.
+function sessionUuidDir() {
+  return join(harnessDataDir(), "session-uuids");
 }
 let processUuid = null;
 export function resolveSessionUuid(harnessSessionId) {
   const hsid = (harnessSessionId ?? "").trim();
   if (!hsid) return (processUuid ??= randomUUID());
-  let map = {};
+  const dir = sessionUuidDir();
+  const path = join(dir, encodeURIComponent(hsid) + ".json");
+  const existing = readEntryFile(path);
+  if (existing?.uuid) return existing.uuid;
+  const uuid = randomUUID();
   try {
-    map = JSON.parse(readFileSync(uuidMapFile(), "utf8")) ?? {};
-  } catch {
-    map = {};
+    mkdirSync(dir, { recursive: true });
+    const fd = openSync(path, "wx", 0o600); // CAS: first writer wins this hsid
+    try {
+      writeSync(fd, JSON.stringify({ uuid, harnessSessionId: hsid }) + "\n");
+    } finally {
+      closeSync(fd);
+    }
+  } catch (e) {
+    if (e?.code === "EEXIST") return readEntryFile(path)?.uuid ?? uuid; // racer won — use theirs
+    /* other write error → fall back to the freshly minted value for this process */
   }
-  if (typeof map[hsid] === "string" && map[hsid]) return map[hsid];
-  const u = randomUUID();
-  map[hsid] = u;
-  try {
-    mkdirSync(harnessDataDir(), { recursive: true });
-    writeFileSync(uuidMapFile(), JSON.stringify(map, null, 2) + "\n", { mode: 0o600 });
-  } catch {
-    /* best-effort — fall back to the freshly minted value for this process */
-  }
-  return u;
+  return uuid;
 }
 
 // Synchronous sleep (no async yield) so claimLabel's CAS retry is indivisible.
