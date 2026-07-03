@@ -12,7 +12,10 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-if (process.env.TINYPLACE_NO_AUTORESPOND) process.exit(0);
+// NO_AUTORESPOND = the recursion guard on responder sessions. AUTORESPOND=off =
+// the user explicitly disabled autoresponding (mirrors the daemon's own gate) —
+// honor it here too, before we claim any queued DMs and spawn a responder.
+if (process.env.TINYPLACE_NO_AUTORESPOND || process.env.TINYPLACE_AUTORESPOND === "off") process.exit(0);
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.TINYPLACE_CODEX_HOME ?? join(homedir(), ".tinyplace-codex");
