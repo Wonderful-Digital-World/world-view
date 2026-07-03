@@ -41,6 +41,7 @@ function runNode(script, { stdin = "", env = {} } = {}) {
   return spawnSync("node", [join(HERE, "hooks", script)], {
     input: stdin,
     encoding: "utf8",
+    timeout: 5000, // fail fast instead of hanging CI if a hook ever blocks on stdin
     env: { ...process.env, TINYPLACE_CODEX_HOME: HOME, ...env },
   });
 }
@@ -108,6 +109,7 @@ try {
     const r = spawnSync("node", [join(HERE, "hooks", "surface-inbound.mjs")], {
       input: JSON.stringify({ hook_event_name: "SessionStart" }),
       encoding: "utf8",
+      timeout: 5000,
       env: { ...process.env, TINYPLACE_CODEX_HOME: HOME2 },
     });
     check("surface no-active exits silent", r.status === 0 && r.stdout.trim() === "", `stdout='${r.stdout.trim()}'`);
