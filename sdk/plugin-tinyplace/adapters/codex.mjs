@@ -48,8 +48,13 @@ export const codexAdapter = {
   responder: {
     command: "codex",
     defaultModel: "gpt-5.4-mini",
+    // This responder feeds ATTACKER-CONTROLLED DM text into `codex exec`, so it
+    // runs in the most restrictive unattended mode: `--sandbox read-only` (NEVER
+    // `--dangerously-bypass-approvals-and-sandbox`) so a prompt-injected message
+    // cannot reach the shell or the filesystem — the only side-effecting path is
+    // the `auto_reply` MCP tool. `--skip-git-repo-check` lets it run outside a repo.
     buildArgs(prompt, model /* pluginRoot unused: MCP comes from CODEX_HOME */) {
-      return ["exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-m", model, prompt];
+      return ["exec", "--sandbox", "read-only", "--skip-git-repo-check", "-m", model, prompt];
     },
   },
 
