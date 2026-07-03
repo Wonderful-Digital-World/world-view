@@ -2,7 +2,7 @@
 // acquire/steal-stale/heartbeat/release, plus a real two-process race that must
 // yield exactly one winner.
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, mkdirSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -128,6 +128,38 @@ expect("3-way stale-steal race → exactly one WIN", stealResults.filter((r) => 
   expect("outbox reclaims exactly the dead owner's job", claimed.length === 1 && claimed[0].job.id === "jobDead");
   expect("outbox leaves the live owner's in-flight claim untouched", existsSync(liveClaim) === true);
   claimed.forEach((c) => c.done());
+}
+
+// ── outbox unknown-owner (unparseable) claim: age-gated requeue under real name ──
+// An old-format/corrupt claim like `.sending-<job>.json` has no owner pid. It must
+// requeue only past the age gate, and must be restored to its ORIGINAL name — the
+// generic `.sending-` prefix has to be stripped (else it renames to itself and is
+// silently dropped).
+{
+  const AO2 = "AgentOutbox8888888888888888888";
+  const dir = outbox.outboxDir(AO2);
+  mkdirSync(dir, { recursive: true });
+  const staleClaim = join(dir, ".sending-staleUnknown.json");
+  writeFileSync(staleClaim, JSON.stringify({ id: "staleUnknown", to: "PeerZ", text: "hi" }) + "\n");
+  const old = new Date(Date.now() - 120000); // backdate past STALE_CLAIM_MS (60s)
+  utimesSync(staleClaim, old, old);
+
+  const claimed = outbox.claimOutboxJobs(AO2);
+  expect("outbox requeues an aged unknown-owner claim under its original name", claimed.length === 1 && claimed[0].job.id === "staleUnknown");
+  expect("outbox stripped the .sending- prefix (not a rename-to-self)", existsSync(staleClaim) === false);
+  claimed.forEach((c) => c.done());
+}
+
+// a FRESH unknown-owner claim is left alone (age gate protects an in-flight send)
+{
+  const AO3 = "AgentOutbox9999999999999999999";
+  const dir = outbox.outboxDir(AO3);
+  mkdirSync(dir, { recursive: true });
+  const freshClaim = join(dir, ".sending-freshUnknown.json");
+  writeFileSync(freshClaim, JSON.stringify({ id: "freshUnknown", to: "PeerZ", text: "hi" }) + "\n");
+
+  const claimed = outbox.claimOutboxJobs(AO3);
+  expect("outbox leaves a fresh unknown-owner claim untouched (age gate)", claimed.length === 0 && existsSync(freshClaim) === true);
 }
 
 sleeper.kill("SIGKILL");

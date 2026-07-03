@@ -47,7 +47,10 @@ function recoverStaleClaims(dir) {
   for (const f of files) {
     const p = join(dir, f);
     const m = /^\.sending-(\d+)-(.+)$/.exec(f);
-    const orig = m ? m[2] : f.replace(/^\.sending-\d+-/, "");
+    // For a parseable name use the captured job; otherwise strip the generic
+    // `.sending-` prefix so an unknown-owner claim requeues under its real name
+    // (a `\d+-` strip would leave `.sending-job.json` unchanged → rename-to-self).
+    const orig = m ? m[2] : f.replace(/^\.sending-/, "");
     if (!orig.endsWith(".json")) continue;
     try {
       if (m) {
