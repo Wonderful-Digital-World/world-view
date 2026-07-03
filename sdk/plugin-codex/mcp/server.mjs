@@ -63,6 +63,17 @@ process.on("uncaughtException", (err) => {
   try { process.stderr.write(`tinyplace: uncaughtException: ${err?.stack ?? err}\n`); } catch {}
 });
 
+// Bound a network-bound promise so a stalled relay can never hang a tool handler.
+// Codex kills the MCP transport if a tool call doesn't return, so every await
+// that touches the relay during `use` must be time-boxed — a stall degrades to a
+// (caught) rejection, the tool still returns, and the transport stays alive.
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+  ]);
+}
+
 // ── storage ────────────────────────────────────────────────────────────────
 const DATA_DIR = process.env.TINYPLACE_CODEX_HOME ?? join(homedir(), ".tinyplace-codex");
 const WALLETS_FILE = join(DATA_DIR, "wallets.json");
@@ -596,10 +607,10 @@ async function adopt(walletName, { label } = {}) {
   };
   let keysPublished = false;
   let cardPublished = false;
-  try { await publishKeys(client, signer); keysPublished = true; } catch {}
+  try { await withTimeout(publishKeys(client, signer), 10000, "publishKeys"); keysPublished = true; } catch {}
   try {
     const now = new Date().toISOString();
-    await client.directory.upsertAgent(signer.agentId, {
+    await withTimeout(client.directory.upsertAgent(signer.agentId, {
       agentId: signer.agentId,
       name: wallet.name,
       description: `tiny.place agent ${wallet.name}`,
@@ -610,7 +621,7 @@ async function adopt(walletName, { label } = {}) {
       publicKey: signer.publicKeyBase64,
       createdAt: now,
       updatedAt: now,
-    });
+    }), 10000, "upsertAgent");
     cardPublished = true;
   } catch {}
   if (process.env.TINYPLACE_SEND_ONLY) {
