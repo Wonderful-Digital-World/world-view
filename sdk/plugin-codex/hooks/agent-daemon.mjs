@@ -210,6 +210,18 @@ async function drainOutbound() {
   const jobs = claimOutboxJobs(AGENT);
   for (const { job, done, fail } of jobs) {
     try {
+      // Control job: a session asked us (the ratchet owner) to reset a peer's
+      // Signal session and optionally re-handshake — do it here, never in the
+      // session process, so store mutation stays single-writer.
+      if (job.kind === "reset") {
+        try { await store.removeSession(job.to); } catch { /* already gone */ }
+        undecryptableByPeer.set(job.to, 0);
+        if (job.rehandshake !== false) {
+          try { await sendMessage(client, signer, job.to, RESET_SENTINEL); } catch { /* best-effort */ }
+        }
+        done();
+        continue;
+      }
       const { body } = buildEnvelope({
         messageId: job.id,
         text: job.text,

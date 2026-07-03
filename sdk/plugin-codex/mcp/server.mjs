@@ -1161,6 +1161,14 @@ server.registerTool(
       const s = requireActive();
       if (peer) {
         const addr = await resolveRecipientKey(s.client, peer);
+        // In daemon mode the daemon is the sole owner of the Signal store/ratchet;
+        // mutating it here would race its readMessages/sendMessage. Hand the reset
+        // to the daemon via a control outbox job instead of touching the store.
+        if (s.mode === "daemon") {
+          writeOutboxJob(s.address, { id: newMessageId(), kind: "reset", to: addr, rehandshake: rehandshake !== false });
+          s.undecryptableByPeer.set(addr, 0);
+          return ok({ reset: addr, via: "daemon", rehandshaked: rehandshake !== false });
+        }
         await s.store.removeSession(addr);
         s.undecryptableByPeer.set(addr, 0);
         let rehandshaked = false;
