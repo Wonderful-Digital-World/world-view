@@ -99,6 +99,34 @@ install (verified) → keep everything under one package root with one `node_mod
    are removed once consumers migrate). Keeps #214/#212 alive during transition.
 5. Cross-harness `xplugin-e2e` still green (now: one package, two adapters, same network).
 
+## Launcher (one `bin/tinyplace`)
+
+`bin/tinyplace.mjs` is harness-agnostic: it owns the wallet store, the arrow-key menu,
+and the import/register flows, then hands off to `activeAdapter().launch.prepare(ctx)`
+for the `{command, args, env}` that boots THIS harness. The per-harness install step
+(Claude: point `claude --plugin-dir` at the package; Codex: write an isolated
+`CODEX_HOME` with `config.toml` + auto-discovered `hooks.json` + symlinked `auth.json`)
+lives entirely inside each adapter's `launch.prepare`. `--harness <name>` (or
+`TINYPLACE_HARNESS`) forces the adapter; otherwise it auto-detects. Adding a harness
+never touches the launcher.
+
+## Convention for adding a harness (the guardrail)
+
+`adapters/README.md` is the authoring guide — the full field contract table + a
+checklist. `adapter-contract-test.mjs` (in `pnpm test`) structurally enforces that
+contract for EVERY adapter in the `ADAPTERS` map: a missing/wrong-shaped field, a
+shared data dir, a dropped `UNTRUSTED` framing, an inbound with no delivery path, or a
+`launch.prepare` that doesn't return a valid plan all fail CI. A new contributor copies
+an existing adapter, fills the fields, adds a detection signal, and makes the contract
+test green — no core edits, no silent breakage.
+
+## Deferred: shim conversion (step 4 above)
+
+`plugin-codex` is still live as PR #214 and `plugin-claude` is separately published, so
+converting them to re-export shims now would conflict with #214 and couple this PR to
+its merge timing. This package ships **standalone**; the shim conversion is a follow-up
+once #214 lands. The unified package does not import from either old plugin.
+
 ## Success criterion
 
 One `npm i @tinyhumansai/tinyplace-plugin` + `tinyplace`. It works in Codex or Claude
