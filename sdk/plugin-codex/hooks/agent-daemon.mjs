@@ -128,13 +128,57 @@ function maybeSpawnResponder() {
   }, 250);
 }
 
+// ── undecryptable-drop recovery ──────────────────────────────────────────────
+// The SDK silently acks + skips envelopes it can't decrypt (a desynced ratchet),
+// so they vanish with no error. As the sole relay drain in daemon mode we mirror
+// the self-drain recovery: diff a raw read against the decrypted set, and after a
+// couple of drops from one peer, reset the local session with them + send a fresh
+// re-handshake ping (X3DH) that the peer consumes silently, so the channel heals.
+const UNDECRYPTABLE_RESET_THRESHOLD = 2;
+const RECOVER_COOLDOWN_MS = 5 * 60 * 1000;
+const undecryptableByPeer = new Map();
+const lastRecover = new Map();
+
+async function maybeRecoverSession(peer) {
+  const last = lastRecover.get(peer) ?? 0;
+  if (Date.now() - last < RECOVER_COOLDOWN_MS) return;
+  lastRecover.set(peer, Date.now());
+  try {
+    await store.removeSession(peer);
+    undecryptableByPeer.set(peer, 0);
+    await sendMessage(client, signer, peer, RESET_SENTINEL); // fresh PREKEY_BUNDLE
+  } catch { /* best-effort; user can reset_session manually */ }
+}
+
+function recordUndecryptable(dropped) {
+  for (const d of dropped) {
+    const from = String(d.from ?? "unknown");
+    const n = (undecryptableByPeer.get(from) ?? 0) + 1;
+    undecryptableByPeer.set(from, n);
+    if (from !== "unknown" && n >= UNDECRYPTABLE_RESET_THRESHOLD) void maybeRecoverSession(from);
+  }
+}
+
 // ── inbound loop (the only relay drain) ──────────────────────────────────────
 let draining = false;
 async function drainInbound() {
   if (draining) return;
   draining = true;
   try {
+    // Capture raw envelopes BEFORE readMessages acks them, so we can detect the
+    // ones it silently drops (couldn't decrypt) and trigger re-handshake recovery.
+    let rawBefore = [];
+    try {
+      rawBefore = (await client.messages.listRaw(signer.publicKeyBase64))?.messages ?? [];
+    } catch {
+      // raw read failed — skip drop detection this tick
+    }
     const messages = await readMessages(client, signer);
+    if (rawBefore.length) {
+      const gotIds = new Set(messages.map((m) => String(m.id)));
+      const dropped = rawBefore.filter((r) => !gotIds.has(String(r.id)));
+      if (dropped.length) recordUndecryptable(dropped);
+    }
     let enqueuedAny = false;
     for (const raw of messages) {
       const { auto, inReplyTo, text, messageId, fromSession, role, toSession } = decodeBody(raw.text);
