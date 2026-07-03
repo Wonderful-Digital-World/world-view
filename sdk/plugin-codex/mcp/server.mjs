@@ -51,6 +51,18 @@ import { writeOutboxJob } from "./outbox.mjs";
 import { daemonLive } from "./daemon-lock.mjs";
 import { toCryptoId } from "./address.mjs";
 
+// ── keep the MCP transport alive ─────────────────────────────────────────────
+// The server does background relay I/O (poll/drain/contact-poll/ws). On Node
+// >=15 a single unhandled rejection (e.g. a transient staging blip) would crash
+// the process and Codex would report "transport closed", losing every tool.
+// Log and survive instead — the poll loop retries on the next tick.
+process.on("unhandledRejection", (reason) => {
+  try { process.stderr.write(`tinyplace: unhandledRejection: ${reason?.stack ?? reason}\n`); } catch {}
+});
+process.on("uncaughtException", (err) => {
+  try { process.stderr.write(`tinyplace: uncaughtException: ${err?.stack ?? err}\n`); } catch {}
+});
+
 // ── storage ────────────────────────────────────────────────────────────────
 const DATA_DIR = process.env.TINYPLACE_CODEX_HOME ?? join(homedir(), ".tinyplace-codex");
 const WALLETS_FILE = join(DATA_DIR, "wallets.json");

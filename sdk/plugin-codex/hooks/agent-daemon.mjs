@@ -26,6 +26,15 @@ import { claimOutboxJobs } from "../mcp/outbox.mjs";
 import { acquireLock, heartbeatLock, releaseLock } from "../mcp/daemon-lock.mjs";
 import { toCryptoId } from "../mcp/address.mjs";
 
+// Survive transient relay errors — a stray unhandled rejection must not kill the
+// single per-agent daemon (it owns the ratchet); the poll loop retries next tick.
+process.on("unhandledRejection", (reason) => {
+  try { process.stderr.write(`tinyplace-daemon: unhandledRejection: ${reason?.stack ?? reason}\n`); } catch {}
+});
+process.on("uncaughtException", (err) => {
+  try { process.stderr.write(`tinyplace-daemon: uncaughtException: ${err?.stack ?? err}\n`); } catch {}
+});
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = dirname(HERE);
 const DATA_DIR = process.env.TINYPLACE_CODEX_HOME ?? join(homedir(), ".tinyplace-codex");
