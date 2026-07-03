@@ -1,0 +1,61 @@
+# plugin-codex — P0 spike findings
+
+Port of `sdk/plugin-claude` (sanil-23) to OpenAI Codex CLI. Self-contained (own daemon + TUI).
+Cross-provider gateway extraction deferred.
+
+## Codex CLI capabilities (verified on codex-cli 0.142.5)
+
+- **Plugin manager**: `codex plugin add PLUGIN@MARKETPLACE`, `codex plugin marketplace add/list`.
+  Marketplace-snapshot based — heavier than Claude's `--plugin-dir`. Deferred to "scale later".
+- **MCP client**: `codex mcp add <NAME> --env K=V -- <cmd...>` or `[mcp_servers.<NAME>]` in config.toml
+  (`command`, `args`, `env`, `env_vars`, `cwd`, `startup_timeout_sec`). Verify in session with `/mcp`.
+  - **PULL-ONLY**: no server-initiated notifications / push / channel. (Claude plugin's real-time
+    DM-into-session does NOT translate — see inbound surfacing below.)
+- **Hooks**: `hooks.json` (same shape as Claude) or `[hooks]` in config.toml. Events: SessionStart,
+  UserPromptSubmit, Stop, PreToolUse, PostToolUse, SubagentStart/Stop, Pre/PostCompact.
+  - Stdin JSON: `session_id`, `transcript_path`, `cwd`, `hook_event_name`, `model`,
+    `permission_mode`, `turn_id`.
+  - `Stop` fires on **turn complete** (not idle); gets `last_assistant_message`; return
+    `{decision:"block",reason}` to continue session with reason as next prompt.
+  - `SessionStart`/`UserPromptSubmit` can return `{additionalContext}` → injected as developer context.
+  - **Trust**: non-managed command hooks require `/hooks` trust. `--dangerously-bypass-hook-trust`
+    bypasses for automation (our TUI launcher uses this).
+- **Non-interactive**: `codex exec [PROMPT]` (alias `codex e`); reads stdin if no prompt.
+  Used by the auto-responder (replaces Claude's `claude -p`).
+- **Config overrides**: `-c dotted.key=tomlvalue`, `--enable/--disable <feature>`.
+- **Session logs**: JSONL under `~/.codex/sessions/`.
+
+## Install mechanism (MVP = Path B)
+
+- **Path B (MVP)**: TUI writes an isolated `CODEX_HOME` dir with `config.toml`
+  (`[mcp_servers.tinyplace]` + inline `[hooks]` or bundled `hooks.json`), launches
+  `CODEX_HOME=<dir> codex --dangerously-bypass-hook-trust`. Mirrors Claude launcher's `--plugin-dir`
+  isolation. Fully controlled, no marketplace.
+- **Path A (later)**: package as a real Codex marketplace plugin (`codex plugin add tinyplace@...`).
+
+## Open items carried forward
+
+- **O2**: unconfirmed whether Codex passes `session_id` (or any id) as ENV to the MCP subprocess.
+  Verify empirically at P2 first boot (dump `process.env`). Fallback: MCP server self-generates a
+  wrapper session id (`tp-codex-<ts>-<uuid>`) + pid for registry keying (same as harness-wrapper).
+
+## Divergences from plugin-claude (design decisions)
+
+| # | Claude | Codex |
+|---|--------|-------|
+| Inbound real-time | MCP server→client channel push | **pull-only**: agent polls `inbox` tool + hooks inject new DMs as `additionalContext` on next turn |
+| Auto-responder | Stop hook → `claude -p` | Stop hook → `codex exec` (loop-guarded via `auto` flag) |
+| Install | `--plugin-dir` | isolated `CODEX_HOME` (mcp+hooks) [Path B] |
+| Surface | commands/*.md + skills/*/SKILL.md | AGENTS.md + README (Codex has neither slash-cmd-md nor skills) |
+| Config dir | `~/.tinyplace-claude` | `~/.tinyplace-codex` |
+| Session label | `claude:n` | `codex:n` |
+
+## What ports verbatim (pure, provider-agnostic)
+
+`format.mjs` (provider→"codex"), `routing.mjs`, `registry.mjs` (label prefix), `daemon-lock.mjs`,
+`outbox.mjs`, `address.mjs`, `agent-daemon.mjs` (spawn target + dir), `register.mjs`.
+
+## Interop
+
+Both plugins speak `SessionEnvelopeV1` (`tinyplace.harness.session.v1`) → a codex agent and a claude
+agent under different identities can DM each other. Cross-harness E2E is the P6 acceptance proof.
