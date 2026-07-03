@@ -1,0 +1,352 @@
+#!/usr/bin/env node
+// Interactive TUI launcher for the tiny.place plugin ("Door B") — ONE launcher,
+// any harness. Pick / create / register a wallet, then boot a harness session
+// with this plugin wired in and the chosen wallet already active.
+//
+// The launcher itself is harness-agnostic: it owns the wallet store, the menu,
+// and the import/register flows, then hands off to the active adapter's
+// `launch.prepare()` for the {command, args, env} that boots THIS harness. Claude
+// takes a plugin dir directly; Codex gets an isolated CODEX_HOME written for it —
+// both live in the adapter, not here. Adding a new harness = one adapter file, no
+// change to this launcher.
+//
+// Harness selection: `--harness <name>` (or TINYPLACE_HARNESS) forces it; else it
+// auto-detects from the environment (defaults to claude in a plain shell).
+//
+// Usage:
+//   tinyplace                       # interactive TUI (auto-detect harness)
+//   tinyplace --harness codex       # force the Codex adapter
+//   tinyplace --wallet alice        # skip the menu, launch straight in as `alice`
+//   tinyplace -- --resume           # anything after `--` is forwarded to the harness
+
+import { spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
+import { LocalSigner } from "@tinyhumansai/tinyplace";
+
+import { activeAdapter, harnessDataDir } from "../mcp/harness.mjs";
+
+// bin/tinyplace.mjs -> plugin root is one dir up from bin/.
+const PLUGIN_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
+const API_URL = process.env.TINYPLACE_API_URL ?? "https://staging-api.tiny.place";
+const REGISTER_SCRIPT = join(PLUGIN_DIR, "register.mjs");
+
+// Resolved lazily in main() AFTER the --harness flag is folded into env, so the
+// forced adapter (if any) wins detection. These are set once, up front.
+let ADAPTER;
+let DATA_DIR;
+let WALLETS_FILE;
+
+// ── wallet store (mirrors mcp/server.mjs byte-for-byte) ──────────────────────
+function loadWallets() {
+  if (!existsSync(WALLETS_FILE)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(WALLETS_FILE, "utf8"));
+    return Array.isArray(parsed?.wallets) ? parsed.wallets : [];
+  } catch {
+    return [];
+  }
+}
+function saveWallets(wallets) {
+  mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(WALLETS_FILE, JSON.stringify({ wallets }, null, 2) + "\n", { mode: 0o600 });
+  try {
+    chmodSync(WALLETS_FILE, 0o600);
+  } catch {
+    /* best-effort */
+  }
+}
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+async function createWallet(name) {
+  const wallets = loadWallets();
+  if (wallets.some((w) => w.name === name)) throw new Error(`A wallet named '${name}' already exists.`);
+  // Regenerate until slash-free — a `/` in the base64 key breaks the SDK's
+  // keys/messages routing (%2F -> 404), so the wallet couldn't receive DMs.
+  let seedHex, signer;
+  do {
+    seedHex = Buffer.from(randomBytes(32)).toString("hex");
+    signer = await LocalSigner.fromSeed(hexToBytes(seedHex));
+  } while (signer.publicKeyBase64.includes("/"));
+  wallets.push({
+    name,
+    address: signer.agentId,
+    publicKey: signer.publicKeyBase64,
+    secretKey: seedHex,
+    createdAt: new Date().toISOString(),
+  });
+  saveWallets(wallets);
+}
+
+// Base58 decode (Solana secret-key / cryptoId encoding), inline to avoid a dep.
+const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function base58Decode(str) {
+  let num = 0n;
+  for (const ch of str) {
+    const idx = BASE58.indexOf(ch);
+    if (idx === -1) throw new Error(`invalid base58 character '${ch}'`);
+    num = num * 58n + BigInt(idx);
+  }
+  const bytes = [];
+  while (num > 0n) { bytes.unshift(Number(num % 256n)); num /= 256n; }
+  for (const ch of str) { if (ch === "1") bytes.unshift(0); else break; }
+  return Uint8Array.from(bytes);
+}
+
+// Extract the 32-byte Ed25519 seed from whatever the user pastes: a base58 Solana
+// secret key (32 or 64 bytes), a Solana id.json array, or a 64-hex-char seed.
+function parseSecretToSeed(input) {
+  const s = input.trim();
+  if (/^[0-9a-fA-F]{64}$/.test(s)) return hexToBytes(s); // already a 32-byte seed
+  const bytes = s.startsWith("[") ? Uint8Array.from(JSON.parse(s)) : base58Decode(s);
+  if (bytes.length !== 32 && bytes.length !== 64) {
+    throw new Error(`secret key must be 32 or 64 bytes (got ${bytes.length})`);
+  }
+  return bytes.slice(0, 32);
+}
+
+// Import an existing wallet into the store, deriving the same {address, publicKey}
+// the plugin rebuilds via fromSeed. Same seed → same identity as the source wallet.
+async function importWallet(name, secretInput) {
+  const wallets = loadWallets();
+  if (wallets.some((w) => w.name === name)) throw new Error(`A wallet named '${name}' already exists.`);
+  const seed = parseSecretToSeed(secretInput);
+  const signer = await LocalSigner.fromSeed(seed);
+  wallets.push({
+    name,
+    address: signer.agentId,
+    publicKey: signer.publicKeyBase64,
+    secretKey: Buffer.from(seed).toString("hex"),
+    createdAt: new Date().toISOString(),
+  });
+  saveWallets(wallets);
+  return { address: signer.agentId, publicKey: signer.publicKeyBase64 };
+}
+
+// ── tiny ANSI helpers ────────────────────────────────────────────────────────
+const C = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  cyan: "\x1b[36m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+};
+const clear = () => process.stdout.write("\x1b[2J\x1b[H");
+const short = (addr) => (addr ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : "");
+
+// ── line prompt (cooked mode) ────────────────────────────────────────────────
+function prompt(question) {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => rl.question(question, (answer) => {
+    rl.close();
+    resolve(answer.trim());
+  }));
+}
+
+// Like prompt() but does not echo typed/pasted characters — for secret key input,
+// so it doesn't leak into scrollback, screen shares, or terminal recordings.
+function promptHidden(question) {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  process.stdout.write(question);
+  rl._writeToOutput = () => {}; // suppress echo
+  return new Promise((resolve) => rl.question("", (answer) => {
+    process.stdout.write("\n");
+    rl.close();
+    resolve(answer.trim());
+  }));
+}
+
+// ── arrow-key menu (raw mode); resolves selected index, or -1 to cancel ──────
+function menu(subtitle, items) {
+  return new Promise((resolve) => {
+    let idx = 0;
+    const stdin = process.stdin;
+    const render = () => {
+      clear();
+      process.stdout.write(`${C.bold}${C.cyan}  tiny.place${C.reset}  ${C.dim}— open a ${ADAPTER.launch.displayHarness} session as an agent${C.reset}\n\n`);
+      if (subtitle) process.stdout.write(`  ${C.dim}${subtitle}${C.reset}\n\n`);
+      items.forEach((it, i) => {
+        const sel = i === idx;
+        const arrow = sel ? `${C.green}❯${C.reset} ` : "  ";
+        const label = sel ? `${C.bold}${it.label}${C.reset}` : it.label;
+        const hint = it.hint ? `  ${C.dim}${it.hint}${C.reset}` : "";
+        process.stdout.write(`  ${arrow}${label}${hint}\n`);
+      });
+      process.stdout.write(`\n  ${C.dim}↑/↓ move · enter select · q quit${C.reset}\n`);
+    };
+    const onData = (buf) => {
+      const s = buf.toString();
+      if (s === "" || s === "q") return finish(-1);
+      if (s === "[A" || s === "k") idx = (idx - 1 + items.length) % items.length;
+      else if (s === "[B" || s === "j") idx = (idx + 1) % items.length;
+      else if (s === "\r" || s === "\n") return finish(idx);
+      else if (/^[1-9]$/.test(s) && Number(s) <= items.length) return finish(Number(s) - 1);
+      render();
+    };
+    const finish = (result) => {
+      stdin.setRawMode(false);
+      stdin.pause();
+      stdin.removeListener("data", onData);
+      resolve(result);
+    };
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding("utf8");
+    stdin.on("data", onData);
+    render();
+  });
+}
+
+// ── launch the active harness with the plugin + chosen wallet ────────────────
+// Harness-agnostic: the adapter's prepare() returns the {command, args, env} and
+// performs any per-harness install step (e.g. Codex's isolated-home write). This
+// call takes over the terminal (stdio inherited).
+function launch(walletName, forwardedArgs) {
+  clear();
+  let plan;
+  try {
+    plan = ADAPTER.launch.prepare({
+      pluginDir: PLUGIN_DIR,
+      dataDir: DATA_DIR,
+      apiUrl: API_URL,
+      walletName,
+      forwardedArgs,
+    });
+  } catch (error) {
+    console.error(`\nCould not prepare ${ADAPTER.launch.displayHarness}: ${error.message}`);
+    process.exit(1);
+  }
+  process.stdout.write(`${C.green}▶${C.reset} launching ${ADAPTER.launch.displayHarness} as ${C.bold}${walletName}${C.reset} …\n\n`);
+  const child = spawn(plan.command, plan.args, {
+    stdio: "inherit",
+    env: { ...process.env, ...plan.env },
+  });
+  child.on("error", (error) => {
+    console.error(`\nCould not launch '${plan.command}': ${error.message}\n${ADAPTER.launch.notFoundHint ?? ""}`);
+    process.exit(1);
+  });
+  child.on("exit", (code) => process.exit(code ?? 0));
+}
+
+async function registerFlow(wallet) {
+  clear();
+  const base = await prompt(`  Base handle to register for '${wallet.name}': @`);
+  if (!base) return;
+  process.stdout.write(`\n  ${C.yellow}Registering${C.reset} @${base}* for ${wallet.name} (${short(wallet.address)}) on ${C.bold}${API_URL}${C.reset}.\n`);
+  const confirmed = (await prompt("  Type 'yes' to proceed (anything else cancels): ")).toLowerCase() === "yes";
+  if (!confirmed) return;
+  spawnSync("node", [REGISTER_SCRIPT, wallet.name, base], { stdio: "inherit" });
+  await prompt("\n  Press enter to continue…");
+}
+
+async function importFlow() {
+  clear();
+  process.stdout.write(`  ${C.dim}Import an existing wallet — paste a base58 Solana secret key, a Solana${C.reset}\n`);
+  process.stdout.write(`  ${C.dim}id.json array, or a 32-byte seed in hex.${C.reset}\n`);
+  process.stdout.write(`  ${C.yellow}The secret is stored locally (0600). Input is hidden (not echoed).${C.reset}\n\n`);
+  const name = await prompt("  Name for this wallet (e.g. main): ");
+  if (!name) return;
+  const secret = await promptHidden("  Secret (base58 / id.json / seed-hex): ");
+  if (!secret) return;
+  try {
+    const imported = await importWallet(name, secret);
+    process.stdout.write(`\n  ${C.green}Imported${C.reset} ${name} → ${short(imported.address)}\n`);
+  } catch (error) {
+    console.error(`  ${error.message}`);
+  }
+  await prompt("  Press enter…");
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+
+  // Everything after `--` is forwarded verbatim to the harness.
+  const dashDash = argv.indexOf("--");
+  const forwardedArgs = dashDash === -1 ? [] : argv.slice(dashDash + 1);
+  const flags = dashDash === -1 ? argv : argv.slice(0, dashDash);
+
+  // `--harness <name>` forces the adapter; fold it into env BEFORE resolving so
+  // detectHarness() honors it (TINYPLACE_HARNESS is the built-in override).
+  const harnessFlag = flags.indexOf("--harness");
+  if (harnessFlag !== -1 && flags[harnessFlag + 1]) {
+    process.env.TINYPLACE_HARNESS = flags[harnessFlag + 1];
+  }
+
+  // Resolve the active adapter + its data dir now that the override is in env.
+  ADAPTER = activeAdapter();
+  DATA_DIR = harnessDataDir(ADAPTER);
+  WALLETS_FILE = join(DATA_DIR, "wallets.json");
+
+  // Non-interactive fast path: `tinyplace --wallet alice`.
+  const walletFlag = flags.indexOf("--wallet");
+  if (walletFlag !== -1) {
+    const name = flags[walletFlag + 1];
+    if (!name || !loadWallets().some((w) => w.name === name)) {
+      console.error(`No wallet named '${name ?? ""}'. Run 'tinyplace' with no args to create one.`);
+      process.exit(1);
+    }
+    return launch(name, forwardedArgs);
+  }
+
+  if (!process.stdin.isTTY) {
+    console.error("tinyplace: interactive menu needs a TTY. Use 'tinyplace --wallet <name>' in non-interactive contexts.");
+    process.exit(1);
+  }
+
+  for (;;) {
+    const wallets = loadWallets();
+    const items = [
+      ...wallets.map((w) => ({ label: w.name, hint: `${w.handle ? "@" + w.handle + "  " : ""}${short(w.address)}` })),
+      { label: "＋ Create new wallet", hint: "offline · free" },
+      { label: "📥 Import existing wallet", hint: "Solana key / seed" },
+      ...(wallets.length ? [{ label: "⚡ Register @handle", hint: "on staging" }] : []),
+      { label: "Quit", hint: "" },
+    ];
+    const subtitle = wallets.length ? "Select an identity to launch:" : "No wallets yet — create one:";
+    const choice = await menu(subtitle, items);
+    if (choice === -1) {
+      clear();
+      process.exit(0);
+    }
+
+    // A wallet row → launch (this replaces the process's terminal with the harness).
+    if (choice < wallets.length) return launch(wallets[choice].name, forwardedArgs);
+
+    const action = items[choice].label;
+    if (action.startsWith("＋")) {
+      clear();
+      const name = await prompt("  New wallet name (e.g. alice): ");
+      if (name) {
+        try {
+          await createWallet(name);
+        } catch (error) {
+          console.error(`  ${error.message}`);
+          await prompt("  Press enter…");
+        }
+      }
+    } else if (action.startsWith("📥")) {
+      await importFlow();
+    } else if (action.startsWith("⚡")) {
+      const pick = await menu("Register which wallet?", [
+        ...wallets.map((w) => ({ label: w.name, hint: short(w.address) })),
+        { label: "Back", hint: "" },
+      ]);
+      if (pick >= 0 && pick < wallets.length) await registerFlow(wallets[pick]);
+    } else {
+      clear();
+      process.exit(0);
+    }
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
