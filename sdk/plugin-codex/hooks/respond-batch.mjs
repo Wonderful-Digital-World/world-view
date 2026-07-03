@@ -12,8 +12,11 @@
 //   - The tinyplace MCP server is reached via the isolated CODEX_HOME the launcher
 //     wrote (config.toml → [mcp_servers.tinyplace]); we forward CODEX_HOME so the
 //     responder loads the same tools. TINYPLACE_ACTIVE_WALLET pins its identity.
-//   - `--dangerously-bypass-approvals-and-sandbox` runs unattended (no TTY prompt);
-//     `--skip-git-repo-check` lets it run outside a repo.
+//   - This responder feeds ATTACKER-CONTROLLED DM text into `codex exec`, so it
+//     runs in the most restrictive unattended mode: `--sandbox read-only` (never
+//     bypass approvals/sandbox) so a prompt-injected message cannot reach the
+//     shell or the filesystem — only the `auto_reply` MCP tool. `--skip-git-repo-
+//     check` lets it run outside a repo.
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -77,7 +80,7 @@ function respond(file) {
     }
     const child = spawn(
       "codex",
-      ["exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-m", MODEL, buildPrompt(msg)],
+      ["exec", "--sandbox", "read-only", "--skip-git-repo-check", "-m", MODEL, buildPrompt(msg)],
       {
         stdio: "ignore",
         env: {
