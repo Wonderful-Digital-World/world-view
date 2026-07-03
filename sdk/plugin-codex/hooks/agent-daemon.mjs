@@ -179,8 +179,13 @@ async function drainOutbound() {
       // base58 cryptoId, so resolve @handle/base64-key first (a raw job.to would
       // silently fail). Other failures also re-queue.
       if (e?.status === 403 && !contactRequested.has(job.to)) {
-        contactRequested.add(job.to);
-        try { await client.contacts.request(await toCryptoId(client, job.to)); } catch { /* best-effort */ }
+        // Mark as requested ONLY after the request actually succeeds — otherwise a
+        // transient failure (handle resolution / request call) would suppress all
+        // future retries and strand the job behind the contact gate.
+        try {
+          await client.contacts.request(await toCryptoId(client, job.to));
+          contactRequested.add(job.to);
+        } catch { /* best-effort; retry on the next 403 */ }
       }
       fail();
     }
