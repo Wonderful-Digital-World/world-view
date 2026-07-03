@@ -124,6 +124,12 @@ async function importWallet(name, secretInput) {
   if (wallets.some((w) => w.name === name)) throw new Error(`A wallet named '${name}' already exists.`);
   const seed = parseSecretToSeed(secretInput);
   const signer = await LocalSigner.fromSeed(seed);
+  // Same constraint as createWallet: a `/` in the base64 public key breaks the
+  // SDK's keys/messages routing (%2F -> 404), so the wallet couldn't receive DMs.
+  // An imported seed is fixed, so we can't regenerate — reject it instead.
+  if (signer.publicKeyBase64.includes("/")) {
+    throw new Error("This wallet's public key contains '/', which this plugin cannot route yet. Import a different wallet.");
+  }
   wallets.push({
     name,
     address: signer.agentId,
