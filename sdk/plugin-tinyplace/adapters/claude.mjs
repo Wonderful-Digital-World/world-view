@@ -42,8 +42,33 @@ export const claudeAdapter = {
   responder: {
     command: "claude",
     defaultModel: "claude-haiku-4-5-20251001",
+    // This responder feeds ATTACKER-CONTROLLED DM text into headless `claude -p`,
+    // so it runs in the most restrictive unattended mode — the Claude parity of the
+    // codex `--sandbox read-only` intent. NEVER `--dangerously-skip-permissions`
+    // (that grants unrestricted shell/fs to a prompt-injected message). Instead:
+    //   • `--permission-mode dontAsk` — auto-DENY any tool not explicitly allowed
+    //     (no interactive prompt to hang on, no silent allow),
+    //   • `--tools ""` — strip ALL built-in tools (Bash/Edit/Write/Read/WebFetch)
+    //     from the model's context entirely, and
+    //   • `--allowedTools mcp__tinyplace__auto_reply` — leave the single tinyplace
+    //     `auto_reply` MCP tool as the ONLY side-effecting path (parity with codex,
+    //     whose only side-effecting path is the same MCP tool).
+    // Net: a prompt-injected message cannot reach the shell or the filesystem.
     buildArgs(prompt, model, pluginRoot) {
-      return ["-p", prompt, "--plugin-dir", pluginRoot, "--dangerously-skip-permissions", "--model", model];
+      return [
+        "-p",
+        prompt,
+        "--plugin-dir",
+        pluginRoot,
+        "--permission-mode",
+        "dontAsk",
+        "--tools",
+        "",
+        "--allowedTools",
+        "mcp__tinyplace__auto_reply",
+        "--model",
+        model,
+      ];
     },
   },
 
