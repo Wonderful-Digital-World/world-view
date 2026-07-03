@@ -25,6 +25,7 @@ import { claimOutboxJobs } from "../mcp/outbox.mjs";
 import { acquireLock, heartbeatLock, releaseLock } from "../mcp/daemon-lock.mjs";
 import { toCryptoId } from "../mcp/address.mjs";
 import { harnessDataDir } from "../mcp/harness.mjs";
+import { foregroundInject } from "../mcp/foreground-inject.mjs";
 
 // Survive transient relay errors — a stray unhandled rejection must not kill the
 // single per-agent daemon (it owns the ratchet); the poll loop retries next tick.
@@ -137,19 +138,45 @@ async function drainInbound() {
   draining = true;
   try {
     const messages = await readMessages(client, signer);
-    let enqueuedAny = false;
+    // Group pending (non-auto) mail by the session label it was ROUTED to, so we
+    // wake the RIGHT session's pane — a DM addressed to to_session=claude:2 must
+    // wake claude:2, not whichever pane happens to be first. Mail with no live
+    // target (unrouted/held) can't be woken, so it takes the isolated responder
+    // directly — a fully-headless agent (daemon only, no live session) keeps
+    // auto-replying, and the held copy is redelivered when a target comes live.
+    const pendingByLabel = new Map(); // label -> [decoded]
+    let headlessPending = false;
     for (const raw of messages) {
       const { auto, inReplyTo, text, messageId, fromSession, role, toSession } = decodeBody(raw.text);
       if (text === RESET_SENTINEL) continue; // handshake ping — consumed on decrypt
       // Correlate on the in-body envelope id when present, else the relay id.
       const id = messageId ?? raw.id;
       const decoded = { id, from: raw.from, fromSession, role, text, inReplyTo, toSession, ts: raw.timestamp ?? new Date().toISOString() };
-      enqueueRouted(AGENT, decoded);
-      // Auto-responder: answer non-auto messages when a session is idle (loop
-      // guard: an auto-tagged reply is never itself enqueued for a response).
-      if (!auto) { enqueueForAutoResponse(decoded); enqueuedAny = true; }
+      const { target } = enqueueRouted(AGENT, decoded); // route to the session inbox(es)
+      // Non-auto messages need a reply (loop guard: an auto-tagged reply is never
+      // itself answered).
+      if (auto || autorespondOff) continue;
+      if (target.kind === "session") {
+        for (const label of target.labels) {
+          if (!pendingByLabel.has(label)) pendingByLabel.set(label, []);
+          pendingByLabel.get(label).push(decoded);
+        }
+      } else {
+        enqueueForAutoResponse(decoded); // no live session to wake → isolated responder
+        headlessPending = true;
+      }
     }
-    if (enqueuedAny) maybeSpawnResponder();
+    // Foreground-preferred: inject a trigger into EACH routed session's own tmux
+    // pane so the real agent drains its inbox and replies IN-CONTEXT. A routed
+    // session with no pane (headless surface) falls back to the isolated responder
+    // — so for any given message exactly one path fires (no double-reply).
+    for (const [label, msgs] of pendingByLabel) {
+      if (!foregroundInject(AGENT, msgs, { label }).injected) {
+        for (const d of msgs) enqueueForAutoResponse(d);
+        headlessPending = true;
+      }
+    }
+    if (headlessPending) maybeSpawnResponder();
   } catch { /* relay hiccup — retry next tick */ } finally {
     draining = false;
   }

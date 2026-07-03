@@ -52,6 +52,7 @@ import { drainInbox, redeliverUnrouted } from "./routing.mjs";
 import { writeOutboxJob } from "./outbox.mjs";
 import { daemonLive } from "./daemon-lock.mjs";
 import { toCryptoId } from "./address.mjs";
+import { foregroundInject } from "./foreground-inject.mjs";
 import { activeAdapter, harnessDataDir } from "./harness.mjs";
 
 // The per-harness descriptor for THIS process, resolved once. Every branch below
@@ -394,24 +395,21 @@ async function buildClient(seedHex) {
 
 // Deliver one decoded inbound message to a pending waiter (synchronous
 // send_and_wait / await_reply) or, failing that, buffer it + push a channel
-// event. `enqueueForAuto` gates the Stop-hook auto-responder enqueue (self mode
-// only — in daemon mode the daemon owns auto-response). Returns true if it was
-// enqueued for auto-response.
-function deliverToSession(msg, { auto, enqueueForAuto }) {
+// event. Returns the disposition so the caller can decide how to resolve it:
+//   "waiter"         — consumed synchronously; no auto-response needed
+//   "auto"           — an auto-tagged reply; buffered only (loop guard: never answered)
+//   "needs-response" — a fresh peer DM buffered and awaiting a reply
+function deliverToSession(msg, { auto }) {
   const waiterIndex = session.waiters.findIndex((w) => w.match(msg));
   if (waiterIndex !== -1) {
     const [waiter] = session.waiters.splice(waiterIndex, 1);
     clearTimeout(waiter.timer);
     waiter.resolve({ ...msg, _delivered: "waiter" });
-    return false;
+    return "waiter";
   }
   session.buffer.push(msg);
   void pushToChannel(msg);
-  if (enqueueForAuto && !auto) {
-    enqueueInbound(session.address, msg);
-    return true;
-  }
-  return false;
+  return auto ? "auto" : "needs-response";
 }
 
 // SELF MODE drain: this session owns the relay. Decrypt + ack inbound DMs, detect
@@ -435,7 +433,7 @@ async function drainSelf() {
       const dropped = rawBefore.filter((r) => !gotIds.has(String(r.id)));
       if (dropped.length) recordUndecryptable(dropped);
     }
-    let enqueuedAny = false;
+    const pending = [];
     for (const rawMsg of messages) {
       const { auto, inReplyTo, text, messageId, fromSession, role, toSession } = decodeBody(rawMsg.text);
       // A re-handshake ping only exists to re-run X3DH (done on decrypt); consume
@@ -444,10 +442,19 @@ async function drainSelf() {
       // Correlate on the in-body envelope id when present (matches what a peer
       // echoes as in_reply_to), else fall back to the relay id for legacy bodies.
       const msg = { ...rawMsg, id: messageId ?? rawMsg.id, text, inReplyTo, fromSession, role, toSession };
-      if (deliverToSession(msg, { auto, enqueueForAuto: true })) enqueuedAny = true;
+      if (deliverToSession(msg, { auto }) === "needs-response") pending.push(msg);
     }
-    // Daemon trigger: react to new mail even when the Claude UI is idle.
-    if (enqueuedAny) maybeSpawnResponder();
+    // React to new mail even when the UI is idle. Foreground-preferred: if this
+    // session runs in a tmux pane, inject a trigger so THIS live agent drains its
+    // inbox and replies IN-CONTEXT. Only when there's no pane (headless) do we
+    // enqueue for + spawn the isolated responder — so the two never both fire (no
+    // double-reply).
+    if (pending.length && autorespondEnabled()) {
+      if (!foregroundInject(session.address, pending, { pane: process.env.TMUX_PANE }).injected) {
+        for (const m of pending) enqueueInbound(session.address, m);
+        maybeSpawnResponder();
+      }
+    }
   } catch {
     // Relay hiccup / nothing to read — try again on the next tick.
   } finally {
@@ -484,8 +491,9 @@ async function drainDaemonInbox() {
         toSession: p.toSession ?? null,
         timestamp: p.ts,
       };
-      // enqueueForAuto=false: the daemon already enqueued for auto-response.
-      deliverToSession(msg, { auto: false, enqueueForAuto: false });
+      // Daemon mode: the daemon owns auto-response + foreground inject, so the
+      // disposition is ignored here — just deliver to a waiter/buffer.
+      deliverToSession(msg, { auto: false });
     }
   } catch {
     // Queue read hiccup — retry next tick.
