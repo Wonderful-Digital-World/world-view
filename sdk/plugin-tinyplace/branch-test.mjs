@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { _resetAdapterCache } from "./mcp/harness.mjs";
+import { canForegroundInject, foregroundInject } from "./mcp/foreground-inject.mjs";
 
 const checks = [];
 const expect = (label, cond) => { checks.push({ label, ok: !!cond }); console.log((cond ? "PASS " : "FAIL ") + label); };
@@ -48,6 +49,16 @@ expect("claude: default sessionLabel = claude:1", fmt.sessionLabel() === "claude
 
 // The two harnesses must NOT share a data dir (isolation is the whole point).
 expect("codex + claude data dirs are distinct", process.env.TINYPLACE_CODEX_HOME !== process.env.TINYPLACE_CLAUDE_HOME);
+
+// ── foreground-inject slot (the #212 abstraction) ────────────────────────────
+// Both adapters advertise the capability; the slot is a fail-open no-op today.
+underHarness("codex");
+expect("codex: foreground-inject capability advertised", canForegroundInject() === true);
+const fiCodex = foregroundInject("addr", [{ id: "x" }]);
+expect("codex: foregroundInject is a no-op today (not-implemented)", fiCodex.injected === false && fiCodex.reason === "not-implemented");
+underHarness("claude");
+expect("claude: foreground-inject capability advertised", canForegroundInject() === true);
+expect("claude: foregroundInject no-op (not-implemented)", foregroundInject("addr", []).reason === "not-implemented");
 
 const failed = checks.filter((c) => !c.ok);
 console.log("\n" + (failed.length === 0 ? `ALL ${checks.length} CHECKS PASSED ✅` : `${failed.length} FAILED ❌`));
