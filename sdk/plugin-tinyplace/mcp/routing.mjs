@@ -4,7 +4,7 @@
 import { mkdirSync, writeFileSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-import { sessionsDir, liveSessions, primarySession } from "./registry.mjs";
+import { sessionsDir, liveSessions, primarySession, labelForConversationUuid } from "./registry.mjs";
 
 // No-target delivery policy (TINYPLACE_UNROUTED_POLICY): primary (default),
 // broadcast (fan out to all live), or drop.
@@ -50,6 +50,18 @@ export function routeTarget({ toSession, liveLabels, primary, policy = "primary"
   return primary ? { kind: "session", labels: [primary] } : { kind: "unrouted" };
 }
 
+// Where a message goes RIGHT NOW, preferring the durable UUID binding. If the sender
+// addressed a session UUID, deliver ONLY to the live session that actually owns it —
+// never to a reused label slot; no live owner → unrouted (held). Falls back to the
+// label/policy routing when there's no UUID (older peers, untargeted mail).
+function resolveBound(agentAddress, { toSession, toSessionUuid }, { liveList, primary, policy }) {
+  if (toSessionUuid) {
+    const label = labelForConversationUuid(agentAddress, toSessionUuid);
+    return label ? { kind: "session", labels: [label] } : { kind: "unrouted" };
+  }
+  return routeTarget({ toSession, liveLabels: liveList, primary, policy });
+}
+
 function writeQueueFile(dir, id, payload) {
   mkdirSync(dir, { recursive: true });
   const tmp = join(dir, `.${encodeURIComponent(String(id))}.tmp`);
@@ -65,15 +77,17 @@ function writeQueueFile(dir, id, payload) {
 export function enqueueRouted(agentAddress, decoded, { policy = unroutedPolicy() } = {}) {
   const live = liveSessions(agentAddress).map((s) => s.label);
   const primary = primarySession(agentAddress)?.label ?? null;
-  const target = routeTarget({ toSession: decoded.toSession, liveLabels: live, primary, policy });
+  const target = resolveBound(agentAddress, decoded, { liveList: live, primary, policy });
   const payload = {
     id: decoded.id,
     from: decoded.from,
     fromSession: decoded.fromSession ?? null,
+    fromSessionUuid: decoded.fromSessionUuid ?? null,
     role: decoded.role ?? null,
     text: decoded.text,
     inReplyTo: decoded.inReplyTo ?? null,
     toSession: decoded.toSession ?? null,
+    toSessionUuid: decoded.toSessionUuid ?? null,
     ts: decoded.ts ?? new Date().toISOString(),
   };
   const written = [];
@@ -107,7 +121,7 @@ export function redeliverUnrouted(agentAddress, { policy = unroutedPolicy() } = 
     } catch {
       continue;
     }
-    const target = routeTarget({ toSession: payload.toSession, liveLabels: liveList, primary, policy });
+    const target = resolveBound(agentAddress, payload, { liveList, primary, policy });
     // Only single-session delivery is reversible from _unrouted (broadcast would
     // need copies); a held untargeted message goes to the current primary.
     if (target.kind === "session" && target.labels.length === 1) {
@@ -153,8 +167,13 @@ export function reapClosedTargets(agentAddress, { graceMs = CLOSED_GRACE_MS } = 
     } catch {
       continue;
     }
-    if (!payload.toSession) continue; // untargeted → not a "closed session" case
-    if (live.has(payload.toSession)) continue; // target is live → let redelivery handle it
+    if (!payload.toSession && !payload.toSessionUuid) continue; // untargeted → not a "closed session" case
+    // Is the addressed session still reachable? Prefer the UUID (a match is the SAME
+    // session, never a reused label); fall back to the label for older peers.
+    const stillLive = payload.toSessionUuid
+      ? Boolean(labelForConversationUuid(agentAddress, payload.toSessionUuid))
+      : live.has(payload.toSession);
+    if (stillLive) continue; // target is live → let redelivery handle it
     if (now - mtimeMs < graceMs) continue; // still within the grace window
     try {
       rmSync(p); // terminate: drop the held message

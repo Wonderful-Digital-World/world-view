@@ -199,6 +199,8 @@ async function drainOutbound() {
         text: job.text,
         role: job.role,
         toSession: job.toSession,
+        toSessionUuid: job.toSessionUuid,
+        conversationUuid: job.conversationUuid,
         inReplyTo: job.inReplyTo,
         auto: job.auto,
         fromSession: job.fromSession,
@@ -234,6 +236,7 @@ function notifyClosedTargets() {
       id: `sysclosed-${p.id}`,
       to: p.from,
       toSession: p.fromSession ?? null, // back to the sender's originating session
+      toSessionUuid: p.fromSessionUuid ?? null, // …addressed by their conversation id
       role: "system",
       text: `The session "${p.toSession}" you addressed is no longer active; your message was not delivered. Start a new message to reach this agent.`,
       inReplyTo: p.id,

@@ -91,20 +91,33 @@ dedicated `tinyplace` tmux socket (for any inject-capable harness) unless alread
 
 ### Closed-session addressing
 
-A DM carries the sender's session as `tp.from_session`; replies echo it back as
-`to_session`, so a thread sticks to the session that started it. When a message is
-addressed to a `to_session` that isn't live, it's held (the `_unrouted` hold doubles as
-a grace window): if that session returns within the grace it's delivered in-context; if
-not, the daemon sends the sender ONE auto-tagged `role:"system"` **"session closed"**
-notice correlated by `in_reply_to` — so a synchronous `await_reply`/`check_reply`
-resolves instead of hanging — and terminates the message (`reapClosedTargets` in
-`routing.mjs`; wired in `agent-daemon.mjs`). A stranger session is never made to answer a
-thread bound to a now-closed session. Tune with `TINYPLACE_SESSION_CLOSED_GRACE_MS`
-(default 5000).
+Binding is on a **conversation UUID**, not the (reusable) label. `scope.wrapper_session_id`
+is a per-conversation id — a fresh uuid per `(session, peer)` minted on first contact
+(`registry.resolveConversationUuid`), so peers can't correlate our sessions across
+conversations and each relationship is its own thread. It maps to the session's durable
+`sessionUuid` via a reverse index (`convUuid → sessionUuid`), and `sessionUuid` maps to
+the live session in presence — so an inbound `to_session_uuid` resolves to the exact
+local session, **reuse-proof**: a label reclaimed by a different session can never inherit
+another's thread. Replies carry `to_session_uuid` (the peer's `wrapper_session_id`),
+echoed automatically from the replied-to message (correlated by `in_reply_to`) — the model
+never handles uuids. Layering:
 
-> Binding is on the session **label** today, which is positional and reusable — a
-> follow-up will bind on a durable per-session `sessionUuid` (persisted via the assignment
-> scope) so "closed" is immune to label reuse and survives restarts unconditionally.
+```text
+wire: tp.from_session (label, display)  scope.wrapper_session_id (convUuid)  tp.to_session_uuid (peer convUuid)
+local: convUuid --idx--> sessionUuid --presence--> live session (label, pid, pane)
+```
+
+When a message is addressed to a `to_session_uuid`/`to_session` that isn't live, it's held
+(the `_unrouted` hold doubles as a grace window): if that session returns within the grace
+it's delivered in-context; if not, the daemon sends the sender ONE auto-tagged
+`role:"system"` **"session closed"** notice correlated by `in_reply_to` — so a synchronous
+`await_reply`/`check_reply` resolves instead of hanging — and terminates the message
+(`reapClosedTargets`). A stranger session is never made to answer a thread bound to a
+now-closed session. Tune with `TINYPLACE_SESSION_CLOSED_GRACE_MS` (default 5000).
+
+> The isolated headless responder (separate process, empty buffer) still echoes on the
+> label, not the conversation uuid — a documented degradation of the fallback path; the
+> interactive / foreground-inject path is fully uuid-bound.
 
 ## Packaging
 

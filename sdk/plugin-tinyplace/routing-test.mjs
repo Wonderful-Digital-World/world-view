@@ -93,6 +93,33 @@ const D = "AgentDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
 routing.enqueueRouted(D, { id: "d1", from: "peerD", text: "no target" }); // untargeted, no live → held
 expect("untargeted held mail is never reaped as closed", routing.reapClosedTargets(D, { graceMs: 0 }).length === 0);
 
+// ── conversation-UUID routing (per (session,peer); reuse-proof binding) ──────
+const E = "AgentEEEEEEEEEEEEEEEEEEEEEEEEEEEE";
+reg.writePresence(E, { label: "codex:1", harnessSessionId: "he1", cwd: "/w", startedAt: new Date().toISOString() });
+const suE1 = reg.resolveSessionUuid("he1"); // codex:1's durable session anchor
+const convE = reg.resolveConversationUuid(suE1, "peerE"); // its wire-visible conversation id
+expect("resolveConversationUuid mints a uuid, indexed to the session", reg.sessionUuidForConversation(convE) === suE1);
+expect("resolveConversationUuid is idempotent per (session,peer)", reg.resolveConversationUuid(suE1, "peerE") === convE);
+const er1 = routing.enqueueRouted(E, { id: "e1", from: "peerE", text: "by conv uuid", toSession: "codex:1", toSessionUuid: convE });
+expect("conversation uuid of a live session → routed to its label", er1.target.kind === "session" && er1.target.labels[0] === "codex:1");
+const er2 = routing.enqueueRouted(E, { id: "e2", from: "peerE", text: "ghost", toSession: "codex:1", toSessionUuid: "00000000-0000-0000-0000-000000000000" });
+expect("unknown conversation uuid → unrouted even though the label is live", er2.target.kind === "unrouted");
+expect("no leak: live codex:1 did not get the unknown-uuid message", !existsSync(join(routing.sessionInboxDir(E, "codex:1"), "e2.json")));
+
+// The crux: a label reused by a DIFFERENT session must not inherit the old thread.
+const F = "AgentFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+reg.writePresence(F, { label: "codex:1", harnessSessionId: "old-sess", cwd: "/w", startedAt: new Date().toISOString() });
+const suOld = reg.resolveSessionUuid("old-sess");
+const convOld = reg.resolveConversationUuid(suOld, "peerF"); // the old session's conversation with peerF
+reg.removePresence(F, "codex:1"); // old session closes → codex:1 frees
+reg.writePresence(F, { label: "codex:1", harnessSessionId: "new-sess", cwd: "/w", startedAt: new Date().toISOString() }); // stranger takes codex:1
+const fr = routing.enqueueRouted(F, { id: "f1", from: "peerF", text: "for the old one", toSession: "codex:1", toSessionUuid: convOld });
+expect("label reuse: old conversation uuid is NOT delivered to the reused label", fr.target.kind === "unrouted");
+expect("reused codex:1 inbox did not receive the old thread", !existsSync(join(routing.sessionInboxDir(F, "codex:1"), "f1.json")));
+spawnSync("sleep", ["0.05"]);
+const fReap = routing.reapClosedTargets(F, { graceMs: 10 });
+expect("old conversation reaps as closed (its session is truly gone)", fReap.length === 1 && fReap[0].id === "f1");
+
 const failed = checks.filter((c) => !c.ok);
 console.log("\n" + (failed.length === 0 ? `ALL ${checks.length} CHECKS PASSED ✅` : `${failed.length} FAILED ❌`));
 process.exit(failed.length === 0 ? 0 : 1);

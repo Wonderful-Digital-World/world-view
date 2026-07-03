@@ -47,6 +47,15 @@ export function safeLabel(value) {
   return typeof value === "string" && SAFE_LABEL_RE.test(value) ? value : null;
 }
 
+// The durable session UUID binding key. Distinct from a label (which is short/
+// positional) — a UUID is 36 chars, so it needs its own guard. Kept permissive
+// enough for any RFC-4122 uuid while still constraining the (attacker-controlled)
+// value to a safe hex/hyphen token.
+export const SAFE_UUID_RE = /^[0-9a-fA-F-]{8,64}$/;
+export function safeUuid(value) {
+  return typeof value === "string" && SAFE_UUID_RE.test(value) ? value : null;
+}
+
 // §15 default: a plugin session's harness_session_id is the harness's own session
 // id. Resolution is per-harness (Codex tries CODEX_SESSION_ID/THREAD_ID, Claude
 // uses CLAUDE_CODE_SESSION_ID), so delegate to the active adapter; the MCP server
@@ -90,11 +99,13 @@ export function encodeEnvelope(opts) {
       type: "session",
       key: `${opts.agentAddress ?? "agent"}:${label}`,
       cwd: opts.cwd ?? process.cwd(),
-      // The shared SessionEnvelope contract uses wrapper_session_id for a UNIQUE
-      // wrapper-session identifier (the harness-wrapper puts a uuid here), so we
-      // keep it aligned with that semantic. The short routing label rides in
-      // tp.from_session instead.
-      wrapper_session_id: opts.harnessSessionId || harnessSessionId() || `${opts.agentAddress ?? "agent"}:${label}`,
+      // wrapper_session_id is a per-CONVERSATION id between two agents (a fresh uuid
+      // per (session, peer) — see registry.resolveConversationUuid): peers can't
+      // correlate our sessions across conversations, and a reply addressed to it
+      // resolves back to the owning local session. Falls back to the harness/label id
+      // for messages sent without a conversation context (e.g. system notices). The
+      // short routing label rides in tp.from_session.
+      wrapper_session_id: opts.conversationUuid || opts.harnessSessionId || harnessSessionId() || `${opts.agentAddress ?? "agent"}:${label}`,
       harness_session_id: opts.harnessSessionId ?? harnessSessionId(),
     },
     harness: { provider: adapter.provider, command: adapter.harness.command, argv: adapter.harness.argv ?? [] },
@@ -109,6 +120,11 @@ export function encodeEnvelope(opts) {
     tp: { v: PLUGIN_TP_VERSION, from_session: label },
   };
   if (opts.toSession) envelope.tp.to_session = opts.toSession;
+  // Address a reply to the exact conversation the peer opened: to_session_uuid is the
+  // peer's wrapper_session_id (their per-conversation id), echoed back so their side
+  // routes it to the originating session — immune to label reuse. (The sender's own
+  // conversation id rides in scope.wrapper_session_id above.)
+  if (opts.toSessionUuid) envelope.tp.to_session_uuid = opts.toSessionUuid;
   if (opts.inReplyTo) envelope.tp.in_reply_to = opts.inReplyTo;
   if (opts.auto) envelope.tp.auto = true;
   return JSON.stringify(envelope);
@@ -136,8 +152,14 @@ function decodeEnvelope(obj) {
     // The routing label is tp.from_session; fall back to wrapper_session_id for
     // older bodies that stored the label there. Constrain the (attacker-
     // controlled) labels to a safe token shape so downstream use is safe.
+    // A uuid in wrapper_session_id won't pass safeLabel (too long), so this legacy
+    // fallback still only catches an OLD body that stored a short label there.
     fromSession: safeLabel(tp.from_session) ?? safeLabel(obj.scope?.wrapper_session_id),
     toSession: safeLabel(tp.to_session),
+    // The sender's per-conversation id is scope.wrapper_session_id (a uuid now);
+    // older peers put a non-uuid there, which safeUuid drops → label routing.
+    fromSessionUuid: safeUuid(obj.scope?.wrapper_session_id),
+    toSessionUuid: safeUuid(tp.to_session_uuid),
     role,
     envelope: true,
   };
@@ -161,7 +183,7 @@ function decodeLegacyBody(raw) {
       }
     }
   }
-  return { auto, inReplyTo, text, messageId: null, fromSession: null, toSession: null, role: null, envelope: false };
+  return { auto, inReplyTo, text, messageId: null, fromSession: null, toSession: null, fromSessionUuid: null, toSessionUuid: null, role: null, envelope: false };
 }
 
 // Build a legacy auto-reply body (auto tag + optional re: header + plaintext).
