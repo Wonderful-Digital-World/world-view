@@ -42,20 +42,29 @@ function readActive(sessionId) {
   return null;
 }
 
-// Peek every routed inbox (per-session + _unrouted) for the agent, oldest first.
-function peekInboxes(address) {
+// Peek the inbox(es) that THIS session can actually drain, oldest first. When we
+// know the active session label, restrict to that label's inbox (+ the shared
+// _unrouted hold) — otherwise a sibling session of the same wallet would surface
+// (and mark as seen) DMs routed to a different label that it can never read.
+function peekInboxes(address, label) {
   const agentDir = join(SESSIONS_ROOT, encodeURIComponent(String(address)));
   const inboxDirs = [];
-  let entries = [];
-  try {
-    entries = readdirSync(agentDir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  for (const e of entries) {
-    if (!e.isDirectory()) continue;
-    if (e.name === "_unrouted") inboxDirs.push(join(agentDir, e.name));
-    else inboxDirs.push(join(agentDir, e.name, "inbox"));
+  if (label) {
+    inboxDirs.push(join(agentDir, encodeURIComponent(String(label)), "inbox"));
+    inboxDirs.push(join(agentDir, "_unrouted"));
+  } else {
+    // No known active label — fall back to scanning every routed inbox.
+    let entries = [];
+    try {
+      entries = readdirSync(agentDir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      if (e.name === "_unrouted") inboxDirs.push(join(agentDir, e.name));
+      else inboxDirs.push(join(agentDir, e.name, "inbox"));
+    }
   }
   const msgs = [];
   for (const dir of inboxDirs) {
@@ -108,7 +117,7 @@ const sessionId = hook?.session_id ?? hook?.sessionId ?? null;
 const active = readActive(sessionId);
 if (!active?.address) process.exit(0);
 
-const fresh = peekInboxes(active.address).filter((m) => !alreadySurfaced(active.address, m.id));
+const fresh = peekInboxes(active.address, active.label ?? null).filter((m) => !alreadySurfaced(active.address, m.id));
 if (fresh.length === 0) process.exit(0);
 
 for (const m of fresh) markSurfaced(active.address, m.id);

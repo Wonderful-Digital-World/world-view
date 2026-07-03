@@ -179,10 +179,12 @@ function activeStateKey() {
 
 // Record the active identity so the (separate-process) dispatcher knows which
 // agent + queue this session belongs to. Written on every adopt().
-function writeActiveState(wallet, address) {
+function writeActiveState(wallet, address, label) {
   try {
     mkdirSync(AUTORESPOND_DIR, { recursive: true });
-    const body = JSON.stringify({ wallet, address, updatedAt: new Date().toISOString() }) + "\n";
+    // Record the active session label so pull-only surfacing can scope to THIS
+    // session's inbox and not leak another session's routed DMs (same wallet).
+    const body = JSON.stringify({ wallet, address, label: label ?? null, updatedAt: new Date().toISOString() }) + "\n";
     writeFileSync(join(AUTORESPOND_DIR, `active-${activeStateKey()}.json`), body, { mode: 0o600 });
     writeFileSync(join(AUTORESPOND_DIR, "active-latest.json"), body, { mode: 0o600 });
   } catch {
@@ -632,7 +634,7 @@ async function adopt(walletName, { label } = {}) {
     session.mode = !daemonDisabled() && daemonLive(wallet.address) ? "daemon" : "self";
     session.daemonStatus = session.mode === "daemon" ? "running" : "self";
   } else {
-    writeActiveState(wallet.name, wallet.address);
+    writeActiveState(wallet.name, wallet.address, session.label);
     registerPresence();
     // Prefer the per-agent daemon (owns relay + ratchet); fall back to self-drain
     // if it's disabled or can't start — no regression for the single-session case.
