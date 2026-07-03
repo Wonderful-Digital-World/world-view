@@ -1109,7 +1109,17 @@ server.registerTool(
     try {
       const s = requireActive();
       const matchFrom = from ? await resolveRecipientKey(s.client, from) : null;
-      const reply = await waitFor((m) => matchFrom === null || m.from === matchFrom, timeout_seconds ?? DEFAULT_WAIT_SECONDS);
+      const match = (m) => matchFrom === null || m.from === matchFrom;
+      // Consume an already-buffered match first (it may have arrived before this
+      // call), mirroring check_reply — otherwise await_reply could time out even
+      // though the reply is already in hand.
+      await drain();
+      const bufferedIndex = s.buffer.findIndex(match);
+      if (bufferedIndex !== -1) {
+        const [m] = s.buffer.splice(bufferedIndex, 1);
+        return ok({ reply: { id: m.id, from: m.from, fromSession: m.fromSession ?? null, role: m.role ?? null, text: m.text, inReplyTo: m.inReplyTo ?? null, timestamp: m.timestamp } });
+      }
+      const reply = await waitFor(match, timeout_seconds ?? DEFAULT_WAIT_SECONDS);
       if (reply._timedOut) return ok({ reply: null, timedOut: true });
       return ok({ reply: { id: reply.id, from: reply.from, fromSession: reply.fromSession ?? null, role: reply.role ?? null, text: reply.text, inReplyTo: reply.inReplyTo ?? null, timestamp: reply.timestamp } });
     } catch (e) {
