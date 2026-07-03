@@ -1,7 +1,7 @@
 // Inbound routing for the per-agent daemon: decide which session's inbox an
 // inbound message belongs to, and write it to the right file queue. Split out as
 // pure-ish helpers so routing is unit-testable offline (§14).
-import { mkdirSync, writeFileSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { sessionsDir, liveSessions, primarySession } from "./registry.mjs";
@@ -12,6 +12,12 @@ export function unroutedPolicy() {
   const p = process.env.TINYPLACE_UNROUTED_POLICY?.trim();
   return p === "broadcast" || p === "drop" ? p : "primary";
 }
+
+// Grace before a message addressed to a now-closed session is abandoned. The hold
+// (see enqueueRouted → _unrouted) doubles as the grace window: a briefly-restarting
+// session that comes back within it still gets its mail (redeliverUnrouted); only
+// past it do we declare the target closed.
+const CLOSED_GRACE_MS = Number(process.env.TINYPLACE_SESSION_CLOSED_GRACE_MS) || 5000;
 
 function inboxDir(agentAddress, label) {
   return join(sessionsDir(agentAddress), encodeURIComponent(String(label)), "inbox");
@@ -116,6 +122,48 @@ export function redeliverUnrouted(agentAddress, { policy = unroutedPolicy() } = 
     }
   }
   return delivered;
+}
+
+// Reap mail addressed to a session that is now CLOSED. A message with an explicit
+// `toSession` that stayed unrouted past the grace window — its target never came
+// (back) live — is abandoned: remove the held file and return its payload so the
+// caller can notify the sender ("session closed") and terminate the thread.
+//
+// Untargeted held mail (no `toSession`) is NOT reaped here — that's "agent away, no
+// live session", not "the specific session you addressed is gone"; it stays held and
+// is delivered to a live session by redeliverUnrouted. Call this AFTER
+// redeliverUnrouted so a target that just came live is delivered, not reaped.
+export function reapClosedTargets(agentAddress, { graceMs = CLOSED_GRACE_MS } = {}) {
+  const dir = unroutedDir(agentAddress);
+  let files = [];
+  try {
+    files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const live = new Set(liveSessions(agentAddress).map((s) => s.label));
+  const now = Date.now();
+  const reaped = [];
+  for (const f of files) {
+    const p = join(dir, f);
+    let payload, mtimeMs;
+    try {
+      payload = JSON.parse(readFileSync(p, "utf8"));
+      mtimeMs = statSync(p).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (!payload.toSession) continue; // untargeted → not a "closed session" case
+    if (live.has(payload.toSession)) continue; // target is live → let redelivery handle it
+    if (now - mtimeMs < graceMs) continue; // still within the grace window
+    try {
+      rmSync(p); // terminate: drop the held message
+      reaped.push(payload);
+    } catch {
+      /* raced with redelivery — fine */
+    }
+  }
+  return reaped;
 }
 
 // Read (and by default claim) the queued inbox files for a session. Each file is

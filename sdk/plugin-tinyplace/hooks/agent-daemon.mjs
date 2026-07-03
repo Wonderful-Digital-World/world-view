@@ -20,8 +20,8 @@ import { sendMessage, readMessages, publishKeys } from "@tinyhumansai/tinyplace/
 
 import { buildEnvelope, decodeBody } from "../mcp/format.mjs";
 import { liveSessions } from "../mcp/registry.mjs";
-import { enqueueRouted, redeliverUnrouted } from "../mcp/routing.mjs";
-import { claimOutboxJobs } from "../mcp/outbox.mjs";
+import { enqueueRouted, redeliverUnrouted, reapClosedTargets } from "../mcp/routing.mjs";
+import { claimOutboxJobs, writeOutboxJob } from "../mcp/outbox.mjs";
 import { acquireLock, heartbeatLock, releaseLock } from "../mcp/daemon-lock.mjs";
 import { toCryptoId } from "../mcp/address.mjs";
 import { harnessDataDir } from "../mcp/harness.mjs";
@@ -161,10 +161,16 @@ async function drainInbound() {
           if (!pendingByLabel.has(label)) pendingByLabel.set(label, []);
           pendingByLabel.get(label).push(decoded);
         }
-      } else {
-        enqueueForAutoResponse(decoded); // no live session to wake → isolated responder
+      } else if (!decoded.toSession) {
+        // Untargeted + no live session → isolated responder (headless agent still
+        // auto-replies).
+        enqueueForAutoResponse(decoded);
         headlessPending = true;
       }
+      // else: addressed to a SPECIFIC session that isn't live → held (unrouted).
+      // Don't isolated-respond — a stranger context must not answer a thread bound
+      // to a now-closed session. It's either redelivered if that session returns
+      // within the grace window, or reaped into a "session closed" notice.
     }
     // Foreground-preferred: inject a trigger into EACH routed session's own tmux
     // pane so the real agent drains its inbox and replies IN-CONTEXT. A routed
@@ -216,6 +222,27 @@ async function drainOutbound() {
   }
 }
 
+// ── closed-session notices ───────────────────────────────────────────────────
+// A message addressed to a specific session (to_session) that never came (back)
+// live within the grace window is abandoned. Send the sender ONE auto-tagged
+// "session closed" notice, correlated by in_reply_to so a synchronous await/
+// check_reply resolves instead of hanging, then terminate (reap already dropped the
+// held copy). auto:true is the loop guard — the peer never answers this notice.
+function notifyClosedTargets() {
+  for (const p of reapClosedTargets(AGENT)) {
+    writeOutboxJob(AGENT, {
+      id: `sysclosed-${p.id}`,
+      to: p.from,
+      toSession: p.fromSession ?? null, // back to the sender's originating session
+      role: "system",
+      text: `The session "${p.toSession}" you addressed is no longer active; your message was not delivered. Start a new message to reach this agent.`,
+      inReplyTo: p.id,
+      auto: true,
+      fromSession: "system",
+    });
+  }
+}
+
 // ── liveness / idle exit ─────────────────────────────────────────────────────
 let lastLive = Date.now();
 function checkIdle() {
@@ -247,9 +274,10 @@ try {
 
 const pollTimer = setInterval(() => {
   void (async () => {
-    redeliverUnrouted(AGENT);
+    redeliverUnrouted(AGENT); // deliver held mail to sessions that just came live
     await drainInbound();
-    await drainOutbound();
+    notifyClosedTargets(); // reap+notify mail bound to a session that stayed gone
+    await drainOutbound(); // sends the notices just enqueued
     if (checkIdle()) shutdown(0);
   })();
 }, POLL_INTERVAL_MS);

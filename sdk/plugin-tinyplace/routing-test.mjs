@@ -1,5 +1,6 @@
 // Offline, deterministic test of daemon inbound routing: pure routeTarget plus
 // enqueueRouted / drainInbox / redeliverUnrouted against a live/dead registry.
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -69,6 +70,28 @@ const movedU = routing.redeliverUnrouted(U, { policy: "primary" });
 expect("redeliverUnrouted delivers held untargeted mail to primary", movedU === 1);
 const dU = routing.drainInbox(U, "codex:1");
 expect("primary session now receives the held untargeted message", dU.length === 1 && dU[0].id === "u1");
+
+// ── reapClosedTargets: mail bound to a now-closed session → notify + terminate ─
+const C = "AgentCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+reg.writePresence(C, { label: "codex:1", harnessSessionId: "hc", cwd: "/w", startedAt: new Date().toISOString() });
+// A message addressed to a dead session is held (unrouted).
+routing.enqueueRouted(C, { id: "c1", from: "peerC", fromSession: "codex:3", text: "hi ghost", toSession: "codex:8" });
+expect("bound-dead within grace → not reaped", routing.reapClosedTargets(C, { graceMs: 100000 }).length === 0);
+spawnSync("sleep", ["0.05"]); // age the held file past the grace used below
+const reaped = routing.reapClosedTargets(C, { graceMs: 10 });
+expect("bound-dead past grace → reaped once", reaped.length === 1 && reaped[0].id === "c1");
+expect("reaped payload carries sender, its session, and the dead target", reaped[0].from === "peerC" && reaped[0].fromSession === "codex:3" && reaped[0].toSession === "codex:8");
+expect("terminated: a second reap is empty", routing.reapClosedTargets(C, { graceMs: 0 }).length === 0);
+
+// A target that is (or became) live is never reaped — redelivery handles it.
+routing.enqueueRouted(C, { id: "c2", from: "peerC", text: "hi", toSession: "codex:7" }); // codex:7 dead → held
+reg.writePresence(C, { label: "codex:7", harnessSessionId: "h7", cwd: "/w", startedAt: new Date().toISOString() });
+expect("bound to a now-LIVE target → not reaped", routing.reapClosedTargets(C, { graceMs: 0 }).length === 0);
+
+// Untargeted held mail (agent away, no live session) is NOT a closed-session case.
+const D = "AgentDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+routing.enqueueRouted(D, { id: "d1", from: "peerD", text: "no target" }); // untargeted, no live → held
+expect("untargeted held mail is never reaped as closed", routing.reapClosedTargets(D, { graceMs: 0 }).length === 0);
 
 const failed = checks.filter((c) => !c.ok);
 console.log("\n" + (failed.length === 0 ? `ALL ${checks.length} CHECKS PASSED ✅` : `${failed.length} FAILED ❌`));

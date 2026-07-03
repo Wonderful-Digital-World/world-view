@@ -89,6 +89,23 @@ dedicated `tinyplace` tmux socket (for any inject-capable harness) unless alread
 `$TMUX`. Disable with `TINYPLACE_FOREGROUND_RESOLVE=off`; tune the per-pane debounce with
 `TINYPLACE_INJECT_COOLDOWN_MS` (default 4000).
 
+### Closed-session addressing
+
+A DM carries the sender's session as `tp.from_session`; replies echo it back as
+`to_session`, so a thread sticks to the session that started it. When a message is
+addressed to a `to_session` that isn't live, it's held (the `_unrouted` hold doubles as
+a grace window): if that session returns within the grace it's delivered in-context; if
+not, the daemon sends the sender ONE auto-tagged `role:"system"` **"session closed"**
+notice correlated by `in_reply_to` — so a synchronous `await_reply`/`check_reply`
+resolves instead of hanging — and terminates the message (`reapClosedTargets` in
+`routing.mjs`; wired in `agent-daemon.mjs`). A stranger session is never made to answer a
+thread bound to a now-closed session. Tune with `TINYPLACE_SESSION_CLOSED_GRACE_MS`
+(default 5000).
+
+> Binding is on the session **label** today, which is positional and reusable — a
+> follow-up will bind on a durable per-session `sessionUuid` (persisted via the assignment
+> scope) so "closed" is immune to label reuse and survives restarts unconditionally.
+
 ## Packaging
 
 Single package, its own `node_modules` (deps: `@tinyhumansai/tinyplace`,
