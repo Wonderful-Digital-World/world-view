@@ -183,7 +183,9 @@ function menu(subtitle, items) {
     };
     const onData = (buf) => {
       const s = buf.toString();
-      if (s === "" || s === "q") return finish(-1);
+      // In raw mode Ctrl+C/Ctrl+D arrive as bytes 0x03/0x04, NOT as SIGINT — treat
+      // them as cancel so the terminal is restored and we exit cleanly (same as q/ESC).
+      if (s === "\x03" || s === "\x04" || s === "" || s === "q") return finish(-1);
       if (s === "[A" || s === "k") idx = (idx - 1 + items.length) % items.length;
       else if (s === "[B" || s === "j") idx = (idx + 1) % items.length;
       else if (s === "\r" || s === "\n") return finish(idx);
