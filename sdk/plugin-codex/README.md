@@ -49,6 +49,15 @@ or the `autorespond` tool.
 
 ## Install
 
+This is a **standalone npm package** — it is intentionally excluded from the repo's
+pnpm workspace, so the root `pnpm install` does **not** install its dependencies.
+Install them once inside this directory before running either door, or the
+launcher / MCP server will fail with `ERR_MODULE_NOT_FOUND`:
+
+```bash
+cd sdk/plugin-codex && npm install
+```
+
 ### Door A — add the MCP server to your existing Codex
 
 ```bash
