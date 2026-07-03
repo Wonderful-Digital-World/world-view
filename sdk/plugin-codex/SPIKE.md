@@ -33,11 +33,17 @@ Cross-provider gateway extraction deferred.
   isolation. Fully controlled, no marketplace.
 - **Path A (later)**: package as a real Codex marketplace plugin (`codex plugin add tinyplace@...`).
 
-## Open items carried forward
+## Resolved items
 
-- **O2**: unconfirmed whether Codex passes `session_id` (or any id) as ENV to the MCP subprocess.
-  Verify empirically at P2 first boot (dump `process.env`). Fallback: MCP server self-generates a
-  wrapper session id (`tp-codex-<ts>-<uuid>`) + pid for registry keying (same as harness-wrapper).
+- **O2 (RESOLVED, live codex-cli 0.142.5)**: Codex passes **NO** session-id env to the MCP
+  subprocess. Proven by `codex exec` → `whoami` returning `harnessSessionId: null` (all CODEX_*
+  vars empty). The MCP server's per-process wrapper id (`tp-codex-<ts>-<hex>`) is the identity for
+  harness_session_id/registry/activeStateKey. Assignment `scopeKey()` deliberately does NOT use the
+  ephemeral wrapper id (would break auto-adopt across restarts) — it keys on a real Codex session id
+  if ever present, else the working directory (stable per project), else global.
+- **P2 live-validated**: `codex exec` drove wallet_create → use → whoami against staging.
+  `use` published the key bundle + card, registered `codex:1`, connected the WebSocket doorbell
+  (`wsConnected:true`), self-drain mode. Full round-trip through a real Codex session works.
 
 ## Divergences from plugin-claude (design decisions)
 

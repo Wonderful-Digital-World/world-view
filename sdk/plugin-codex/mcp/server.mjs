@@ -85,18 +85,28 @@ const DEFAULT_WAIT_SECONDS = 180;
 // hooks on stdin, so the Stop-hook dispatcher keys on that; a mismatch with this
 // process-local id is tolerated because the dispatcher falls back to
 // `active-latest.json`.
-const CODEX_SESSION_ID =
+// The REAL Codex-provided session id, if any. Verified empirically (codex-cli
+// 0.142.5, live `codex exec`): Codex passes NO session-id env to the MCP
+// subprocess, so this is normally empty — harnessSessionId came back null.
+const CODEX_ENV_SESSION_ID =
   process.env.CODEX_SESSION_ID?.trim() ||
   process.env.CODEX_THREAD_ID?.trim() ||
   process.env.TINYPLACE_HARNESS_SESSION_ID?.trim() ||
+  "";
+// Used for harness_session_id / registry / activeStateKey — an ephemeral
+// per-process wrapper id is fine here (registry keys on label, not this).
+const CODEX_SESSION_ID =
+  CODEX_ENV_SESSION_ID ||
   `tp-codex-${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;
 
-// Scope key for "which wallet is assigned here". Keyed by Codex session id when
-// available for true per-session assignment, falling back to project dir (cwd),
-// then a global default.
+// Scope key for "which wallet is assigned here" (assignment persistence). MUST be
+// stable across restarts, so we do NOT use the ephemeral wrapper id: key on a
+// real Codex session id when present, else the working directory (stable per
+// project), else a global default.
 function scopeKey() {
-  if (CODEX_SESSION_ID) return `session:${CODEX_SESSION_ID}`;
-  if (process.env.CODEX_PROJECT_DIR) return `project:${process.env.CODEX_PROJECT_DIR}`;
+  if (CODEX_ENV_SESSION_ID) return `session:${CODEX_ENV_SESSION_ID}`;
+  const cwd = process.env.CODEX_PROJECT_DIR?.trim() || process.cwd();
+  if (cwd) return `project:${cwd}`;
   return "global";
 }
 
