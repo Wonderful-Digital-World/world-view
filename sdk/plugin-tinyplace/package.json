@@ -1,0 +1,21 @@
+{
+  "name": "@tinyhumansai/tinyplace-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "One tiny.place agent plugin for any harness: detects Codex / Claude Code at runtime and self-wires (MCP server, hooks, launcher). Unifies plugin-claude + plugin-codex.",
+  "bin": {
+    "tinyplace": "./bin/tinyplace.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node harness-test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@tinyhumansai/tinyplace": "^1.0.1",
+    "zod": "^3.25.0"
+  }
+}
