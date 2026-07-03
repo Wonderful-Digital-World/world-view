@@ -134,9 +134,14 @@ function ensureIsolatedHome({ pluginDir, dataDir, apiUrl, walletName }) {
   writeFileSync(join(iso, "config.toml"), config, { mode: 0o600 });
 
   // hooks.json — substitute ${TINYPLACE_PLUGIN_ROOT} with the absolute plugin dir
-  // so hook commands resolve regardless of Codex env expansion.
+  // so hook commands resolve regardless of Codex env expansion. The placeholder
+  // sits INSIDE JSON string values, so the substituted path must be JSON-escaped
+  // first — a Windows path (backslashes) or one containing a quote would otherwise
+  // produce invalid JSON. JSON.stringify(...).slice(1,-1) yields the escaped string
+  // body (\\ , \" , control chars) without the surrounding quotes.
   const hooksTemplate = join(pluginDir, "hooks", "hooks.json");
-  const hooks = readFileSync(hooksTemplate, "utf8").split("${TINYPLACE_PLUGIN_ROOT}").join(pluginDir);
+  const safePluginDir = JSON.stringify(pluginDir).slice(1, -1);
+  const hooks = readFileSync(hooksTemplate, "utf8").split("${TINYPLACE_PLUGIN_ROOT}").join(safePluginDir);
   writeFileSync(join(iso, "hooks.json"), hooks, { mode: 0o600 });
 
   return iso;
