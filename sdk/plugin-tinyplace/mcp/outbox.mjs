@@ -15,8 +15,27 @@ export function outboxDir(agentAddress) {
   return join(sessionsDir(agentAddress), "_outbox");
 }
 
+// True if `pid` names a live process. `process.kill(pid, 0)` sends no signal but
+// throws ESRCH if the process is gone; EPERM means it exists but isn't ours (still
+// alive). Guards against a garbage/negative pid.
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+
 // Requeue jobs whose `.sending-*` claim was orphaned by a daemon that exited
 // between claiming and done()/fail(). Without this they'd never be listed again.
+//
+// The claim name carries the OWNER daemon's pid (`.sending-<pid>-<job>.json`). A
+// claim whose owner is still alive may have a send in flight — reclaiming it by
+// age alone (the old behavior) double-sends the message. So only reclaim when the
+// owner is dead (definitively orphaned). For an unparseable name (unknown owner)
+// fall back to the age gate so a same-pid reuse race can't instantly reclaim.
 function recoverStaleClaims(dir) {
   let files;
   try {
@@ -27,10 +46,17 @@ function recoverStaleClaims(dir) {
   const now = Date.now();
   for (const f of files) {
     const p = join(dir, f);
+    const m = /^\.sending-(\d+)-(.+)$/.exec(f);
+    const orig = m ? m[2] : f.replace(/^\.sending-\d+-/, "");
+    if (!orig.endsWith(".json")) continue;
     try {
-      if (now - statSync(p).mtimeMs < STALE_CLAIM_MS) continue;
-      const orig = f.replace(/^\.sending-\d+-/, "");
-      if (!orig.endsWith(".json")) continue;
+      if (m) {
+        // Owner pid known: skip while it's alive (send may be in flight); a dead
+        // owner's claim is orphaned and reclaimed immediately.
+        if (pidAlive(Number(m[1]))) continue;
+      } else if (now - statSync(p).mtimeMs < STALE_CLAIM_MS) {
+        continue; // unknown owner — age gate only
+      }
       renameSync(p, join(dir, orig)); // back to a pending job
     } catch {
       /* raced with a live daemon finishing the send — fine */

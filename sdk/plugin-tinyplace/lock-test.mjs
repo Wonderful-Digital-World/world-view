@@ -13,6 +13,7 @@ process.env.TINYPLACE_HARNESS = "codex";
 process.env.TINYPLACE_CODEX_HOME = mkdtempSync(join(tmpdir(), "tinyplace-lock-"));
 delete process.env.TINYPLACE_DAEMON_LOCK_MS;
 const lock = await import("./mcp/daemon-lock.mjs");
+const outbox = await import("./mcp/outbox.mjs");
 
 const checks = [];
 const expect = (label, cond) => { checks.push({ label, ok: !!cond }); console.log((cond ? "PASS " : "FAIL ") + label); };
@@ -109,6 +110,25 @@ const staleAgent = "AgentStaleRace666666666666666";
 writeForeignLock(staleAgent, deadPid, now()); // a stale lock all racers must steal
 const stealResults = await Promise.all([runStealRacer(staleAgent), runStealRacer(staleAgent), runStealRacer(staleAgent)]);
 expect("3-way stale-steal race → exactly one WIN", stealResults.filter((r) => r === "WIN").length === 1);
+
+// ── outbox stale-claim recovery: skip a still-alive owner, reclaim a dead one ──
+// The claim name carries the owner daemon's pid. A live owner may have a send in
+// flight, so its claim must NOT be reclaimed (double-send); a dead owner's claim
+// is orphaned and must be requeued.
+{
+  const AO = "AgentOutbox7777777777777777777";
+  const dir = outbox.outboxDir(AO);
+  mkdirSync(dir, { recursive: true });
+  const job = (id) => JSON.stringify({ id, to: "PeerZ", text: "hi" }) + "\n";
+  const liveClaim = join(dir, `.sending-${livePid}-jobLive.json`);
+  writeFileSync(liveClaim, job("jobLive"));
+  writeFileSync(join(dir, `.sending-${deadPid}-jobDead.json`), job("jobDead"));
+
+  const claimed = outbox.claimOutboxJobs(AO);
+  expect("outbox reclaims exactly the dead owner's job", claimed.length === 1 && claimed[0].job.id === "jobDead");
+  expect("outbox leaves the live owner's in-flight claim untouched", existsSync(liveClaim) === true);
+  claimed.forEach((c) => c.done());
+}
 
 sleeper.kill("SIGKILL");
 
