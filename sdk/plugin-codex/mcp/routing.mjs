@@ -1,10 +1,14 @@
 // Inbound routing for the per-agent daemon: decide which session's inbox an
 // inbound message belongs to, and write it to the right file queue. Split out as
 // pure-ish helpers so routing is unit-testable offline (§14).
-import { mkdirSync, writeFileSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { sessionsDir, liveSessions, primarySession } from "./registry.mjs";
+
+// A claim older than this is assumed abandoned (reader crashed mid-drain) and is
+// requeued so the message isn't stranded. Mirrors the outbox stale-claim policy.
+const STALE_CLAIM_MS = Number(process.env.TINYPLACE_INBOX_CLAIM_MS) || 60_000;
 
 // No-target delivery policy (TINYPLACE_UNROUTED_POLICY): primary (default),
 // broadcast (fan out to all live), or drop.
@@ -102,9 +106,8 @@ export function redeliverUnrouted(agentAddress, { policy = unroutedPolicy() } = 
       continue;
     }
     const target = routeTarget({ toSession: payload.toSession, liveLabels: liveList, primary, policy });
-    // Only single-session delivery is reversible from _unrouted (broadcast would
-    // need copies); a held untargeted message goes to the current primary.
     if (target.kind === "session" && target.labels.length === 1) {
+      // Single-session delivery is reversible from _unrouted via a plain rename.
       const label = target.labels[0];
       try {
         mkdirSync(inboxDir(agentAddress, label), { recursive: true });
@@ -113,9 +116,42 @@ export function redeliverUnrouted(agentAddress, { policy = unroutedPolicy() } = 
       } catch {
         /* raced/gone */
       }
+    } else if (target.kind === "session" && target.labels.length > 1) {
+      // Broadcast (policy=broadcast): fan a copy into every live inbox, then drop
+      // the held original — otherwise it stays stuck in _unrouted forever.
+      try {
+        for (const label of target.labels) writeQueueFile(inboxDir(agentAddress, label), payload.id, payload);
+        rmSync(join(dir, f));
+        delivered += target.labels.length;
+      } catch {
+        /* keep the original for the next retry */
+      }
     }
   }
   return delivered;
+}
+
+// Requeue inbox files whose `.claimed-*` rename was orphaned by a reader that
+// crashed between claiming and removing them. Best-effort, stale-guarded.
+function recoverStaleInboxClaims(dir) {
+  let files;
+  try {
+    files = readdirSync(dir).filter((f) => f.startsWith(".claimed-"));
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  for (const f of files) {
+    const p = join(dir, f);
+    try {
+      if (now - statSync(p).mtimeMs < STALE_CLAIM_MS) continue;
+      const orig = f.replace(/^\.claimed-\d+-/, "");
+      if (!orig.endsWith(".json")) continue;
+      renameSync(p, join(dir, orig)); // back to a pending message
+    } catch {
+      /* raced with a live reader finishing — fine */
+    }
+  }
 }
 
 // Read (and by default claim) the queued inbox files for a session. Each file is
@@ -123,9 +159,12 @@ export function redeliverUnrouted(agentAddress, { policy = unroutedPolicy() } = 
 // double-deliver, then parsed. Returns an array of payloads.
 export function drainInbox(agentAddress, label, { peek = false } = {}) {
   const dir = inboxDir(agentAddress, label);
+  if (!peek) recoverStaleInboxClaims(dir); // requeue anything a crashed reader stranded
   let files = [];
   try {
-    files = readdirSync(dir).filter((f) => f.endsWith(".json")).sort();
+    // Exclude dotfiles: a live `.claimed-*` file also ends in `.json`, and reading
+    // it as a pending message would double-deliver on a racing drain.
+    files = readdirSync(dir).filter((f) => f.endsWith(".json") && !f.startsWith(".")).sort();
   } catch {
     return [];
   }
