@@ -11,7 +11,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node envelope-test.mjs && node registry-test.mjs && node routing-test.mjs && node lock-test.mjs && node mcp-smoke.mjs"
+    "test": "node envelope-test.mjs && node registry-test.mjs && node routing-test.mjs && node lock-test.mjs && node daemon-test.mjs && node mcp-smoke.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
