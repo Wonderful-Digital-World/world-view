@@ -73,6 +73,28 @@ Cross-provider gateway extraction deferred.
   substitutes absolute paths when writing into `CODEX_HOME` (robust regardless of
   Codex hook-command env expansion).
 
+## P5/Door-B live proof (2026-07-03)
+
+Launcher path validated end-to-end via `bin/tinyplace-codex.mjs --wallet cxfresh --
+exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4-mini "…"`:
+- isolated `CODEX_HOME` config loaded, MCP `tinyplace` registered, `whoami` + `inbox`
+  **completed** (wallet `cxfresh`, session `codex:2`, **mode `daemon`** → P3 daemon
+  spawned live), inbox 0/0.
+- **All three hooks fired**: SessionStart + UserPromptSubmit (surfacing) + Stop (dispatch).
+
+**Hooks loading (verified):** codex **auto-discovers `$CODEX_HOME/hooks.json`** at
+runtime — the Claude-shaped `{"hooks":{"SessionStart":[{"hooks":[{type,command}]}]}}`
+file fires as-is, no config key needed. Do NOT add a `hooks` key to `config.toml`: there
+it must be an inline `[hooks]` struct (`[[hooks.sessionStart]]` camelCase array-of-tables,
+fields `type`/`command`/`timeout`/`async`/`statusMessage`); a path string errors
+(`invalid type: string, expected struct HooksToml`). The `hooks = "./hooks.json"` file-ref
+form is only valid in a `.codex-plugin/plugin.json` manifest (Path A), not config.toml.
+
+**`codex exec` sandbox note:** exec defaults to `read-only` sandbox + `approval: never`,
+which auto-cancels the MCP tool calls ("user cancelled MCP tool call"). Pass
+`--dangerously-bypass-approvals-and-sandbox` for non-interactive runs (the auto-responder
+already does). Interactive Door B doesn't hit this — it approves tool calls live.
+
 ## What ports verbatim (pure, provider-agnostic)
 
 `format.mjs` (provider→"codex"), `routing.mjs`, `registry.mjs` (label prefix), `daemon-lock.mjs`,
