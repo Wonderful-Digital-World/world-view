@@ -11,7 +11,7 @@ differs is isolated into **runtime-selected adapters**.
 
 ## How one package serves every harness
 
-```
+```text
                        ┌─────────────────────────────┐
    install once  ───▶  │  @tinyhumansai/tinyplace-*   │
                        │                             │
