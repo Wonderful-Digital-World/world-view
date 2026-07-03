@@ -155,7 +155,14 @@ async function drainInbound() {
 
 // ── outbound loop (the only ratchet writer) ──────────────────────────────────
 const contactRequested = new Set(); // peers we've already sent a contact request to
+let outboundDraining = false;
 async function drainOutbound() {
+  // setInterval can fire a new cycle before the previous send finishes; a second
+  // concurrent drain would call sendMessage against the same Signal store, breaking
+  // the daemon's single-ratchet-writer contract. Serialize on an in-flight flag.
+  if (outboundDraining) return;
+  outboundDraining = true;
+  try {
   const jobs = claimOutboxJobs(AGENT);
   for (const { job, done, fail } of jobs) {
     try {
@@ -189,6 +196,9 @@ async function drainOutbound() {
       }
       fail();
     }
+  }
+  } finally {
+    outboundDraining = false;
   }
 }
 
