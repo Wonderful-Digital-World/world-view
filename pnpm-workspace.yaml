@@ -6,3 +6,6 @@ packages:
   # + -r builds.
   - "!sdk/plugin-claude"
   - "!sdk/plugin-codex"
+  # plugin-tinyplace is the unified plugin (own node_modules / lockfile) — same
+  # standalone treatment: keep it out of the frozen install + recursive builds.
+  - "!sdk/plugin-tinyplace"
