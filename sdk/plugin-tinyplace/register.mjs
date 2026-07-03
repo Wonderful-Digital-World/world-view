@@ -17,6 +17,10 @@ const BASE = process.env.TINYPLACE_API_URL ?? "https://staging-api.tiny.place";
 const RPC = `${BASE}/solana/rpc`;
 const WALLETS_FILE = join(harnessDataDir(), "wallets.json");
 const [name, baseHandle] = process.argv.slice(2);
+if (!name || !baseHandle) {
+  console.error("usage: node register.mjs <walletName> <baseHandle>");
+  process.exit(1);
+}
 const h2b = (h) => { const o = new Uint8Array(h.length / 2); for (let i = 0; i < o.length; i++) o[i] = parseInt(h.slice(i * 2, i * 2 + 2), 16); return o; };
 
 const store = JSON.parse(readFileSync(WALLETS_FILE, "utf8"));
@@ -26,12 +30,19 @@ if (!w) { console.log("no wallet", name); process.exit(1); }
 const signer = await LocalSigner.fromSeed(h2b(w.secretKey));
 const client = new TinyPlaceClient({ baseUrl: BASE, signer });
 
-// find an available handle
-let handle = baseHandle;
+// find an available handle: try the base, then a few deterministic variants.
+// Only ever register a candidate we've confirmed is available — never fall out
+// of the loop onto an unchecked handle.
+const suffixSeed = [...w.address.slice(2, 6)].reduce((s, c) => s + c.charCodeAt(0), 0) % 1000;
+let handle;
 for (let i = 0; i < 6; i++) {
-  const a = await client.registry.get(handle).catch(() => ({ available: false }));
-  if (a.available) break;
-  handle = `${baseHandle}${Math.floor(Number(w.address.slice(2, 6).split("").reduce((s, c) => s + c.charCodeAt(0), 0)) % 1000) + i}`;
+  const candidate = i === 0 ? baseHandle : `${baseHandle}${suffixSeed + i - 1}`;
+  const a = await client.registry.get(candidate).catch(() => ({ available: false }));
+  if (a.available) { handle = candidate; break; }
+}
+if (!handle) {
+  console.error(`no available handle found for base "${baseHandle}" after 6 tries`);
+  process.exit(1);
 }
 console.log(`registering ${handle} for ${name} (${w.address}) — spends 1 USDC...`);
 
