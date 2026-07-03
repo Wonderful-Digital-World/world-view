@@ -64,4 +64,26 @@ Cross-provider gateway extraction deferred.
 ## Interop
 
 Both plugins speak `SessionEnvelopeV1` (`tinyplace.harness.session.v1`) → a codex agent and a claude
-agent under different identities can DM each other. Cross-harness E2E is the P6 acceptance proof.
+agent under different identities can DM each other.
+
+- **Cross-plugin E2E (deterministic, committed)**: `xplugin-e2e.mjs` — claude-plugin sender →
+  codex-plugin receiver, fresh identities, decrypts to exact plaintext. Green.
+- **Cross-harness LIVE (proven 2026-07-03)**: a real Claude session DM was received + decrypted in a
+  live Codex session (`from session: claude:1`), against staging.
+
+## Known issue: first-contact ratchet desync (SDK-level)
+
+Intermittently, the FIRST message to a new peer arrives **undecryptable** ("desynced session") — the
+sender's X3DH init doesn't match the receiver's stored prekeys. Reproduced across BOTH harnesses, so
+it is SDK/relay-level (Signal prekey publish vs fetch race), not plugin logic. Amplified by: repeated
+`use` (rotates prekeys), MCP transport restarts (Codex kills a hung server), and the receiver's
+in-memory (self-mode) buffer being lost on restart.
+
+**Recovery (works): mutual `reset_session`** — receiver `reset_session(peer, rehandshake:true)`
+republishes its bundle; sender then `reset_session(peer, rehandshake:true)` + resend, refetching the
+fresh bundle → clean X3DH → decrypts.
+
+**Follow-ups**: (a) P4 auto-recovery should escalate to republish-own-bundle on undecryptable, not
+just local reset; (b) prefer **daemon mode** for receivers (durable inbox files survive MCP restarts;
+self-mode buffers in RAM and loses drained mail on restart); (c) file upstream: SDK first-contact
+prekey race.
