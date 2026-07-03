@@ -249,8 +249,10 @@ function menu(subtitle, items) {
     const onData = (buf) => {
       const s = buf.toString();
       if (s === "" || s === "q") return finish(-1);
-      if (s === "[A" || s === "k") idx = (idx - 1 + items.length) % items.length;
-      else if (s === "[B" || s === "j") idx = (idx + 1) % items.length;
+      // Raw TTY arrow keys arrive as the full ESC sequence (\x1b[A / \x1b[B);
+      // match both those and the bare CSI/vim forms.
+      if (s === "\x1b[A" || s === "[A" || s === "k") idx = (idx - 1 + items.length) % items.length;
+      else if (s === "\x1b[B" || s === "[B" || s === "j") idx = (idx + 1) % items.length;
       else if (s === "\r" || s === "\n") return finish(idx);
       else if (/^[1-9]$/.test(s) && Number(s) <= items.length) return finish(Number(s) - 1);
       render();
