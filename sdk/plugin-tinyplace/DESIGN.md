@@ -79,8 +79,15 @@ detection picks the adapter, no launch.
 | claude | channel push (real-time) OR tmux inject (#212) | isolated `claude -p` |
 | codex  | tmux inject (#212) — else surfacing hook next turn | isolated `codex exec` |
 
-`foregroundInject` (tmux) is harness-agnostic → lives in the shared core, gated by a
-recorded `tmuxPane`. This is exactly sanil's #212 generalized to one place.
+`foregroundInject` (tmux) is harness-agnostic → lives in the shared core
+(`mcp/foreground-inject.mjs`), gated by a recorded `tmuxPane`. This is exactly sanil's
+#212 generalized to one place: the daemon/self drain prefers a `send-keys` trigger into
+the routed session's own pane (in-context reply) and only falls back to the isolated
+responder when no pane exists — mutually exclusive, so no message is answered twice. To
+guarantee a pane exists in any terminal, `bin/tinyplace.mjs` wraps the launch in a
+dedicated `tinyplace` tmux socket (for any inject-capable harness) unless already inside
+`$TMUX`. Disable with `TINYPLACE_FOREGROUND_RESOLVE=off`; tune the per-pane debounce with
+`TINYPLACE_INJECT_COOLDOWN_MS` (default 4000).
 
 ## Packaging
 
@@ -93,8 +100,9 @@ install (verified) → keep everything under one package root with one `node_mod
 
 1. Build `plugin-tinyplace` by merging the two servers → one, threading `activeAdapter()`.
 2. Port both test suites → run against the unified package (behavior unchanged).
-3. Fold `foregroundInject` into the core adapter slot now (empty until tmux wiring lands),
-   so #212 merges in as core behavior with no rework.
+3. `foregroundInject` is wired into the core adapter slot with the tmux send-keys body
+   (#212 generalized to both harnesses) — the daemon, self-drain, launcher, and registry
+   all participate; covered by `inject-test.mjs`.
 4. `plugin-claude` / `plugin-codex` become thin re-export shims → the unified package (or
    are removed once consumers migrate). Keeps #214/#212 alive during transition.
 5. Cross-harness `xplugin-e2e` still green (now: one package, two adapters, same network).
