@@ -49,4 +49,28 @@ export const claudeAdapter = {
 
   // Launcher install shape.
   install: { kind: "plugin-dir" },
+
+  // Launcher recipe (Door B). The shared bin/tinyplace.mjs stays harness-agnostic:
+  // it owns wallet store + menu, then calls prepare() to get the {command,args,env}
+  // for THIS harness and spawns it with stdio inherited. Claude Code takes a plugin
+  // dir directly, so there's no isolated-home step — just point it at the plugin.
+  launch: {
+    displayHarness: "Claude",
+    binary: "claude",
+    notFoundHint: "Is Claude Code installed and on your PATH?",
+    // ctx: { pluginDir, dataDir, apiUrl, walletName, forwardedArgs }
+    prepare(ctx) {
+      return {
+        command: "claude",
+        args: [
+          "--plugin-dir",
+          ctx.pluginDir,
+          "--dangerously-load-development-channels",
+          "server:tinyplace",
+          ...ctx.forwardedArgs,
+        ],
+        env: { TINYPLACE_ACTIVE_WALLET: ctx.walletName },
+      };
+    },
+  },
 };
