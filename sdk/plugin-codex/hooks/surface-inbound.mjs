@@ -114,10 +114,12 @@ if (fresh.length === 0) process.exit(0);
 for (const m of fresh) markSurfaced(active.address, m.id);
 
 const shown = fresh.slice(0, MAX_ANNOUNCE);
+// Announce only sender/count metadata — never the message text. A preview would
+// smuggle peer-controlled (untrusted) content into trusted model context outside
+// the `inbox` tool's trust boundary; the agent reads the full body via `inbox`.
 const lines = shown.map((m) => {
   const who = m.fromSession ? `${m.from} (session ${m.fromSession})` : m.from;
-  const preview = String(m.text ?? "").replace(/\s+/g, " ").slice(0, 120);
-  return `  • from ${who}: "${preview}"`;
+  return `  • from ${who}`;
 });
 const more = fresh.length > shown.length ? `\n  …and ${fresh.length - shown.length} more.` : "";
 const context =
