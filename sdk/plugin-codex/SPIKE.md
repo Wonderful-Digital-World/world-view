@@ -56,6 +56,23 @@ Cross-provider gateway extraction deferred.
 | Config dir | `~/.tinyplace-claude` | `~/.tinyplace-codex` |
 | Session label | `claude:n` | `codex:n` |
 
+## P4 status (hooks + auto-responder + inbound surfacing)
+
+- **Stop hook → `dispatch.mjs` → `respond-batch.mjs`**: claims the queued inbound
+  batch, spawns one `codex exec --dangerously-bypass-approvals-and-sandbox -m <model>`
+  responder per DM that calls `auto_reply` (threaded, `auto`-tagged → loop-guarded).
+  Recursion guard `TINYPLACE_NO_AUTORESPOND` on responders. Offline-tested
+  (`hooks-test.mjs`, DRYRUN seam). **Not yet live-verified** — the `codex exec`
+  responder + hook-trust path needs the P5 isolated `CODEX_HOME` to run.
+- **Pull-only inbound surfacing** (`surface-inbound.mjs`, SessionStart +
+  UserPromptSubmit): PEEKS routed inboxes, injects unseen DMs as `additionalContext`
+  (per-id marker dedups; `inbox` tool still delivers full content). Only meaningful
+  in **daemon mode** (inbox files); self-mode buffers inbound in RAM, invisible to
+  the separate hook process → agent calls `inbox` directly there.
+- **hooks.json** uses `${TINYPLACE_PLUGIN_ROOT}` placeholders → the P5 launcher
+  substitutes absolute paths when writing into `CODEX_HOME` (robust regardless of
+  Codex hook-command env expansion).
+
 ## What ports verbatim (pure, provider-agnostic)
 
 `format.mjs` (provider→"codex"), `routing.mjs`, `registry.mjs` (label prefix), `daemon-lock.mjs`,
