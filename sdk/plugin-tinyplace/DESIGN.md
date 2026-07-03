@@ -49,7 +49,7 @@ Order: explicit override → harness-specific env signals → default.
   sessionLabelPrefix,                  // "codex" / "claude"
   resolveHarnessSessionId(),           // codex: CODEX_* → null→wrapper id; claude: CLAUDE_CODE_SESSION_ID
   inbound: {                           // how new DMs reach a live session
-    push: false | { capability, pushMessage, pushContactRequest },   // claude channel
+    push: false | { capability, method },   // claude channel (server→client notification)
     pull: true | false,                // codex: surfacing hook + inbox tool
     foregroundInject: true,            // tmux send-keys into the live pane (folds in #212, both harnesses)
   },
