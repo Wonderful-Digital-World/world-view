@@ -119,6 +119,18 @@ now-closed session. Tune with `TINYPLACE_SESSION_CLOSED_GRACE_MS` (default 5000)
 > label, not the conversation uuid — a documented degradation of the fallback path; the
 > interactive / foreground-inject path is fully uuid-bound.
 
+## Identity store (shared) + CLI picker
+
+An agent identity is a keypair; which harness drives it is a runtime choice. So wallets
+live in ONE shared, CLI-independent store — `~/.tinyplace/wallets.json` (override with
+`TINYPLACE_HOME`), read by the launcher, server, daemon, and register via `mcp/wallets.mjs`.
+Only sessions/signal/queue/uuids stay per-harness (`harnessDataDir`). First read migrates
+any legacy per-harness `wallets.json` (`~/.tinyplace-claude`, `~/.tinyplace-codex`) into the
+shared store. The launcher flow is therefore **pick identity → pick CLI → launch**: after a
+wallet is chosen, `bin/tinyplace.mjs` offers the installed harnesses (probed on PATH) when
+more than one exists and `--harness` wasn't forced, then pins `TINYPLACE_HARNESS` and
+re-resolves the adapter for the launch.
+
 ## Packaging
 
 Single package, its own `node_modules` (deps: `@tinyhumansai/tinyplace`,

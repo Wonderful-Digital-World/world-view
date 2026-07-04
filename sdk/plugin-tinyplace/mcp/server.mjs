@@ -50,6 +50,7 @@ import {
   resolveSessionUuid,
   resolveConversationUuid,
 } from "./registry.mjs";
+import { loadWallets, saveWallets } from "./wallets.mjs";
 import { drainInbox, redeliverUnrouted } from "./routing.mjs";
 import { writeOutboxJob } from "./outbox.mjs";
 import { daemonLive } from "./daemon-lock.mjs";
@@ -89,7 +90,6 @@ function withTimeout(promise, ms, label) {
 
 // ── storage ────────────────────────────────────────────────────────────────
 const DATA_DIR = harnessDataDir(ADAPTER);
-const WALLETS_FILE = join(DATA_DIR, "wallets.json");
 const SIGNAL_DIR = join(DATA_DIR, "signal");
 const BASE_URL =
   process.env.TINYPLACE_API_URL ??
@@ -144,21 +144,7 @@ function ensureDirs() {
   mkdirSync(SIGNAL_DIR, { recursive: true });
 }
 
-function loadWallets() {
-  if (!existsSync(WALLETS_FILE)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(WALLETS_FILE, "utf8"));
-    return Array.isArray(parsed?.wallets) ? parsed.wallets : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveWallets(wallets) {
-  ensureDirs();
-  writeFileSync(WALLETS_FILE, JSON.stringify({ wallets }, null, 2) + "\n", { mode: 0o600 });
-  try { chmodSync(WALLETS_FILE, 0o600); } catch {}
-}
+// loadWallets / saveWallets come from the shared, CLI-independent store (wallets.mjs).
 
 function loadAssignments() {
   if (!existsSync(ASSIGN_FILE)) return {};

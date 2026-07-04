@@ -26,6 +26,7 @@ import { acquireLock, heartbeatLock, releaseLock } from "../mcp/daemon-lock.mjs"
 import { toCryptoId } from "../mcp/address.mjs";
 import { harnessDataDir } from "../mcp/harness.mjs";
 import { foregroundInject } from "../mcp/foreground-inject.mjs";
+import { loadWallets } from "../mcp/wallets.mjs";
 
 // Survive transient relay errors — a stray unhandled rejection must not kill the
 // single per-agent daemon (it owns the ratchet); the poll loop retries next tick.
@@ -41,7 +42,6 @@ const PLUGIN_ROOT = dirname(HERE);
 // Data dir for the active harness (env override wins) — the daemon serves ONE
 // harness's agent; harnessDataDir() reads the adapter's env + default.
 const DATA_DIR = harnessDataDir();
-const WALLETS_FILE = join(DATA_DIR, "wallets.json");
 const SIGNAL_DIR = join(DATA_DIR, "signal");
 const QUEUE_DIR = join(DATA_DIR, "queue");
 const BASE_URL =
@@ -60,13 +60,7 @@ if (!walletName) {
 }
 
 function loadWallet(name) {
-  try {
-    const parsed = JSON.parse(readFileSync(WALLETS_FILE, "utf8"));
-    const list = Array.isArray(parsed?.wallets) ? parsed.wallets : [];
-    return list.find((w) => w.name === name) ?? null;
-  } catch {
-    return null;
-  }
+  return loadWallets().find((w) => w.name === name) ?? null; // shared, CLI-independent store
 }
 
 function hexToBytes(hex) {

@@ -27,8 +27,9 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { LocalSigner } from "@tinyhumansai/tinyplace";
 
-import { activeAdapter, harnessDataDir } from "../mcp/harness.mjs";
+import { activeAdapter, harnessDataDir, ADAPTERS, _resetAdapterCache } from "../mcp/harness.mjs";
 import { canForegroundInject } from "../mcp/foreground-inject.mjs";
+import { loadWallets, saveWallets } from "../mcp/wallets.mjs";
 
 // bin/tinyplace.mjs -> plugin root is one dir up from bin/.
 const PLUGIN_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -39,27 +40,7 @@ const REGISTER_SCRIPT = join(PLUGIN_DIR, "register.mjs");
 // forced adapter (if any) wins detection. These are set once, up front.
 let ADAPTER;
 let DATA_DIR;
-let WALLETS_FILE;
-
-// ── wallet store (mirrors mcp/server.mjs byte-for-byte) ──────────────────────
-function loadWallets() {
-  if (!existsSync(WALLETS_FILE)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(WALLETS_FILE, "utf8"));
-    return Array.isArray(parsed?.wallets) ? parsed.wallets : [];
-  } catch {
-    return [];
-  }
-}
-function saveWallets(wallets) {
-  mkdirSync(DATA_DIR, { recursive: true });
-  writeFileSync(WALLETS_FILE, JSON.stringify({ wallets }, null, 2) + "\n", { mode: 0o600 });
-  try {
-    chmodSync(WALLETS_FILE, 0o600);
-  } catch {
-    /* best-effort */
-  }
-}
+// Wallets come from the shared, CLI-independent store (mcp/wallets.mjs).
 function hexToBytes(hex) {
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
@@ -187,8 +168,10 @@ function menu(subtitle, items) {
       // In raw mode Ctrl+C/Ctrl+D arrive as bytes 0x03/0x04, NOT as SIGINT — treat
       // them as cancel so the terminal is restored and we exit cleanly (same as q/ESC).
       if (s === "\x03" || s === "\x04" || s === "" || s === "q") return finish(-1);
-      if (s === "[A" || s === "k") idx = (idx - 1 + items.length) % items.length;
-      else if (s === "[B" || s === "j") idx = (idx + 1) % items.length;
+      // Arrow keys arrive as a full ESC sequence in one chunk (ESC "[" "A"/"B");
+      // match that (not a bare "[A", which never occurs) plus vim j/k.
+      if (s === "\x1b[A" || s === "\x1bOA" || s === "k") idx = (idx - 1 + items.length) % items.length;
+      else if (s === "\x1b[B" || s === "\x1bOB" || s === "j") idx = (idx + 1) % items.length;
       else if (s === "\r" || s === "\n") return finish(idx);
       else if (/^[1-9]$/.test(s) && Number(s) <= items.length) return finish(Number(s) - 1);
       render();
@@ -348,6 +331,51 @@ function launch(walletName, forwardedArgs) {
   return launchWrapped(plan, walletName);
 }
 
+// The harnesses whose CLI is actually installed (on PATH). `spawnSync` sets `error`
+// only when the binary can't be found, so a non-zero `--version` still counts.
+function installedHarnesses() {
+  return Object.entries(ADAPTERS)
+    .filter(([, a]) => {
+      try {
+        return !spawnSync(a.launch.binary, ["--version"], { stdio: "ignore" }).error;
+      } catch {
+        return false;
+      }
+    })
+    .map(([name, adapter]) => ({ name, adapter }));
+}
+
+// Pin the active harness for THIS launch (and the child, via env) and re-resolve the
+// adapter + its per-harness data dir. Wallets are shared, so only sessions/signal move.
+function selectHarness(name) {
+  process.env.TINYPLACE_HARNESS = name;
+  _resetAdapterCache();
+  ADAPTER = activeAdapter();
+  DATA_DIR = harnessDataDir(ADAPTER);
+}
+
+// After an identity is chosen, let the user pick which CLI to drive it with (Claude /
+// Codex …) when more than one is installed and none was forced via --harness.
+// Returns true if it launched (caller should return/exit), false if the user backed
+// out (caller re-shows its menu). `launch()` takes over the terminal, so on a real
+// launch control only returns here for the async launchDirect case.
+async function chooseHarnessAndLaunch(walletName, forwardedArgs, { forced }) {
+  const installed = installedHarnesses();
+  if (forced || installed.length <= 1) {
+    if (installed.length === 1) selectHarness(installed[0].name);
+    launch(walletName, forwardedArgs);
+    return true;
+  }
+  const pick = await menu(`Launch ${walletName} with which CLI?`, [
+    ...installed.map((h) => ({ label: h.adapter.launch.displayHarness, hint: h.adapter.launch.binary })),
+    { label: "← Back", hint: "" },
+  ]);
+  if (pick < 0 || pick >= installed.length) return false; // back → caller's menu loop
+  selectHarness(installed[pick].name);
+  launch(walletName, forwardedArgs);
+  return true;
+}
+
 async function registerFlow(wallet) {
   clear();
   const base = await prompt(`  Base handle to register for '${wallet.name}': @`);
@@ -388,14 +416,14 @@ async function main() {
   // `--harness <name>` forces the adapter; fold it into env BEFORE resolving so
   // detectHarness() honors it (TINYPLACE_HARNESS is the built-in override).
   const harnessFlag = flags.indexOf("--harness");
-  if (harnessFlag !== -1 && flags[harnessFlag + 1]) {
+  const harnessForced = harnessFlag !== -1 && Boolean(flags[harnessFlag + 1]);
+  if (harnessForced) {
     process.env.TINYPLACE_HARNESS = flags[harnessFlag + 1];
   }
 
   // Resolve the active adapter + its data dir now that the override is in env.
   ADAPTER = activeAdapter();
   DATA_DIR = harnessDataDir(ADAPTER);
-  WALLETS_FILE = join(DATA_DIR, "wallets.json");
 
   // Non-interactive fast path: `tinyplace --wallet alice`.
   const walletFlag = flags.indexOf("--wallet");
@@ -429,8 +457,12 @@ async function main() {
       process.exit(0);
     }
 
-    // A wallet row → launch (this replaces the process's terminal with the harness).
-    if (choice < wallets.length) return launch(wallets[choice].name, forwardedArgs);
+    // A wallet row → pick the CLI (if >1 installed), then launch (this replaces the
+    // process's terminal with the harness). "Back" from the CLI picker re-shows this.
+    if (choice < wallets.length) {
+      if (await chooseHarnessAndLaunch(wallets[choice].name, forwardedArgs, { forced: harnessForced })) return;
+      continue;
+    }
 
     const action = items[choice].label;
     if (action.startsWith("＋")) {
