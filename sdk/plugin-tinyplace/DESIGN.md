@@ -87,7 +87,11 @@ responder when no pane exists — mutually exclusive, so no message is answered 
 guarantee a pane exists in any terminal, `bin/tinyplace.mjs` wraps the launch in a
 dedicated `tinyplace` tmux socket (for any inject-capable harness) unless already inside
 `$TMUX`. Disable with `TINYPLACE_FOREGROUND_RESOLVE=off`; tune the per-pane debounce with
-`TINYPLACE_INJECT_COOLDOWN_MS` (default 4000).
+`TINYPLACE_INJECT_COOLDOWN_MS` (default 4000). Injection is verified live on **both**
+Claude and Codex (a `send-keys` trigger wakes an idle Codex TUI and it takes the turn);
+the Codex launch config pre-trusts the working directory (`[projects."<cwd>"]
+trust_level = "trusted"`) so the first trigger isn't swallowed by the first-run
+"trust this directory?" dialog.
 
 ### Closed-session addressing
 

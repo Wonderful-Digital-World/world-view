@@ -304,6 +304,7 @@ function launch(walletName, forwardedArgs) {
       apiUrl: API_URL,
       walletName,
       forwardedArgs,
+      cwd: process.cwd(),
     });
   } catch (error) {
     console.error(`\nCould not prepare ${ADAPTER.launch.displayHarness}: ${error.message}`);
