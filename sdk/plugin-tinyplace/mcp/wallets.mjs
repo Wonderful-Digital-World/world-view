@@ -6,7 +6,7 @@
 // One-time migration: the first read folds any legacy per-harness `wallets.json`
 // (~/.tinyplace-claude, ~/.tinyplace-codex) into the shared store, so existing
 // identities aren't lost when this lands.
-import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -17,6 +17,15 @@ export function sharedDir() {
 }
 export function walletsFile() {
   return join(sharedDir(), "wallets.json");
+}
+
+// Atomic write: this store now consolidates EVERY identity's secret key, so a
+// truncated/partial write (crash / ENOSPC / concurrent writer) would wipe them all.
+// Write to a temp file and rename into place so readers only ever see a complete file.
+function writeAtomic(path, content) {
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, content, { mode: 0o600 });
+  renameSync(tmp, path);
 }
 
 function migrateLegacy() {
@@ -34,7 +43,7 @@ function migrateLegacy() {
   if (!merged.size) return; // nothing to migrate — first real save creates the store
   try {
     mkdirSync(sharedDir(), { recursive: true });
-    writeFileSync(dest, JSON.stringify({ wallets: [...merged.values()] }, null, 2) + "\n", { mode: 0o600 });
+    writeAtomic(dest, JSON.stringify({ wallets: [...merged.values()] }, null, 2) + "\n");
   } catch {
     /* best-effort — loadWallets falls back to [] */
   }
@@ -52,7 +61,7 @@ export function loadWallets() {
 
 export function saveWallets(wallets) {
   mkdirSync(sharedDir(), { recursive: true });
-  writeFileSync(walletsFile(), JSON.stringify({ wallets }, null, 2) + "\n", { mode: 0o600 });
+  writeAtomic(walletsFile(), JSON.stringify({ wallets }, null, 2) + "\n");
   try {
     chmodSync(walletsFile(), 0o600);
   } catch {
