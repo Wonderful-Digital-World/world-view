@@ -10,6 +10,7 @@
 // Liveness: a session is live if `now - updatedAt < LIVE_WINDOW` AND its pid is
 // alive. Sessions heartbeat (rewrite updatedAt) on the poll tick. Stale files
 // are ignored for routing and garbage-collected.
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync, openSync, writeSync, closeSync } from "node:fs";
 import { join } from "node:path";
 
@@ -17,6 +18,42 @@ import { activeAdapter, harnessDataDir } from "./harness.mjs";
 
 // A session is considered live within this window of its last heartbeat.
 const LIVE_WINDOW_MS = Number(process.env.TINYPLACE_SESSION_LIVE_MS) || 30_000;
+
+// Durable per-session UUID — the reuse-proof binding key for conversations. A label
+// (`claude:1`) is positional and can be inherited by a DIFFERENT session once its slot
+// frees, which would misroute a bound thread to a stranger; a UUID is never reused.
+// Keyed by the harness session id (stable across `claude --resume`) so a resumed
+// session keeps its identity; when the harness exposes no session id we fall back to a
+// process-stable random (still unique + non-reusable, just not stable across restart).
+// One file per harness session id (not a shared blob), so concurrent first-writes
+// for different sessions can't clobber each other's mapping. Exclusive-create CAS:
+// on a race, the loser reads the winner's uuid.
+function sessionUuidDir() {
+  return join(harnessDataDir(), "session-uuids");
+}
+let processUuid = null;
+export function resolveSessionUuid(harnessSessionId) {
+  const hsid = (harnessSessionId ?? "").trim();
+  if (!hsid) return (processUuid ??= randomUUID());
+  const dir = sessionUuidDir();
+  const path = join(dir, encodeURIComponent(hsid) + ".json");
+  const existing = readEntryFile(path);
+  if (existing?.uuid) return existing.uuid;
+  const uuid = randomUUID();
+  try {
+    mkdirSync(dir, { recursive: true });
+    const fd = openSync(path, "wx", 0o600); // CAS: first writer wins this hsid
+    try {
+      writeSync(fd, JSON.stringify({ uuid, harnessSessionId: hsid }) + "\n");
+    } finally {
+      closeSync(fd);
+    }
+  } catch (e) {
+    if (e?.code === "EEXIST") return readEntryFile(path)?.uuid ?? uuid; // racer won — use theirs
+    /* other write error → fall back to the freshly minted value for this process */
+  }
+  return uuid;
+}
 
 // Synchronous sleep (no async yield) so claimLabel's CAS retry is indivisible.
 function sleepSync(ms) {
@@ -96,6 +133,70 @@ export function primarySession(agentAddress) {
   return liveSessions(agentAddress)[0] ?? null;
 }
 
+// The label of the live session owning `uuid`, or null if that session isn't live —
+// the reuse-proof "is the addressed session still up?" check. Because a UUID is never
+// reused, a match is guaranteed to be the SAME session the peer was talking to.
+export function labelForUuid(agentAddress, uuid) {
+  if (!uuid) return null;
+  return liveSessions(agentAddress).find((s) => s.sessionUuid === uuid)?.label ?? null;
+}
+
+// ── Conversation UUIDs (the wire-visible `wrapper_session_id`) ────────────────
+// wrapper_session_id is a per-CONVERSATION id between two agents: a fresh uuid per
+// (this session, peer) so peers can't correlate our sessions across conversations and
+// each relationship is its own thread. It maps to the session's durable sessionUuid
+// via a reverse index (option b), so an inbound reply addressed to the conversation
+// uuid resolves to the live local session — reuse-proof end to end.
+function convFwdDir() {
+  return join(harnessDataDir(), "conversations", "fwd");
+}
+function convIdxDir() {
+  return join(harnessDataDir(), "conversations", "idx");
+}
+
+// Mint (once) or fetch this session's conversation uuid for a peer. Idempotent per
+// (sessionUuid, peer) via an exclusive-create CAS so concurrent first-sends agree on
+// one uuid. On win, publishes the reverse index convUuid → sessionUuid for routing.
+export function resolveConversationUuid(sessionUuid, peer) {
+  if (!sessionUuid || !peer) return null;
+  const fwd = convFwdDir();
+  mkdirSync(fwd, { recursive: true });
+  const fwdPath = join(fwd, encodeURIComponent(`${sessionUuid}|${peer}`) + ".json");
+  const existing = readEntryFile(fwdPath);
+  if (existing?.convUuid) return existing.convUuid;
+  const convUuid = randomUUID();
+  try {
+    const fd = openSync(fwdPath, "wx", 0o600); // CAS: first writer wins the pairing
+    try {
+      writeSync(fd, JSON.stringify({ convUuid, sessionUuid, peer }) + "\n");
+    } finally {
+      closeSync(fd);
+    }
+  } catch (e) {
+    if (e?.code === "EEXIST") return readEntryFile(fwdPath)?.convUuid ?? null; // a racer won — use theirs
+    throw e;
+  }
+  try {
+    mkdirSync(convIdxDir(), { recursive: true });
+    writeFileSync(join(convIdxDir(), encodeURIComponent(convUuid) + ".json"), JSON.stringify({ sessionUuid, peer }) + "\n", { mode: 0o600 });
+  } catch {
+    /* best-effort — inbound routing falls back to label if the index is missing */
+  }
+  return convUuid;
+}
+
+// Reverse: the sessionUuid that owns a conversation uuid (or null for an unknown one).
+export function sessionUuidForConversation(convUuid) {
+  if (!convUuid) return null;
+  return readEntryFile(join(convIdxDir(), encodeURIComponent(convUuid) + ".json"))?.sessionUuid ?? null;
+}
+
+// The label of the LIVE local session owning a conversation uuid, or null. Resolves
+// convUuid → sessionUuid (index) → live session (presence).
+export function labelForConversationUuid(agentAddress, convUuid) {
+  return labelForUuid(agentAddress, sessionUuidForConversation(convUuid));
+}
+
 // Remove stale (non-live) presence files. Best-effort.
 export function gcStale(agentAddress) {
   const dir = sessionsDir(agentAddress);
@@ -166,6 +267,18 @@ export function claimLabel(agentAddress, { requested, harnessSessionId, cwd, sta
       harnessSessionId: harnessSessionId ?? "",
       cwd: cwd ?? "",
       pid: process.pid,
+      // Durable, reuse-proof binding key (see resolveSessionUuid). The label above is
+      // the friendly display handle; this is what a bound conversation routes on.
+      sessionUuid: resolveSessionUuid(harnessSessionId),
+      // tmux pane + server socket hosting this session's TUI, so the daemon/listener
+      // can inject a trigger keystroke into the live session (foreground-resolve).
+      // tmuxPane "" = not in a tmux pane (headless) → callers fall back to the
+      // isolated responder. tmuxSocket is the `-S` path from $TMUX (first field),
+      // needed because the launcher wraps plain terminals in a DEDICATED tmux
+      // socket, so `send-keys` must target that server, not the default one.
+      // Harness-agnostic: any TUI harness launched inside tmux records these.
+      tmuxPane: process.env.TMUX_PANE ?? "",
+      tmuxSocket: (process.env.TMUX ?? "").split(",")[0],
       startedAt: startedAt ?? now,
       updatedAt: now,
     };
@@ -209,6 +322,10 @@ export function writePresence(agentAddress, { label, harnessSessionId, cwd, star
     harnessSessionId: harnessSessionId ?? "",
     cwd: cwd ?? "",
     pid: process.pid,
+    sessionUuid: resolveSessionUuid(harnessSessionId), // durable binding key (see claimLabel)
+    // See claimLabel: the pane/socket the daemon injects into for foreground-resolve.
+    tmuxPane: process.env.TMUX_PANE ?? "",
+    tmuxSocket: (process.env.TMUX ?? "").split(",")[0],
     startedAt: startedAt ?? now,
     updatedAt: now,
   };

@@ -50,15 +50,16 @@ expect("claude: default sessionLabel = claude:1", fmt.sessionLabel() === "claude
 // The two harnesses must NOT share a data dir (isolation is the whole point).
 expect("codex + claude data dirs are distinct", process.env.TINYPLACE_CODEX_HOME !== process.env.TINYPLACE_CLAUDE_HOME);
 
-// ── foreground-inject slot (the #212 abstraction) ────────────────────────────
-// Both adapters advertise the capability; the slot is a fail-open no-op today.
+// ── foreground-inject (the #212 abstraction, now live for both harnesses) ─────
+// Both adapters advertise the capability; with no live pane for the agent the call
+// fails open (injected:false) so the caller uses the isolated responder.
 underHarness("codex");
 expect("codex: foreground-inject capability advertised", canForegroundInject() === true);
 const fiCodex = foregroundInject("addr", [{ id: "x" }]);
-expect("codex: foregroundInject is a no-op today (not-implemented)", fiCodex.injected === false && fiCodex.reason === "not-implemented");
+expect("codex: foregroundInject fails open with no pane", fiCodex.injected === false && fiCodex.reason === "no-pane");
 underHarness("claude");
 expect("claude: foreground-inject capability advertised", canForegroundInject() === true);
-expect("claude: foregroundInject no-op (not-implemented)", foregroundInject("addr", []).reason === "not-implemented");
+expect("claude: foregroundInject fails open with no pane", foregroundInject("addr", []).reason === "no-pane");
 
 const failed = checks.filter((c) => !c.ok);
 console.log("\n" + (failed.length === 0 ? `ALL ${checks.length} CHECKS PASSED ✅` : `${failed.length} FAILED ❌`));

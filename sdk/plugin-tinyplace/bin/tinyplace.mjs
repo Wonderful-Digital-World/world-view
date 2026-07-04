@@ -27,7 +27,9 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { LocalSigner } from "@tinyhumansai/tinyplace";
 
-import { activeAdapter, harnessDataDir } from "../mcp/harness.mjs";
+import { activeAdapter, harnessDataDir, ADAPTERS, _resetAdapterCache } from "../mcp/harness.mjs";
+import { canForegroundInject } from "../mcp/foreground-inject.mjs";
+import { loadWallets, saveWallets } from "../mcp/wallets.mjs";
 
 // bin/tinyplace.mjs -> plugin root is one dir up from bin/.
 const PLUGIN_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -38,27 +40,7 @@ const REGISTER_SCRIPT = join(PLUGIN_DIR, "register.mjs");
 // forced adapter (if any) wins detection. These are set once, up front.
 let ADAPTER;
 let DATA_DIR;
-let WALLETS_FILE;
-
-// ── wallet store (mirrors mcp/server.mjs byte-for-byte) ──────────────────────
-function loadWallets() {
-  if (!existsSync(WALLETS_FILE)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(WALLETS_FILE, "utf8"));
-    return Array.isArray(parsed?.wallets) ? parsed.wallets : [];
-  } catch {
-    return [];
-  }
-}
-function saveWallets(wallets) {
-  mkdirSync(DATA_DIR, { recursive: true });
-  writeFileSync(WALLETS_FILE, JSON.stringify({ wallets }, null, 2) + "\n", { mode: 0o600 });
-  try {
-    chmodSync(WALLETS_FILE, 0o600);
-  } catch {
-    /* best-effort */
-  }
-}
+// Wallets come from the shared, CLI-independent store (mcp/wallets.mjs).
 function hexToBytes(hex) {
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
@@ -186,8 +168,10 @@ function menu(subtitle, items) {
       // In raw mode Ctrl+C/Ctrl+D arrive as bytes 0x03/0x04, NOT as SIGINT — treat
       // them as cancel so the terminal is restored and we exit cleanly (same as q/ESC).
       if (s === "\x03" || s === "\x04" || s === "" || s === "q") return finish(-1);
-      if (s === "[A" || s === "k") idx = (idx - 1 + items.length) % items.length;
-      else if (s === "[B" || s === "j") idx = (idx + 1) % items.length;
+      // Arrow keys arrive as a full ESC sequence in one chunk (ESC "[" "A"/"B");
+      // match that (not a bare "[A", which never occurs) plus vim j/k.
+      if (s === "\x1b[A" || s === "\x1bOA" || s === "k") idx = (idx - 1 + items.length) % items.length;
+      else if (s === "\x1b[B" || s === "\x1bOB" || s === "j") idx = (idx + 1) % items.length;
       else if (s === "\r" || s === "\n") return finish(idx);
       else if (/^[1-9]$/.test(s) && Number(s) <= items.length) return finish(Number(s) - 1);
       render();
@@ -208,8 +192,108 @@ function menu(subtitle, items) {
 
 // ── launch the active harness with the plugin + chosen wallet ────────────────
 // Harness-agnostic: the adapter's prepare() returns the {command, args, env} and
-// performs any per-harness install step (e.g. Codex's isolated-home write). This
-// call takes over the terminal (stdio inherited).
+// performs any per-harness install step (e.g. Codex's isolated-home write). When
+// the harness supports foreground-inject (any TUI harness), we ensure the session
+// lives in a tmux pane so the daemon can wake it in-context on inbound DMs — this
+// wrap is the SAME for Claude and Codex (it wraps whatever prepare() returned).
+
+// A dedicated tmux socket so wrapped sessions stay out of the user's own tmux.
+const TMUX_SOCKET = "tinyplace";
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+function tmuxAvailable() {
+  try {
+    return spawnSync("tmux", ["-V"], { stdio: "ignore" }).status === 0;
+  } catch {
+    return false;
+  }
+}
+
+// Best-effort auto-install of tmux via the platform package manager. Returns true
+// if tmux is available afterward. Each entry is [managerBinary, installArgv] — we
+// probe the MANAGER (not sudo) so we never run e.g. `sudo apt-get` on a box that
+// has sudo but not apt.
+function installTmux() {
+  const managers =
+    process.platform === "darwin"
+      ? [["brew", ["brew", "install", "tmux"]]]
+      : [
+          ["apt-get", ["sudo", "apt-get", "install", "-y", "tmux"]],
+          ["dnf", ["sudo", "dnf", "install", "-y", "tmux"]],
+          ["pacman", ["sudo", "pacman", "-S", "--noconfirm", "tmux"]],
+        ];
+  for (const [manager, [cmd, ...args]] of managers) {
+    try {
+      if (spawnSync(manager, ["--version"], { stdio: "ignore" }).status !== 0) continue; // manager absent
+      process.stdout.write(`  ${C.dim}Installing tmux via ${cmd} ${args.join(" ")} …${C.reset}\n`);
+      spawnSync(cmd, args, { stdio: "inherit" });
+      if (tmuxAvailable()) return true;
+    } catch {
+      /* try next */
+    }
+  }
+  return tmuxAvailable();
+}
+
+// Launch the prepared plan directly in the current terminal. Foreground-resolve
+// still works when $TMUX is set (the current pane is injectable); otherwise
+// inbound mail is answered by the isolated responder.
+function launchDirect(plan) {
+  const child = spawn(plan.command, plan.args, {
+    stdio: "inherit",
+    env: { ...process.env, ...plan.env },
+  });
+  child.on("error", (error) => {
+    console.error(`\nCould not launch '${plan.command}': ${error.message}\n${ADAPTER.launch.notFoundHint ?? ""}`);
+    process.exit(1);
+  });
+  child.on("exit", (code) => process.exit(code ?? 0));
+}
+
+// Pick a free `tp-<wallet>[-N]` session name on our dedicated socket so each launch
+// is its own harness instance (a distinct agent session → its own <harness>:N label).
+function freeSessionName(walletName) {
+  const base = `tp-${walletName}`;
+  for (let n = 1; ; n++) {
+    const name = n === 1 ? base : `${base}-${n}`;
+    if (spawnSync("tmux", ["-L", TMUX_SOCKET, "has-session", "-t", name], { stdio: "ignore" }).status !== 0) return name;
+  }
+}
+
+// Wrap the launch in a tmux session on our dedicated socket, then attach. This
+// makes the agent ALWAYS live in a tmux pane, so the daemon can TTY-inject inbound
+// queries for the live session to resolve in-context — in ANY terminal, not just
+// when the user happens to already run tmux. Harness-agnostic: it wraps whatever
+// plan.command/args prepare() produced (Claude or Codex).
+function launchWrapped(plan, walletName) {
+  const name = freeSessionName(walletName);
+  const S = ["-L", TMUX_SOCKET];
+  // Carry the adapter's launch env into the SESSION environment via `-e` (not the
+  // command line), so nothing lands in `ps`/tmux listings and each launch gets its
+  // own env. plan.env is a curated non-secret config set (wallet secrets live in
+  // wallets.json, never in env), so forwarding all of it is safe.
+  const envFlags = [];
+  for (const [k, v] of Object.entries(plan.env ?? {})) if (v != null) envFlags.push("-e", `${k}=${v}`);
+  const cmd = [plan.command, ...plan.args].map(shq).join(" ");
+  const created = spawnSync("tmux", [...S, "new-session", "-d", "-s", name, ...envFlags, cmd], { stdio: "inherit" });
+  if (created.status !== 0) {
+    process.stdout.write(`  ${C.dim}tmux wrap failed; launching directly (auto-replies use an isolated context).${C.reset}\n`);
+    return launchDirect(plan);
+  }
+  // Make the wrap feel like a plain terminal + pass color through.
+  for (const opt of [
+    ["status", "off"],
+    ["mouse", "on"],
+    ["escape-time", "0"],
+    ["default-terminal", "tmux-256color"],
+  ]) {
+    spawnSync("tmux", [...S, "set-option", "-g", ...opt], { stdio: "ignore" });
+  }
+  spawnSync("tmux", [...S, "set-option", "-ga", "terminal-overrides", ",*:Tc"], { stdio: "ignore" });
+  const att = spawnSync("tmux", [...S, "attach-session", "-t", name], { stdio: "inherit" });
+  process.exit(att.status ?? 0);
+}
+
 function launch(walletName, forwardedArgs) {
   clear();
   let plan;
@@ -226,15 +310,70 @@ function launch(walletName, forwardedArgs) {
     process.exit(1);
   }
   process.stdout.write(`${C.green}▶${C.reset} launching ${ADAPTER.launch.displayHarness} as ${C.bold}${walletName}${C.reset} …\n\n`);
-  const child = spawn(plan.command, plan.args, {
-    stdio: "inherit",
-    env: { ...process.env, ...plan.env },
-  });
-  child.on("error", (error) => {
-    console.error(`\nCould not launch '${plan.command}': ${error.message}\n${ADAPTER.launch.notFoundHint ?? ""}`);
-    process.exit(1);
-  });
-  child.on("exit", (code) => process.exit(code ?? 0));
+  // Harness doesn't support foreground-inject, or we're already inside tmux (the
+  // current pane is injectable) → launch directly. Otherwise wrap so the daemon
+  // can wake an idle session in-context; install tmux if missing.
+  if (!canForegroundInject(ADAPTER) || process.env.TMUX) return launchDirect(plan);
+  if (!tmuxAvailable()) {
+    process.stdout.write(`  ${C.yellow}tmux not found${C.reset} — needed so the agent can answer inbound DMs in-context.\n`);
+    // Only auto-install (a privileged `sudo`/brew step) when interactive and not
+    // opted out — never from a scripted `--wallet`/CI invocation.
+    const mayInstall = Boolean(process.stdout.isTTY) && !process.env.TINYPLACE_NO_AUTO_INSTALL;
+    if (!mayInstall) {
+      process.stdout.write(`  ${C.dim}Skipping tmux auto-install (non-interactive or TINYPLACE_NO_AUTO_INSTALL set); launching without it (auto-replies use an isolated context).${C.reset}\n`);
+      return launchDirect(plan);
+    }
+    if (!installTmux()) {
+      process.stdout.write(`  ${C.dim}Could not install tmux; launching without it (auto-replies use an isolated context).${C.reset}\n`);
+      return launchDirect(plan);
+    }
+  }
+  return launchWrapped(plan, walletName);
+}
+
+// The harnesses whose CLI is actually installed (on PATH). `spawnSync` sets `error`
+// only when the binary can't be found, so a non-zero `--version` still counts.
+function installedHarnesses() {
+  return Object.entries(ADAPTERS)
+    .filter(([, a]) => {
+      try {
+        return !spawnSync(a.launch.binary, ["--version"], { stdio: "ignore" }).error;
+      } catch {
+        return false;
+      }
+    })
+    .map(([name, adapter]) => ({ name, adapter }));
+}
+
+// Pin the active harness for THIS launch (and the child, via env) and re-resolve the
+// adapter + its per-harness data dir. Wallets are shared, so only sessions/signal move.
+function selectHarness(name) {
+  process.env.TINYPLACE_HARNESS = name;
+  _resetAdapterCache();
+  ADAPTER = activeAdapter();
+  DATA_DIR = harnessDataDir(ADAPTER);
+}
+
+// After an identity is chosen, let the user pick which CLI to drive it with (Claude /
+// Codex …) when more than one is installed and none was forced via --harness.
+// Returns true if it launched (caller should return/exit), false if the user backed
+// out (caller re-shows its menu). `launch()` takes over the terminal, so on a real
+// launch control only returns here for the async launchDirect case.
+async function chooseHarnessAndLaunch(walletName, forwardedArgs, { forced }) {
+  const installed = installedHarnesses();
+  if (forced || installed.length <= 1) {
+    if (installed.length === 1) selectHarness(installed[0].name);
+    launch(walletName, forwardedArgs);
+    return true;
+  }
+  const pick = await menu(`Launch ${walletName} with which CLI?`, [
+    ...installed.map((h) => ({ label: h.adapter.launch.displayHarness, hint: h.adapter.launch.binary })),
+    { label: "← Back", hint: "" },
+  ]);
+  if (pick < 0 || pick >= installed.length) return false; // back → caller's menu loop
+  selectHarness(installed[pick].name);
+  launch(walletName, forwardedArgs);
+  return true;
 }
 
 async function registerFlow(wallet) {
@@ -277,14 +416,14 @@ async function main() {
   // `--harness <name>` forces the adapter; fold it into env BEFORE resolving so
   // detectHarness() honors it (TINYPLACE_HARNESS is the built-in override).
   const harnessFlag = flags.indexOf("--harness");
-  if (harnessFlag !== -1 && flags[harnessFlag + 1]) {
+  const harnessForced = harnessFlag !== -1 && Boolean(flags[harnessFlag + 1]);
+  if (harnessForced) {
     process.env.TINYPLACE_HARNESS = flags[harnessFlag + 1];
   }
 
   // Resolve the active adapter + its data dir now that the override is in env.
   ADAPTER = activeAdapter();
   DATA_DIR = harnessDataDir(ADAPTER);
-  WALLETS_FILE = join(DATA_DIR, "wallets.json");
 
   // Non-interactive fast path: `tinyplace --wallet alice`.
   const walletFlag = flags.indexOf("--wallet");
@@ -318,8 +457,12 @@ async function main() {
       process.exit(0);
     }
 
-    // A wallet row → launch (this replaces the process's terminal with the harness).
-    if (choice < wallets.length) return launch(wallets[choice].name, forwardedArgs);
+    // A wallet row → pick the CLI (if >1 installed), then launch (this replaces the
+    // process's terminal with the harness). "Back" from the CLI picker re-shows this.
+    if (choice < wallets.length) {
+      if (await chooseHarnessAndLaunch(wallets[choice].name, forwardedArgs, { forced: harnessForced })) return;
+      continue;
+    }
 
     const action = items[choice].label;
     if (action.startsWith("＋")) {

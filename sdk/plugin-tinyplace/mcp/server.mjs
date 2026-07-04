@@ -47,11 +47,15 @@ import {
   removePresence,
   liveSessions,
   gcStale,
+  resolveSessionUuid,
+  resolveConversationUuid,
 } from "./registry.mjs";
+import { loadWallets, saveWallets } from "./wallets.mjs";
 import { drainInbox, redeliverUnrouted } from "./routing.mjs";
 import { writeOutboxJob } from "./outbox.mjs";
 import { daemonLive } from "./daemon-lock.mjs";
 import { toCryptoId } from "./address.mjs";
+import { foregroundInject } from "./foreground-inject.mjs";
 import { activeAdapter, harnessDataDir } from "./harness.mjs";
 
 // The per-harness descriptor for THIS process, resolved once. Every branch below
@@ -86,7 +90,6 @@ function withTimeout(promise, ms, label) {
 
 // ── storage ────────────────────────────────────────────────────────────────
 const DATA_DIR = harnessDataDir(ADAPTER);
-const WALLETS_FILE = join(DATA_DIR, "wallets.json");
 const SIGNAL_DIR = join(DATA_DIR, "signal");
 const BASE_URL =
   process.env.TINYPLACE_API_URL ??
@@ -141,21 +144,7 @@ function ensureDirs() {
   mkdirSync(SIGNAL_DIR, { recursive: true });
 }
 
-function loadWallets() {
-  if (!existsSync(WALLETS_FILE)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(WALLETS_FILE, "utf8"));
-    return Array.isArray(parsed?.wallets) ? parsed.wallets : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveWallets(wallets) {
-  ensureDirs();
-  writeFileSync(WALLETS_FILE, JSON.stringify({ wallets }, null, 2) + "\n", { mode: 0o600 });
-  try { chmodSync(WALLETS_FILE, 0o600); } catch {}
-}
+// loadWallets / saveWallets come from the shared, CLI-independent store (wallets.mjs).
 
 function loadAssignments() {
   if (!existsSync(ASSIGN_FILE)) return {};
@@ -333,14 +322,31 @@ async function maybeRecoverSession(peer) {
 // a daemon-mode sender's reply still matches a self-mode receiver's echo. In
 // daemon mode the send is deferred to the daemon (single ratchet writer) via an
 // outbox job; in self mode we send directly. Returns { id, via }.
-async function dispatchSend({ to, text, role, toSession, inReplyTo, auto }) {
+// The peer conversation id to address a reply to: the from_session_uuid of the
+// buffered message we're replying to (correlated by in_reply_to). Lets a reply route
+// to the exact session that opened the thread WITHOUT the model handling uuids. Null
+// (→ fall back to label routing) if the original was already drained from the buffer.
+function replyConvUuid(inReplyTo) {
+  if (!inReplyTo || !session) return null;
+  // Prefer the durable map (survives an inbox drain); fall back to a still-buffered msg.
+  return session.convByMsgId.get(String(inReplyTo)) ?? session.buffer.find((m) => String(m.id) === String(inReplyTo))?.fromSessionUuid ?? null;
+}
+
+async function dispatchSend({ to, text, role, toSession, toSessionUuid, inReplyTo, auto }) {
   const s = requireActive();
   const id = newMessageId();
+  // This session's per-conversation id with `to` (minted once, stable) → wire as
+  // wrapper_session_id so the peer's reply routes back to us reuse-proof.
+  const conversationUuid = resolveConversationUuid(s.sessionUuid, to);
+  // Address the peer's conversation (explicit arg, else echo the replied-to message's).
+  const peerConvUuid = toSessionUuid ?? replyConvUuid(inReplyTo);
   if (s.mode === "daemon") {
     writeOutboxJob(s.address, {
       id,
       to,
       toSession: toSession ?? null,
+      toSessionUuid: peerConvUuid ?? null,
+      conversationUuid: conversationUuid ?? null,
       role: role ?? null,
       text,
       inReplyTo: inReplyTo ?? null,
@@ -356,6 +362,8 @@ async function dispatchSend({ to, text, role, toSession, inReplyTo, auto }) {
     text,
     role,
     toSession,
+    toSessionUuid: peerConvUuid,
+    conversationUuid,
     inReplyTo,
     auto,
     fromSession: s.label,
@@ -394,24 +402,27 @@ async function buildClient(seedHex) {
 
 // Deliver one decoded inbound message to a pending waiter (synchronous
 // send_and_wait / await_reply) or, failing that, buffer it + push a channel
-// event. `enqueueForAuto` gates the Stop-hook auto-responder enqueue (self mode
-// only — in daemon mode the daemon owns auto-response). Returns true if it was
-// enqueued for auto-response.
-function deliverToSession(msg, { auto, enqueueForAuto }) {
+// event. Returns the disposition so the caller can decide how to resolve it:
+//   "waiter"         — consumed synchronously; no auto-response needed
+//   "auto"           — an auto-tagged reply; buffered only (loop guard: never answered)
+//   "needs-response" — a fresh peer DM buffered and awaiting a reply
+function deliverToSession(msg, { auto }) {
+  // Remember the sender's conversation uuid keyed by message id, so a later reply
+  // (in_reply_to) can echo it as to_session_uuid even after `inbox` drained buffer.
+  if (msg.fromSessionUuid && msg.id != null) {
+    session.convByMsgId.set(String(msg.id), msg.fromSessionUuid);
+    if (session.convByMsgId.size > 500) session.convByMsgId.delete(session.convByMsgId.keys().next().value);
+  }
   const waiterIndex = session.waiters.findIndex((w) => w.match(msg));
   if (waiterIndex !== -1) {
     const [waiter] = session.waiters.splice(waiterIndex, 1);
     clearTimeout(waiter.timer);
     waiter.resolve({ ...msg, _delivered: "waiter" });
-    return false;
+    return "waiter";
   }
   session.buffer.push(msg);
   void pushToChannel(msg);
-  if (enqueueForAuto && !auto) {
-    enqueueInbound(session.address, msg);
-    return true;
-  }
-  return false;
+  return auto ? "auto" : "needs-response";
 }
 
 // SELF MODE drain: this session owns the relay. Decrypt + ack inbound DMs, detect
@@ -435,19 +446,29 @@ async function drainSelf() {
       const dropped = rawBefore.filter((r) => !gotIds.has(String(r.id)));
       if (dropped.length) recordUndecryptable(dropped);
     }
-    let enqueuedAny = false;
+    const pending = [];
     for (const rawMsg of messages) {
-      const { auto, inReplyTo, text, messageId, fromSession, role, toSession } = decodeBody(rawMsg.text);
+      const { auto, inReplyTo, text, messageId, fromSession, fromSessionUuid, role, toSession } = decodeBody(rawMsg.text);
       // A re-handshake ping only exists to re-run X3DH (done on decrypt); consume
       // it silently so it never surfaces as a message.
       if (text === RESET_SENTINEL) continue;
       // Correlate on the in-body envelope id when present (matches what a peer
       // echoes as in_reply_to), else fall back to the relay id for legacy bodies.
-      const msg = { ...rawMsg, id: messageId ?? rawMsg.id, text, inReplyTo, fromSession, role, toSession };
-      if (deliverToSession(msg, { auto, enqueueForAuto: true })) enqueuedAny = true;
+      // fromSessionUuid = the peer's conversation id, kept so a reply can echo it.
+      const msg = { ...rawMsg, id: messageId ?? rawMsg.id, text, inReplyTo, fromSession, fromSessionUuid, role, toSession };
+      if (deliverToSession(msg, { auto }) === "needs-response") pending.push(msg);
     }
-    // Daemon trigger: react to new mail even when the Claude UI is idle.
-    if (enqueuedAny) maybeSpawnResponder();
+    // React to new mail even when the UI is idle. Foreground-preferred: if this
+    // session runs in a tmux pane, inject a trigger so THIS live agent drains its
+    // inbox and replies IN-CONTEXT. Only when there's no pane (headless) do we
+    // enqueue for + spawn the isolated responder — so the two never both fire (no
+    // double-reply).
+    if (pending.length && autorespondEnabled()) {
+      if (!foregroundInject(session.address, pending, { pane: process.env.TMUX_PANE }).injected) {
+        for (const m of pending) enqueueInbound(session.address, m);
+        maybeSpawnResponder();
+      }
+    }
   } catch {
     // Relay hiccup / nothing to read — try again on the next tick.
   } finally {
@@ -480,12 +501,14 @@ async function drainDaemonInbox() {
         text: p.text,
         inReplyTo: p.inReplyTo ?? null,
         fromSession: p.fromSession ?? null,
+        fromSessionUuid: p.fromSessionUuid ?? null,
         role: p.role ?? null,
         toSession: p.toSession ?? null,
         timestamp: p.ts,
       };
-      // enqueueForAuto=false: the daemon already enqueued for auto-response.
-      deliverToSession(msg, { auto: false, enqueueForAuto: false });
+      // Daemon mode: the daemon owns auto-response + foreground inject, so the
+      // disposition is ignored here — just deliver to a waiter/buffer.
+      deliverToSession(msg, { auto: false });
     }
   } catch {
     // Queue read hiccup — retry next tick.
@@ -573,12 +596,15 @@ async function adopt(walletName, { label } = {}) {
   // its presence file (claimLabel) so two concurrent starts can't grab the same
   // label. A send-only responder stays out of the registry (no claim).
   let allocatedLabel;
+  let sessionUuidValue;
   let presenceClaimed = false;
   if (process.env.TINYPLACE_SEND_ONLY) {
     allocatedLabel = requestedLabel || sessionLabel();
+    sessionUuidValue = resolveSessionUuid(hsid);
   } else {
     const entry = claimLabel(wallet.address, { requested: requestedLabel, harnessSessionId: hsid, cwd: process.cwd(), startedAt });
     allocatedLabel = entry.label;
+    sessionUuidValue = entry.sessionUuid;
     presenceClaimed = true;
   }
   session = {
@@ -586,6 +612,7 @@ async function adopt(walletName, { label } = {}) {
     address: wallet.address,
     publicKey: wallet.publicKey,
     label: allocatedLabel,
+    sessionUuid: sessionUuidValue,
     harnessSessionId: hsid,
     startedAt,
     presenceWritten: presenceClaimed,
@@ -596,6 +623,9 @@ async function adopt(walletName, { label } = {}) {
     client,
     store,
     buffer: [],
+    // msgId → sender conversation uuid, for reply echo. Kept SEPARATE from buffer so
+    // draining the inbox (which clears buffer) doesn't lose the reply-address binding.
+    convByMsgId: new Map(),
     waiters: [],
     ws: null,
     pollTimer: null,

@@ -20,11 +20,13 @@ import { sendMessage, readMessages, publishKeys } from "@tinyhumansai/tinyplace/
 
 import { buildEnvelope, decodeBody } from "../mcp/format.mjs";
 import { liveSessions } from "../mcp/registry.mjs";
-import { enqueueRouted, redeliverUnrouted } from "../mcp/routing.mjs";
-import { claimOutboxJobs } from "../mcp/outbox.mjs";
+import { enqueueRouted, redeliverUnrouted, reapClosedTargets } from "../mcp/routing.mjs";
+import { claimOutboxJobs, writeOutboxJob } from "../mcp/outbox.mjs";
 import { acquireLock, heartbeatLock, releaseLock } from "../mcp/daemon-lock.mjs";
 import { toCryptoId } from "../mcp/address.mjs";
 import { harnessDataDir } from "../mcp/harness.mjs";
+import { foregroundInject } from "../mcp/foreground-inject.mjs";
+import { loadWallets } from "../mcp/wallets.mjs";
 
 // Survive transient relay errors — a stray unhandled rejection must not kill the
 // single per-agent daemon (it owns the ratchet); the poll loop retries next tick.
@@ -40,7 +42,6 @@ const PLUGIN_ROOT = dirname(HERE);
 // Data dir for the active harness (env override wins) — the daemon serves ONE
 // harness's agent; harnessDataDir() reads the adapter's env + default.
 const DATA_DIR = harnessDataDir();
-const WALLETS_FILE = join(DATA_DIR, "wallets.json");
 const SIGNAL_DIR = join(DATA_DIR, "signal");
 const QUEUE_DIR = join(DATA_DIR, "queue");
 const BASE_URL =
@@ -59,13 +60,7 @@ if (!walletName) {
 }
 
 function loadWallet(name) {
-  try {
-    const parsed = JSON.parse(readFileSync(WALLETS_FILE, "utf8"));
-    const list = Array.isArray(parsed?.wallets) ? parsed.wallets : [];
-    return list.find((w) => w.name === name) ?? null;
-  } catch {
-    return null;
-  }
+  return loadWallets().find((w) => w.name === name) ?? null; // shared, CLI-independent store
 }
 
 function hexToBytes(hex) {
@@ -137,19 +132,53 @@ async function drainInbound() {
   draining = true;
   try {
     const messages = await readMessages(client, signer);
-    let enqueuedAny = false;
+    // Group pending (non-auto) mail by the session label it was ROUTED to, so we
+    // wake the RIGHT session's pane — a DM addressed to to_session=claude:2 must
+    // wake claude:2, not whichever pane happens to be first. Mail with no live
+    // target (unrouted/held) can't be woken, so it takes the isolated responder
+    // directly — a fully-headless agent (daemon only, no live session) keeps
+    // auto-replying, and the held copy is redelivered when a target comes live.
+    const pendingByLabel = new Map(); // label -> [decoded]
+    let headlessPending = false;
     for (const raw of messages) {
-      const { auto, inReplyTo, text, messageId, fromSession, role, toSession } = decodeBody(raw.text);
+      const { auto, inReplyTo, text, messageId, fromSession, fromSessionUuid, role, toSession, toSessionUuid } = decodeBody(raw.text);
       if (text === RESET_SENTINEL) continue; // handshake ping — consumed on decrypt
       // Correlate on the in-body envelope id when present, else the relay id.
       const id = messageId ?? raw.id;
-      const decoded = { id, from: raw.from, fromSession, role, text, inReplyTo, toSession, ts: raw.timestamp ?? new Date().toISOString() };
-      enqueueRouted(AGENT, decoded);
-      // Auto-responder: answer non-auto messages when a session is idle (loop
-      // guard: an auto-tagged reply is never itself enqueued for a response).
-      if (!auto) { enqueueForAutoResponse(decoded); enqueuedAny = true; }
+      // Carry the conversation uuids so enqueueRouted can do reuse-proof routing and
+      // held/closed mail keeps the sender's conversation id for the notice.
+      const decoded = { id, from: raw.from, fromSession, fromSessionUuid, role, text, inReplyTo, toSession, toSessionUuid, ts: raw.timestamp ?? new Date().toISOString() };
+      const { target } = enqueueRouted(AGENT, decoded); // route to the session inbox(es)
+      // Non-auto messages need a reply (loop guard: an auto-tagged reply is never
+      // itself answered).
+      if (auto || autorespondOff) continue;
+      if (target.kind === "session") {
+        for (const label of target.labels) {
+          if (!pendingByLabel.has(label)) pendingByLabel.set(label, []);
+          pendingByLabel.get(label).push(decoded);
+        }
+      } else if (!decoded.toSession && !decoded.toSessionUuid) {
+        // Untargeted + no live session → isolated responder (headless agent still
+        // auto-replies).
+        enqueueForAutoResponse(decoded);
+        headlessPending = true;
+      }
+      // else: addressed to a SPECIFIC session that isn't live → held (unrouted).
+      // Don't isolated-respond — a stranger context must not answer a thread bound
+      // to a now-closed session. It's either redelivered if that session returns
+      // within the grace window, or reaped into a "session closed" notice.
     }
-    if (enqueuedAny) maybeSpawnResponder();
+    // Foreground-preferred: inject a trigger into EACH routed session's own tmux
+    // pane so the real agent drains its inbox and replies IN-CONTEXT. A routed
+    // session with no pane (headless surface) falls back to the isolated responder
+    // — so for any given message exactly one path fires (no double-reply).
+    for (const [label, msgs] of pendingByLabel) {
+      if (!foregroundInject(AGENT, msgs, { label }).injected) {
+        for (const d of msgs) enqueueForAutoResponse(d);
+        headlessPending = true;
+      }
+    }
+    if (headlessPending) maybeSpawnResponder();
   } catch { /* relay hiccup — retry next tick */ } finally {
     draining = false;
   }
@@ -166,6 +195,8 @@ async function drainOutbound() {
         text: job.text,
         role: job.role,
         toSession: job.toSession,
+        toSessionUuid: job.toSessionUuid,
+        conversationUuid: job.conversationUuid,
         inReplyTo: job.inReplyTo,
         auto: job.auto,
         fromSession: job.fromSession,
@@ -186,6 +217,28 @@ async function drainOutbound() {
       }
       fail();
     }
+  }
+}
+
+// ── closed-session notices ───────────────────────────────────────────────────
+// A message addressed to a specific session (to_session) that never came (back)
+// live within the grace window is abandoned. Send the sender ONE auto-tagged
+// "session closed" notice, correlated by in_reply_to so a synchronous await/
+// check_reply resolves instead of hanging, then terminate (reap already dropped the
+// held copy). auto:true is the loop guard — the peer never answers this notice.
+function notifyClosedTargets() {
+  for (const p of reapClosedTargets(AGENT)) {
+    writeOutboxJob(AGENT, {
+      id: `sysclosed-${p.id}`,
+      to: p.from,
+      toSession: p.fromSession ?? null, // back to the sender's originating session
+      toSessionUuid: p.fromSessionUuid ?? null, // …addressed by their conversation id
+      role: "system",
+      text: `The session "${p.toSession}" you addressed is no longer active; your message was not delivered. Start a new message to reach this agent.`,
+      inReplyTo: p.id,
+      auto: true,
+      fromSession: "system",
+    });
   }
 }
 
@@ -220,9 +273,10 @@ try {
 
 const pollTimer = setInterval(() => {
   void (async () => {
-    redeliverUnrouted(AGENT);
+    redeliverUnrouted(AGENT); // deliver held mail to sessions that just came live
     await drainInbound();
-    await drainOutbound();
+    notifyClosedTargets(); // reap+notify mail bound to a session that stayed gone
+    await drainOutbound(); // sends the notices just enqueued
     if (checkIdle()) shutdown(0);
   })();
 }, POLL_INTERVAL_MS);

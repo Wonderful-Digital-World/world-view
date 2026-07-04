@@ -114,6 +114,21 @@ const okLabelEnv = JSON.parse(encodeEnvelope({ text: "hi", fromSession: "codex:1
 const dok = decodeBody(JSON.stringify(okLabelEnv));
 expect("safe labels (codex:1 / codex:2) pass validation", dok.fromSession === "codex:1" && dok.toSession === "codex:2");
 
+// ── conversation uuids on the wire ───────────────────────────────────────────
+// The sender's conversation id rides in scope.wrapper_session_id and decodes as
+// fromSessionUuid; to_session_uuid (addressing the peer's conversation) roundtrips.
+const CONV = "11111111-2222-3333-4444-555555555555";
+const PEER_CONV = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+const convEnv = JSON.parse(encodeEnvelope({ text: "hi", fromSession: "codex:1", conversationUuid: CONV, toSessionUuid: PEER_CONV }));
+expect("conversationUuid is written to scope.wrapper_session_id", convEnv.scope.wrapper_session_id === CONV);
+const dconv = decodeBody(JSON.stringify(convEnv));
+expect("wrapper_session_id decodes as fromSessionUuid", dconv.fromSessionUuid === CONV);
+expect("to_session_uuid roundtrips as toSessionUuid", dconv.toSessionUuid === PEER_CONV);
+expect("the routing label still rides in tp.from_session", dconv.fromSession === "codex:1");
+// A non-uuid wrapper_session_id (old peers put the harness id there) → no uuid.
+const legacyWrap = JSON.parse(encodeEnvelope({ text: "hi", fromSession: "codex:1", harnessSessionId: "legacy-harness-id" }));
+expect("non-uuid wrapper_session_id → fromSessionUuid null (label fallback)", decodeBody(JSON.stringify(legacyWrap)).fromSessionUuid === null);
+
 const failed = checks.filter((c) => !c.ok);
 console.log("\n" + (failed.length === 0 ? `ALL ${checks.length} CHECKS PASSED ✅` : `${failed.length} FAILED ❌`));
 process.exit(failed.length === 0 ? 0 : 1);

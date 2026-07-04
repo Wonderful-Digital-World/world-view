@@ -79,8 +79,57 @@ detection picks the adapter, no launch.
 | claude | channel push (real-time) OR tmux inject (#212) | isolated `claude -p` |
 | codex  | tmux inject (#212) — else surfacing hook next turn | isolated `codex exec` |
 
-`foregroundInject` (tmux) is harness-agnostic → lives in the shared core, gated by a
-recorded `tmuxPane`. This is exactly sanil's #212 generalized to one place.
+`foregroundInject` (tmux) is harness-agnostic → lives in the shared core
+(`mcp/foreground-inject.mjs`), gated by a recorded `tmuxPane`. This is exactly sanil's
+#212 generalized to one place: the daemon/self drain prefers a `send-keys` trigger into
+the routed session's own pane (in-context reply) and only falls back to the isolated
+responder when no pane exists — mutually exclusive, so no message is answered twice. To
+guarantee a pane exists in any terminal, `bin/tinyplace.mjs` wraps the launch in a
+dedicated `tinyplace` tmux socket (for any inject-capable harness) unless already inside
+`$TMUX`. Disable with `TINYPLACE_FOREGROUND_RESOLVE=off`; tune the per-pane debounce with
+`TINYPLACE_INJECT_COOLDOWN_MS` (default 4000).
+
+### Closed-session addressing
+
+Binding is on a **conversation UUID**, not the (reusable) label. `scope.wrapper_session_id`
+is a per-conversation id — a fresh uuid per `(session, peer)` minted on first contact
+(`registry.resolveConversationUuid`), so peers can't correlate our sessions across
+conversations and each relationship is its own thread. It maps to the session's durable
+`sessionUuid` via a reverse index (`convUuid → sessionUuid`), and `sessionUuid` maps to
+the live session in presence — so an inbound `to_session_uuid` resolves to the exact
+local session, **reuse-proof**: a label reclaimed by a different session can never inherit
+another's thread. Replies carry `to_session_uuid` (the peer's `wrapper_session_id`),
+echoed automatically from the replied-to message (correlated by `in_reply_to`) — the model
+never handles uuids. Layering:
+
+```text
+wire: tp.from_session (label, display)  scope.wrapper_session_id (convUuid)  tp.to_session_uuid (peer convUuid)
+local: convUuid --idx--> sessionUuid --presence--> live session (label, pid, pane)
+```
+
+When a message is addressed to a `to_session_uuid`/`to_session` that isn't live, it's held
+(the `_unrouted` hold doubles as a grace window): if that session returns within the grace
+it's delivered in-context; if not, the daemon sends the sender ONE auto-tagged
+`role:"system"` **"session closed"** notice correlated by `in_reply_to` — so a synchronous
+`await_reply`/`check_reply` resolves instead of hanging — and terminates the message
+(`reapClosedTargets`). A stranger session is never made to answer a thread bound to a
+now-closed session. Tune with `TINYPLACE_SESSION_CLOSED_GRACE_MS` (default 5000).
+
+> The isolated headless responder (separate process, empty buffer) still echoes on the
+> label, not the conversation uuid — a documented degradation of the fallback path; the
+> interactive / foreground-inject path is fully uuid-bound.
+
+## Identity store (shared) + CLI picker
+
+An agent identity is a keypair; which harness drives it is a runtime choice. So wallets
+live in ONE shared, CLI-independent store — `~/.tinyplace/wallets.json` (override with
+`TINYPLACE_HOME`), read by the launcher, server, daemon, and register via `mcp/wallets.mjs`.
+Only sessions/signal/queue/uuids stay per-harness (`harnessDataDir`). First read migrates
+any legacy per-harness `wallets.json` (`~/.tinyplace-claude`, `~/.tinyplace-codex`) into the
+shared store. The launcher flow is therefore **pick identity → pick CLI → launch**: after a
+wallet is chosen, `bin/tinyplace.mjs` offers the installed harnesses (probed on PATH) when
+more than one exists and `--harness` wasn't forced, then pins `TINYPLACE_HARNESS` and
+re-resolves the adapter for the launch.
 
 ## Packaging
 
@@ -93,8 +142,9 @@ install (verified) → keep everything under one package root with one `node_mod
 
 1. Build `plugin-tinyplace` by merging the two servers → one, threading `activeAdapter()`.
 2. Port both test suites → run against the unified package (behavior unchanged).
-3. Fold `foregroundInject` into the core adapter slot now (empty until tmux wiring lands),
-   so #212 merges in as core behavior with no rework.
+3. `foregroundInject` is wired into the core adapter slot with the tmux send-keys body
+   (#212 generalized to both harnesses) — the daemon, self-drain, launcher, and registry
+   all participate; covered by `inject-test.mjs`.
 4. `plugin-claude` / `plugin-codex` become thin re-export shims → the unified package (or
    are removed once consumers migrate). Keeps #214/#212 alive during transition.
 5. Cross-harness `xplugin-e2e` still green (now: one package, two adapters, same network).
