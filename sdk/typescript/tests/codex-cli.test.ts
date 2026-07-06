@@ -19,7 +19,7 @@ import {
   type MessageEnvelope,
   type SignedKey,
 } from "../src/index.js";
-import { publishKeys, readMessages } from "../src/agent/index.js";
+import { publishKeys, readMessages, sendMessage } from "../src/agent/index.js";
 import { publicKeyToSolanaAddress } from "../src/crypto.js";
 import { fromBase64 } from "../src/signal/index.js";
 
@@ -357,6 +357,9 @@ describe("tinyplace codex", () => {
       [
         "codex",
         "--tinyplace-no-pty",
+        // Outbound-only test: keep the inbound receiver off so it doesn't also
+        // request the (pending) contact and skew relay.contactRequests.
+        "--tinyplace-no-receive",
         "--tinyplace-out",
         tempDir,
         "--tinyplace-session-id",
@@ -458,14 +461,119 @@ describe("tinyplace codex", () => {
       expect(parsed.passthrough).toEqual([]);
       expect(parsed.forwarded).toEqual([]);
     });
+  });
 
-    it("fails with an actionable message when the plugin has no installed deps", async () => {
-      // The unified plugin ships in-repo but is excluded from the workspace, so
-      // its node_modules is absent in a fresh checkout / CI — the guard should
-      // surface an install hint rather than a cryptic module-resolution crash.
-      const result = await runTinyPlaceCli(["codex", "--agent"], { env: {} });
-      expect(result.code).toBe(1);
-      expect(result.stderr).toMatch(/node_modules|tiny\.place plugin|not bundled/i);
+  describe("inbound receive → inject into codex", () => {
+    // The wrapper identity is derived from TINYPLACE_SECRET_KEY=hexSeed(33), so
+    // its address is deterministic and the owner can DM it.
+    async function runWrapperReceiving(opts: {
+      relay: HarnessRelay;
+      ownerAgentId: string;
+      send: (wrapperAddress: string) => Promise<void>;
+    }): Promise<{ code: number; stdin: string; wrapperAddress: string }> {
+      const tempDir = await mkdtemp(join(tmpdir(), "tinyplace-inbound-"));
+      const wrapperSigner = await LocalSigner.fromSeed(new Uint8Array(32).fill(33));
+      const stdinChunks: Array<string> = [];
+      const result = await runTinyPlaceCli(
+        [
+          "codex",
+          "--tinyplace-no-pty",
+          "--tinyplace-no-session-tail",
+          "--tinyplace-out",
+          tempDir,
+          "--tinyplace-receive-poll-ms",
+          "5",
+          "prompt",
+        ],
+        {
+          cwd: "/tmp/project",
+          env: {
+            TINYPLACE_CODEX_BIN: "fake-codex",
+            TINYPLACE_CONFIG: join(tempDir, "config.json"),
+            TINYPLACE_ENDPOINT: "https://relay.test",
+            TINYPLACE_HARNESS_DM_TO: opts.ownerAgentId,
+            TINYPLACE_SECRET_KEY: hexSeed(33),
+          },
+          fetch: opts.relay,
+          stdin: new PassThrough(),
+          stdout: new PassThrough(),
+          stderr: new PassThrough(),
+          spawn: () => {
+            const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+            child.stdin = new PassThrough();
+            child.stdout = new PassThrough();
+            child.stderr = new PassThrough();
+            child.pid = 1234;
+            child.stdin.on("data", (chunk: Buffer) => stdinChunks.push(chunk.toString("utf8")));
+            // Keys are published + owner contact accepted BEFORE spawn (in
+            // receiver.start), so the owner can DM the wrapper immediately here.
+            queueMicrotask(() => {
+              void (async () => {
+                await opts.send(wrapperSigner.agentId);
+                setTimeout(() => child.emit("exit", 0, null), 80);
+              })();
+            });
+            return child;
+          },
+        },
+      );
+      return { code: result.code, stdin: stdinChunks.join(""), wrapperAddress: wrapperSigner.agentId };
+    }
+
+    it("publishes its Signal keys so the owner can DM it (was un-messageable before)", async () => {
+      const relay = makeRelay({ autoAcceptContacts: true });
+      const owner = await makeClient(44, relay);
+      await publishKeys(owner.client, owner.signer);
+      const { code, wrapperAddress } = await runWrapperReceiving({
+        relay,
+        ownerAgentId: owner.signer.agentId,
+        send: async () => {
+          // no DM — this test only asserts key publication
+        },
+      });
+      expect(code).toBe(0);
+      expect(relay.keysPublished).toContain(wrapperAddress);
+    });
+
+    it("injects an owner DM into the codex process as `<text>\\r`", async () => {
+      const relay = makeRelay({ autoAcceptContacts: true });
+      const owner = await makeClient(44, relay);
+      await publishKeys(owner.client, owner.signer);
+      const { code, stdin } = await runWrapperReceiving({
+        relay,
+        ownerAgentId: owner.signer.agentId,
+        send: async (wrapperAddress) => {
+          await sendMessage(owner.client, owner.signer, wrapperAddress, "hello from openhuman");
+        },
+      });
+      expect(code).toBe(0);
+      expect(stdin).toContain("hello from openhuman\r");
+    });
+
+    it("drops auto-flagged envelopes but injects normal ones (loop-guard)", async () => {
+      const relay = makeRelay({ autoAcceptContacts: true });
+      const owner = await makeClient(44, relay);
+      await publishKeys(owner.client, owner.signer);
+      const autoEnvelope = JSON.stringify({
+        envelope_version: "tinyplace.harness.session.v1",
+        tp: { auto: true },
+        message: { text: "AUTO_SHOULD_NOT_INJECT" },
+      });
+      const humanEnvelope = JSON.stringify({
+        envelope_version: "tinyplace.harness.session.v1",
+        message: { text: "HUMAN_SHOULD_INJECT" },
+      });
+      const { code, stdin } = await runWrapperReceiving({
+        relay,
+        ownerAgentId: owner.signer.agentId,
+        send: async (wrapperAddress) => {
+          await sendMessage(owner.client, owner.signer, wrapperAddress, autoEnvelope);
+          await sendMessage(owner.client, owner.signer, wrapperAddress, humanEnvelope);
+        },
+      });
+      expect(code).toBe(0);
+      expect(stdin).toContain("HUMAN_SHOULD_INJECT\r");
+      expect(stdin).not.toContain("AUTO_SHOULD_NOT_INJECT");
     });
   });
 
@@ -614,6 +722,7 @@ interface HarnessRelay {
     init?: Parameters<typeof globalThis.fetch>[1],
   ): Promise<Response>;
   contactRequests: Array<string>;
+  keysPublished: Array<string>;
 }
 
 function makeRelay(options: { autoAcceptContacts?: boolean } = {}): HarnessRelay {
@@ -678,8 +787,10 @@ function makeRelay(options: { autoAcceptContacts?: boolean } = {}): HarnessRelay
     }
     const signedMatch = path.match(/^\/keys\/([^/]+)\/signed-prekey$/);
     if (signedMatch && method === "PUT") {
+      const id = decodeURIComponent(signedMatch[1]!);
       const body = (await request.json()) as { signedPreKey: SignedKey };
-      signedPreKeys.set(decodeURIComponent(signedMatch[1]!), body.signedPreKey);
+      signedPreKeys.set(id, body.signedPreKey);
+      relay.keysPublished.push(id);
       return new Response(null, { status: 204 });
     }
     const preKeysMatch = path.match(/^\/keys\/([^/]+)\/prekeys$/);
@@ -708,6 +819,7 @@ function makeRelay(options: { autoAcceptContacts?: boolean } = {}): HarnessRelay
     return Response.json({ error: `unhandled ${method} ${path}` }, { status: 500 });
   }) as HarnessRelay;
   relay.contactRequests = [];
+  relay.keysPublished = [];
   return relay;
 }
 

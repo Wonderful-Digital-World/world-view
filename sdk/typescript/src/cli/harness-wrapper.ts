@@ -14,7 +14,13 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { spawn as spawnPty, type IPty } from "node-pty";
 
-import { resolveRecipientKey, sendMessage } from "../agent/messaging.js";
+import {
+  publishKeys,
+  readMessages,
+  resolveRecipientKey,
+  sendMessage,
+  type ReadMessage,
+} from "../agent/messaging.js";
 import {
   SESSION_ENVELOPE_VERSION_V1,
   type HarnessBucketUnit,
@@ -52,6 +58,9 @@ export interface HarnessWrapperConfig {
   dryRun: boolean;
   outDir: string;
   provider: HarnessProvider;
+  receiveEnabled: boolean;
+  receiveFrom?: string;
+  receivePollMs: number;
   sessionFile?: string;
   sessionPollMs: number;
   sessionsDir: string;
@@ -170,18 +179,33 @@ export async function runHarnessCommand(
   const sessionTailer = config.captureSession
     ? new HarnessSessionTailer(config, cwd, stdio.stderr, publisher)
     : undefined;
+  const receiver = config.receiveEnabled
+    ? new InboundMessageReceiver(config, publisher, stdio.stderr)
+    : undefined;
   const launch = buildAgentLaunch(config);
 
   const usePty = config.usePty && options.spawn === undefined;
   writer.pty = usePty;
   writer.write("lifecycle", `start ${launch.command} ${launch.args.join(" ")}`.trim());
   sessionTailer?.start(new Date());
+  // Publish keys + start the inbound poll before spawn; injection stays a no-op
+  // until the child registers its input sink below. Guarded (not `?.`) so the
+  // no-receiver path stays synchronous and doesn't reorder stdin capture.
+  if (receiver) {
+    await receiver.start();
+  }
 
+  const onInputSink = receiver
+    ? (write: (text: string) => void): void => receiver.setSink(write)
+    : undefined;
   const exitCode = usePty
-    ? await runPtyAgent(launch, config, cwd, env, writer, stdio)
-    : await runPipeAgent(launch, config, cwd, env, writer, stdio, spawnFn);
+    ? await runPtyAgent(launch, config, cwd, env, writer, stdio, onInputSink)
+    : await runPipeAgent(launch, config, cwd, env, writer, stdio, spawnFn, onInputSink);
 
   const dmFailures = (await sessionTailer?.stop()) ?? 0;
+  if (receiver) {
+    await receiver.stop();
+  }
 
   return { code: exitCode === 0 && dmFailures > 0 ? 1 : exitCode, stdout: "", stderr: "" };
 }
@@ -193,6 +217,7 @@ async function runPtyAgent(
   env: Record<string, string | undefined>,
   writer: TerminalEnvelopeWriter,
   stdio: HarnessStdio,
+  onInputSink?: (write: (text: string) => void) => void,
 ): Promise<number> {
   let pty: IPty;
   try {
@@ -209,10 +234,20 @@ async function runPtyAgent(
     writer.write("lifecycle", `node-pty unavailable: ${message}`);
     stdio.stderr.write(`tinyplace ${config.provider}: node-pty unavailable: ${message}\n`);
     writer.pty = false;
-    return runPipeAgent(launch, config, cwd, env, writer, stdio, spawnChild);
+    return runPipeAgent(launch, config, cwd, env, writer, stdio, spawnChild, onInputSink);
   }
 
   writer.pid = pty.pid;
+  // Inbound injection writes straight to the PTY master — NOT through the
+  // `writer.write("input", …)` capture, so injected prompts are never re-emitted
+  // outbound as a fresh terminal envelope (feedback-loop defense).
+  onInputSink?.((text) => {
+    try {
+      pty.write(text);
+    } catch {
+      // PTY closed — drop injected input
+    }
+  });
   const restoreRawMode = configureRawInput(stdio.stdin);
   const onInput = (chunk: Buffer | string): void => {
     if (config.captureInput) {
@@ -253,6 +288,7 @@ async function runPipeAgent(
   writer: TerminalEnvelopeWriter,
   stdio: HarnessStdio,
   spawnFn: NonNullable<TinyPlaceCliOptions["spawn"]>,
+  onInputSink?: (write: (text: string) => void) => void,
 ): Promise<number> {
   const child = spawnFn(launch.command, launch.args, {
     cwd,
@@ -263,6 +299,9 @@ async function runPipeAgent(
     writer.pid = child.pid;
   }
   child.stdin.on("error", () => {});
+  // Inbound injection writes straight to the child's stdin, bypassing the
+  // `writer.write("input", …)` capture (feedback-loop defense).
+  onInputSink?.((text) => child.stdin.write(text));
 
   const restoreRawMode = configureRawInput(stdio.stdin);
   const onInput = (chunk: Buffer | string): void => {
@@ -319,6 +358,17 @@ export function parseHarnessWrapperArgs(
   const outDir =
     firstEnv(env, [`TINYPLACE_${provider.toUpperCase()}_ENVELOPES`, "TINYPLACE_HARNESS_ENVELOPES"]) ??
     profile.defaultOutDir;
+  const owner = configuredRecipient(provider, env);
+  // Inbound receive-from: an explicit override, else the same owner we DM to.
+  // Receive is ON by default whenever an owner is known, unless TINYPLACE_..._RECEIVE=0.
+  const receiveFrom =
+    firstEnv(env, [
+      `TINYPLACE_${provider.toUpperCase()}_RECEIVE_FROM`,
+      "TINYPLACE_HARNESS_RECEIVE_FROM",
+    ]) ?? owner;
+  const receiveDisabled =
+    firstEnv(env, [`TINYPLACE_${provider.toUpperCase()}_RECEIVE`, "TINYPLACE_HARNESS_RECEIVE"]) ===
+    "0";
   const config: HarnessWrapperConfig = {
     agentArgs,
     agentBin: firstEnv(env, profile.binEnv) ?? profile.defaultBin,
@@ -327,10 +377,18 @@ export function parseHarnessWrapperArgs(
     captureInput: true,
     captureOutput: true,
     captureSession: true,
-    ...(configuredRecipient(provider, env) ? { dmRecipient: configuredRecipient(provider, env) } : {}),
+    ...(owner ? { dmRecipient: owner } : {}),
     dryRun: false,
     outDir,
     provider,
+    ...(receiveFrom ? { receiveFrom } : {}),
+    receiveEnabled: receiveFrom !== undefined && !receiveDisabled,
+    receivePollMs: Number(
+      firstEnv(env, [
+        `TINYPLACE_${provider.toUpperCase()}_RECEIVE_POLL_MS`,
+        "TINYPLACE_HARNESS_RECEIVE_POLL_MS",
+      ]) ?? 1500,
+    ),
     sessionPollMs: Number(
       firstEnv(env, [
         `TINYPLACE_${provider.toUpperCase()}_SESSION_POLL_MS`,
@@ -399,6 +457,18 @@ export function parseHarnessWrapperArgs(
         break;
       case "--tinyplace-no-dm":
         delete config.dmRecipient;
+        break;
+      case "--tinyplace-no-receive":
+        config.receiveEnabled = false;
+        break;
+      case "--tinyplace-receive-from":
+        config.receiveFrom = requiredValue(token, next);
+        config.receiveEnabled = true;
+        index += 1;
+        break;
+      case "--tinyplace-receive-poll-ms":
+        config.receivePollMs = parsePositiveInteger(token, requiredValue(token, next));
+        index += 1;
         break;
       case "--tinyplace-no-input":
         config.captureInput = false;
@@ -682,6 +752,12 @@ class SessionEnvelopePublisher {
     }
   }
 
+  /** Shared, memoized tiny.place context (client + signer). Reused by the
+   *  inbound receiver so only ONE client / FileSessionStore / ratchet exists. */
+  public getContext(): ReturnType<typeof makeContext> {
+    return this.context();
+  }
+
   private context(): ReturnType<typeof makeContext> {
     this.contextPromise ??= makeContext(this.options);
     return this.contextPromise;
@@ -729,6 +805,179 @@ function isNotAContactError(error: unknown): boolean {
     typeof body === "string" ? body : body !== undefined ? JSON.stringify(body) : "";
   const message = error instanceof Error ? error.message : String(error);
   return /not[_ ]a[_ ]contact/i.test(`${message} ${bodyText}`);
+}
+
+/** Re-handshake ping the plugin daemon sends; never inject it into the agent. */
+const RESET_SENTINEL = "\x01tp-rehandshake\x01";
+
+/**
+ * Inbound half of the wrapper's tiny.place connection: polls the relay for
+ * Signal-E2E DMs from the configured owner (OpenHuman) and injects them into the
+ * live agent process the wrapper spawned, so a message sent from OpenHuman
+ * appears as a typed+submitted prompt in the running codex/claude session.
+ *
+ * The outbound `SessionEnvelopePublisher` already streams the agent's turns back,
+ * so together they form a full bidirectional bridge with no plugin.
+ *
+ * Reuses the publisher's memoized context (one client / FileSessionStore / ratchet)
+ * and the SDK primitives `publishKeys` (be messageable) + `readMessages` (decrypt).
+ */
+class InboundMessageReceiver {
+  private sink: ((text: string) => void) | undefined;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private draining = false;
+  private ownerAddress: string | undefined;
+
+  public constructor(
+    private readonly config: HarnessWrapperConfig,
+    private readonly publisher: SessionEnvelopePublisher,
+    private readonly stderr: Writable,
+  ) {}
+
+  /** Register the agent-input writer once the child is spawned. Injection is a
+   *  no-op until this is set, so the poll loop can start before the child. */
+  public setSink(write: (text: string) => void): void {
+    this.sink = write;
+  }
+
+  public async start(): Promise<void> {
+    if (!this.config.receiveEnabled || this.config.dryRun) {
+      return;
+    }
+    const ctx = await this.publisher.getContext();
+    if (!ctx.signer) {
+      this.stderr.write(
+        `tinyplace ${this.config.provider}: inbound receive needs a tiny.place signer (unlock or set TINYPLACE_SECRET_KEY); receive disabled\n`,
+      );
+      return;
+    }
+    // Publish our Signal key bundle so the owner can open a session to us — the
+    // wrapper never did this before, which is why it was un-messageable.
+    try {
+      await publishKeys(ctx.client, ctx.signer);
+    } catch (error) {
+      this.stderr.write(
+        `tinyplace ${this.config.provider}: failed to publish Signal keys: ${describeError(error)}\n`,
+      );
+    }
+    if (this.config.receiveFrom) {
+      try {
+        this.ownerAddress = await resolveRecipientKey(ctx.client, this.config.receiveFrom);
+        await this.ensureOwnerContact(ctx, this.ownerAddress);
+      } catch (error) {
+        this.stderr.write(
+          `tinyplace ${this.config.provider}: could not set up inbound owner ${this.config.receiveFrom}: ${describeError(error)}\n`,
+        );
+      }
+    }
+    this.timer = setInterval(() => void this.poll(), this.config.receivePollMs);
+  }
+
+  public async stop(): Promise<void> {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    try {
+      await this.poll();
+    } catch {
+      // best-effort final drain
+    }
+  }
+
+  /** Accept the owner contact so inbound DMs are not 403'd by the relay. */
+  private async ensureOwnerContact(
+    ctx: Awaited<ReturnType<typeof makeContext>>,
+    owner: string,
+  ): Promise<void> {
+    if (!ctx.signer || owner === ctx.signer.agentId) {
+      return;
+    }
+    const before = await ctx.client.contacts.status(owner);
+    if (before.status === "accepted") {
+      return;
+    }
+    if (before.status === "blocked") {
+      this.stderr.write(
+        `tinyplace ${this.config.provider}: inbound owner ${owner} is blocked; unblock to receive\n`,
+      );
+      return;
+    }
+    await ctx.client.contacts.request(owner);
+    const after = await ctx.client.contacts.status(owner);
+    if (after.status !== "accepted") {
+      this.stderr.write(
+        `tinyplace ${this.config.provider}: contact with ${owner} pending; approve it in OpenHuman to receive inbound\n`,
+      );
+    }
+  }
+
+  private async poll(): Promise<void> {
+    if (this.draining || !this.sink) {
+      return;
+    }
+    this.draining = true;
+    try {
+      const ctx = await this.publisher.getContext();
+      if (!ctx.signer) {
+        return;
+      }
+      const messages = await readMessages(ctx.client, ctx.signer, { limit: 50 });
+      for (const message of messages) {
+        const text = this.filterAndParse(message);
+        if (text !== undefined && this.sink) {
+          // "\r" (carriage return) submits the prompt to the agent TUI.
+          this.sink(`${text}\r`);
+        }
+      }
+    } catch {
+      // transient relay / decrypt hiccup — retry on the next tick
+    } finally {
+      this.draining = false;
+    }
+  }
+
+  /** Decide whether a received DM should be injected, and extract its text.
+   *  Returns undefined to drop the message. */
+  private filterAndParse(message: ReadMessage): string | undefined {
+    // Owner-scoped: never inject a message from anyone but the configured owner.
+    if (this.ownerAddress && message.from !== this.ownerAddress) {
+      return undefined;
+    }
+    const raw = message.text;
+    if (raw === RESET_SENTINEL) {
+      return undefined;
+    }
+    if (!raw.trimStart().startsWith("{")) {
+      return raw; // plaintext DM
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return raw; // looked like JSON but isn't — treat as plaintext
+    }
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      (parsed as { envelope_version?: unknown }).envelope_version !== SESSION_ENVELOPE_VERSION_V1
+    ) {
+      return raw;
+    }
+    // `tp.auto` is a plugin extension (not on the typed SessionEnvelope); read it
+    // loosely. Drop auto/echo turns so the bridge never ping-pongs.
+    const obj = parsed as Record<string, unknown>;
+    const tpAuto = (obj.tp as { auto?: unknown } | undefined)?.auto;
+    const messageObj = obj.message as { text?: unknown; tp?: { auto?: unknown } } | undefined;
+    if (tpAuto || messageObj?.tp?.auto) {
+      return undefined;
+    }
+    return typeof messageObj?.text === "string" ? messageObj.text : undefined;
+  }
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 class TerminalEnvelopeWriter {
