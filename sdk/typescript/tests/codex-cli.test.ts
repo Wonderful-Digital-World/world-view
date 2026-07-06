@@ -16,6 +16,8 @@ import {
   type SignedKey,
 } from "../src/index.js";
 import { publishKeys, readMessages } from "../src/agent/index.js";
+import { publicKeyToSolanaAddress } from "../src/crypto.js";
+import { fromBase64 } from "../src/signal/index.js";
 
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 
@@ -263,7 +265,7 @@ describe("tinyplace codex", () => {
           TINYPLACE_CODEX_SESSIONS_DIR: sessionsDir,
           TINYPLACE_CONFIG: join(tempDir, "config.json"),
           TINYPLACE_ENDPOINT: "https://relay.test",
-          TINYPLACE_HARNESS_DM_TO: recipient.signer.publicKeyBase64,
+          TINYPLACE_HARNESS_DM_TO: recipient.signer.agentId,
           TINYPLACE_SECRET_KEY: hexSeed(33),
         },
         fetch: relay,
@@ -316,7 +318,7 @@ describe("tinyplace codex", () => {
     );
 
     expect(result.code).toBe(0);
-    expect(relay.contactRequests).toEqual([recipient.signer.publicKeyBase64]);
+    expect(relay.contactRequests).toEqual([recipient.signer.agentId]);
     const messages = await readMessages(recipient.client, recipient.signer);
     expect(messages).toHaveLength(2);
     const envelopes = messages.map((message) => JSON.parse(message.text) as Record<string, unknown>);
@@ -368,7 +370,7 @@ describe("tinyplace codex", () => {
           TINYPLACE_CODEX_SESSIONS_DIR: sessionsDir,
           TINYPLACE_CONFIG: join(tempDir, "config.json"),
           TINYPLACE_ENDPOINT: "https://relay.test",
-          TINYPLACE_HARNESS_DM_TO: recipient.signer.publicKeyBase64,
+          TINYPLACE_HARNESS_DM_TO: recipient.signer.agentId,
           TINYPLACE_SECRET_KEY: hexSeed(33),
         },
         fetch: relay,
@@ -412,7 +414,7 @@ describe("tinyplace codex", () => {
     );
 
     expect(result.code).toBe(1);
-    expect(relay.contactRequests).toEqual([recipient.signer.publicKeyBase64]);
+    expect(relay.contactRequests).toEqual([recipient.signer.agentId]);
     expect(stderrChunks.join("")).toContain("contact request pending");
     await expect(readMessages(recipient.client, recipient.signer)).resolves.toHaveLength(0);
   });
@@ -660,7 +662,18 @@ function makeRelay(options: { autoAcceptContacts?: boolean } = {}): HarnessRelay
 }
 
 function actorId(request: Request): string {
-  return request.headers.get("X-TinyPlace-Public-Key") ?? request.headers.get("X-Agent-ID") ?? "";
+  // The backend canonicalizes the authenticated actor to its base58 cryptoId; the
+  // auth headers carry the base64 public key, so derive the cryptoId to match the
+  // base58 `from`/`to` the SDK now routes with. Falls back to the raw header value.
+  const raw =
+    request.headers.get("X-TinyPlace-Public-Key") ??
+    request.headers.get("X-Agent-ID") ??
+    "";
+  try {
+    return publicKeyToSolanaAddress(fromBase64(raw));
+  } catch {
+    return raw;
+  }
 }
 
 function contactKey(a: string, b: string): string {

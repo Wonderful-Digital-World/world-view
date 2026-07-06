@@ -735,8 +735,8 @@ describe("tinyplace CLI", () => {
         const url = request.url;
         if (url.includes("/directory/resolve")) {
           return Response.json({
-            identity: { cryptoId: "c1" },
-            agent: { publicKey: peerPub },
+            identity: { cryptoId: peer.agentId },
+            agent: { cryptoId: peer.agentId, publicKey: peerPub },
           });
         }
         if (url.includes("/bundle")) {

@@ -697,7 +697,7 @@ class SessionEnvelopePublisher {
       throw new Error("DM forwarding requires a tiny.place signer");
     }
     const recipient = await resolveRecipientKey(ctx.client, this.config.dmRecipient ?? "");
-    if (recipient === ctx.signer.publicKeyBase64) {
+    if (recipient === ctx.signer.agentId) {
       return recipient;
     }
 
