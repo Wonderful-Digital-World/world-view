@@ -26,6 +26,8 @@ interface TuiState {
   autoStartRemainingMs?: number;
   notice?: string;
   openHumanConnected: boolean;
+  // Owner entered in the TUI (overrides env); the address/@handle we bridge to.
+  openHumanOwner?: string;
   openHumanSessionId?: string;
   selectedIndex: number;
   view: TuiView;
@@ -306,21 +308,65 @@ class BlessedTinyPlaceTui {
     this.render();
   }
 
+  /** The owner we bridge to: entered in the TUI (overrides) else from env. */
+  private resolveOwner(): string | undefined {
+    return this.state.openHumanOwner ?? bridgeOwner(this.ctx.env);
+  }
+
+  /** Prompt for the OpenHuman owner (@handle or address), store it, and — if the
+   *  agent is already running — (re)start the bridge with it. */
   private connectOpenHuman(): void {
     this.clearAutoStart();
-    const owner = bridgeOwner(this.ctx.env);
-    this.state = owner
-      ? {
+    const current = this.resolveOwner() ?? "";
+    const input = blessed.textbox({
+      parent: this.screen,
+      top: "center",
+      left: "center",
+      width: "80%",
+      height: 3,
+      border: { type: "line" },
+      inputOnFocus: true,
+      keys: true,
+      mouse: true,
+      label: " OpenHuman owner — @handle or address (Enter to save, Esc to cancel) ",
+      style: { fg: "white", bg: "black", border: { fg: "cyan" } },
+      tags: true,
+    });
+    input.setValue(current);
+    input.focus();
+    this.screen.render();
+
+    let settled = false;
+    const done = (value: string | undefined): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      input.destroy();
+      const owner = value?.trim();
+      if (owner) {
+        this.state = {
           ...this.state,
-          notice: `OpenHuman bridge will connect to ${owner} when ${this.profile.displayName} launches.`,
+          notice:
+            this.state.view === "agent"
+              ? `OpenHuman owner set to ${owner}; reconnecting bridge.`
+              : `OpenHuman owner set to ${owner}. Launch ${this.profile.displayName} to connect.`,
           openHumanConnected: true,
+          openHumanOwner: owner,
           openHumanSessionId: owner,
-        }
-      : {
-          ...this.state,
-          notice: "No OpenHuman owner configured. Set TINYPLACE_OPENHUMAN_OWNER (or TINYPLACE_HARNESS_DM_TO).",
         };
-    this.render();
+        // If a session is live, restart the bridge so the new owner takes effect.
+        if (this.state.view === "agent") {
+          this.stopBridge();
+          this.startBridge();
+        }
+      } else {
+        this.state = { ...this.state, notice: "OpenHuman owner unchanged." };
+      }
+      this.render();
+    };
+    input.key(["escape"], () => done(undefined));
+    input.readInput((_err, value) => done(typeof value === "string" ? value : undefined));
   }
 
   /** Start the real bidirectional OpenHuman bridge alongside the agent: publish
@@ -330,11 +376,15 @@ class BlessedTinyPlaceTui {
     if (this.bridgeTailer || this.bridgeReceiver) {
       return;
     }
-    const config = parseHarnessWrapperArgs(this.profile.kind, [], this.ctx.env);
-    const owner = bridgeOwner(this.ctx.env);
+    const owner = this.resolveOwner();
     if (!owner) {
       return;
     }
+    const config = parseHarnessWrapperArgs(this.profile.kind, [], this.ctx.env);
+    // A TUI-entered owner overrides env: bridge both directions to it.
+    config.dmRecipient = owner;
+    config.receiveFrom = owner;
+    config.receiveEnabled = true;
     // Diagnostics from the bridge are discarded — writing to process.stderr would
     // corrupt the Blessed screen.
     const sink = new Writable({ write: (_chunk, _enc, cb) => cb() });
