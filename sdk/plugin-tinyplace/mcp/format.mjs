@@ -120,11 +120,12 @@ export function encodeEnvelope(opts) {
     tp: { v: PLUGIN_TP_VERSION, from_session: label },
   };
   if (opts.toSession) envelope.tp.to_session = opts.toSession;
-  // Address a reply to the exact conversation the peer opened: to_session_uuid is the
-  // peer's wrapper_session_id (their per-conversation id), echoed back so their side
-  // routes it to the originating session — immune to label reuse. (The sender's own
-  // conversation id rides in scope.wrapper_session_id above.)
-  if (opts.toSessionUuid) envelope.tp.to_session_uuid = opts.toSessionUuid;
+  // Single shared session id: every message — whoever sends it — carries exactly one
+  // id, in scope.wrapper_session_id (the shared per-thread conversation id). A reply
+  // REUSES the id of the thread it answers (see dispatchSend), so there is no separate
+  // "peer session id" to echo. (Historically tp.to_session_uuid carried the peer's id
+  // back; that dual-id addressing is gone — routing keys on wrapper_session_id alone.
+  // tp.to_session above is an explicit label target, orthogonal to the session id.)
   if (opts.inReplyTo) envelope.tp.in_reply_to = opts.inReplyTo;
   if (opts.auto) envelope.tp.auto = true;
   return JSON.stringify(envelope);

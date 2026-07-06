@@ -185,6 +185,26 @@ export function resolveConversationUuid(sessionUuid, peer) {
   return convUuid;
 }
 
+// Adopt a conversation id we did NOT mint — one the PEER opened (their
+// wrapper_session_id) — binding it to the local session now handling the thread.
+// Writes only the reverse index (convUuid → {sessionUuid, peer}); it deliberately
+// does NOT touch the forward `sessionUuid|peer → convUuid` map, so a session can own
+// multiple thread ids for the same peer (each id is one thread) and the forward map
+// keeps naming the id WE'd mint for a fresh thread. Idempotent: never clobbers an
+// existing binding (the minter/first adopter wins), so re-adoption on every reply is a
+// cheap no-op. Best-effort — inbound routing falls back to policy if the write fails.
+export function bindConversationUuid(convUuid, sessionUuid, peer) {
+  if (!convUuid || !sessionUuid || !peer) return;
+  const path = join(convIdxDir(), encodeURIComponent(convUuid) + ".json");
+  if (readEntryFile(path)?.sessionUuid) return; // already bound — keep the first owner
+  try {
+    mkdirSync(convIdxDir(), { recursive: true });
+    writeFileSync(path, JSON.stringify({ sessionUuid, peer }) + "\n", { mode: 0o600 });
+  } catch {
+    /* best-effort */
+  }
+}
+
 // Reverse: the sessionUuid that owns a conversation uuid (or null for an unknown one).
 export function sessionUuidForConversation(convUuid) {
   if (!convUuid) return null;
