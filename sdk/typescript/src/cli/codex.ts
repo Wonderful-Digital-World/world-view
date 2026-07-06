@@ -10,23 +10,29 @@ import {
   runHarnessCommand,
   type CodexWrapperConfig,
 } from "./harness-wrapper.js";
+import { makeContext } from "./context.js";
+import { runTinyPlaceTui } from "./tui.js";
 import type { TinyPlaceCliOptions, TinyPlaceCliResult } from "./types.js";
 
 /** Prod endpoint the SDK falls back to (mirrors `context.ts`). */
 const DEFAULT_ENDPOINT = "https://api.tiny.place";
 
 /**
- * `tinyplace codex` has two mutually-exclusive modes per invocation:
+ * `tinyplace codex` has three mutually-exclusive modes per invocation:
  *
- * - default (no `--agent`): the **harness wrapper** — spawn plain codex, tail
- *   `~/.codex/sessions`, one-way DM session envelopes to an owner. Observability.
+ * - default: the **tiny.place TUI** — a visible wrapper showing the active
+ *   session + OpenHuman connection, which launches codex inside itself and runs
+ *   the real bidirectional bridge (publish keys, stream turns, inject inbound).
+ * - `--raw`: the **transparent harness wrapper** — spawn codex with no UI, tail
+ *   `~/.codex/sessions`, and bridge to OpenHuman underneath (same bridge, no
+ *   chrome). Used by embedders/tests.
  * - `--agent`: boot a first-class **agent** session via the unified tiny.place
  *   plugin launcher (`sdk/plugin-tinyplace`, `--harness codex`): the session gets
- *   its own wallet + MCP tools and can DM peers bidirectionally. (Not `--tui` —
- *   the top-level `tinyplace tui` command already means the proxy TUI.)
+ *   its own wallet + MCP tools and can DM peers bidirectionally.
  *
- * They are exclusive because the plugin isolates `CODEX_HOME` (which would blind
- * the wrapper's tailer) and DMs from a different identity than the wrapper.
+ * `--agent` and the wrapper are exclusive because the plugin isolates
+ * `CODEX_HOME` (which would blind the wrapper's tailer) and DMs from a different
+ * identity than the wrapper.
  */
 export async function runCodexCommand(
   argv: Array<string>,
@@ -35,7 +41,11 @@ export async function runCodexCommand(
   if (wantsAgentMode(argv)) {
     return runCodexAgentTui(argv, options);
   }
-  return runHarnessCommand("codex", argv, options);
+  if (wantsRawMode(argv)) {
+    return runHarnessCommand("codex", stripFlag(argv, "--raw"), options);
+  }
+  const ctx = await makeContext(options);
+  return runTinyPlaceTui(ctx, options, "codex");
 }
 
 export async function runClaudeCommand(
@@ -64,6 +74,18 @@ function splitAtForward(argv: Array<string>): { pre: Array<string>; post: Array<
 /** `--agent` before any `--` selects the plugin launcher (agent mode). */
 export function wantsAgentMode(argv: Array<string>): boolean {
   return splitAtForward(argv).pre.some((a) => a === "--agent");
+}
+
+/** `--raw` before any `--` selects the transparent harness wrapper (no TUI). */
+export function wantsRawMode(argv: Array<string>): boolean {
+  return splitAtForward(argv).pre.some((a) => a === "--raw");
+}
+
+/** Remove a bare flag from the pre-`--` portion, leaving forwarded args intact. */
+function stripFlag(argv: Array<string>, flag: string): Array<string> {
+  const { pre, post } = splitAtForward(argv);
+  const kept = pre.filter((a) => a !== flag);
+  return post.length > 0 || argv.includes("--") ? [...kept, "--", ...post] : kept;
 }
 
 /** The published launcher package + its bin subpath, resolved when installed. */

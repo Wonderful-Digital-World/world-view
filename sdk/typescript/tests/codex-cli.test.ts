@@ -52,6 +52,17 @@ describe("tinyplace codex", () => {
     expect(parsed.codexArgs).toEqual(["--model", "gpt-5", "--search", "hello"]);
   });
 
+  it("defaults to the tiny.place TUI (static snapshot in a non-TTY)", async () => {
+    const result = await runTinyPlaceCli(["codex"], {
+      env: { TINYPLACE_ENDPOINT: "https://relay.test" },
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("welcome to tiny.place");
+  });
+
   it("proxies terminal streams into envelope files without creating tinyplace context", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "tinyplace-codex-"));
     const stdin = new PassThrough();
@@ -66,6 +77,8 @@ describe("tinyplace codex", () => {
     const resultPromise = runTinyPlaceCli(
       [
         "codex",
+        // `codex` now defaults to the TUI; --raw selects the transparent wrapper.
+        "--raw",
         "--tinyplace-no-pty",
         "--tinyplace-no-session-tail",
         "--tinyplace-out",
@@ -141,6 +154,8 @@ describe("tinyplace codex", () => {
     const resultPromise = runTinyPlaceCli(
       [
         "codex",
+        // `codex` now defaults to the TUI; --raw selects the transparent wrapper.
+        "--raw",
         "--tinyplace-no-pty",
         "--tinyplace-out",
         tempDir,
@@ -251,6 +266,8 @@ describe("tinyplace codex", () => {
     const result = await runTinyPlaceCli(
       [
         "codex",
+        // `codex` now defaults to the TUI; --raw selects the transparent wrapper.
+        "--raw",
         "--tinyplace-no-pty",
         "--tinyplace-out",
         tempDir,
@@ -356,6 +373,8 @@ describe("tinyplace codex", () => {
     const result = await runTinyPlaceCli(
       [
         "codex",
+        // `codex` now defaults to the TUI; --raw selects the transparent wrapper.
+        "--raw",
         "--tinyplace-no-pty",
         // Outbound-only test: keep the inbound receiver off so it doesn't also
         // request the (pending) contact and skew relay.contactRequests.
@@ -477,6 +496,7 @@ describe("tinyplace codex", () => {
       const result = await runTinyPlaceCli(
         [
           "codex",
+          "--raw",
           "--tinyplace-no-pty",
           "--tinyplace-no-session-tail",
           "--tinyplace-out",
