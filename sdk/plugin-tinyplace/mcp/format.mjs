@@ -157,10 +157,10 @@ function decodeEnvelope(obj) {
     // fallback still only catches an OLD body that stored a short label there.
     fromSession: safeLabel(tp.from_session) ?? safeLabel(obj.scope?.wrapper_session_id),
     toSession: safeLabel(tp.to_session),
-    // The sender's per-conversation id is scope.wrapper_session_id (a uuid now);
-    // older peers put a non-uuid there, which safeUuid drops → label routing.
+    // The single shared session id for the thread is scope.wrapper_session_id (a
+    // uuid); a non-uuid there (e.g. a plain harness/label id) is dropped by safeUuid
+    // → label routing. There is no separate peer-id field — one id per message.
     fromSessionUuid: safeUuid(obj.scope?.wrapper_session_id),
-    toSessionUuid: safeUuid(tp.to_session_uuid),
     role,
     envelope: true,
   };
@@ -184,7 +184,7 @@ function decodeLegacyBody(raw) {
       }
     }
   }
-  return { auto, inReplyTo, text, messageId: null, fromSession: null, toSession: null, fromSessionUuid: null, toSessionUuid: null, role: null, envelope: false };
+  return { auto, inReplyTo, text, messageId: null, fromSession: null, toSession: null, fromSessionUuid: null, role: null, envelope: false };
 }
 
 // Build a legacy auto-reply body (auto tag + optional re: header + plaintext).

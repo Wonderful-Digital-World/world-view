@@ -196,12 +196,17 @@ export function resolveConversationUuid(sessionUuid, peer) {
 export function bindConversationUuid(convUuid, sessionUuid, peer) {
   if (!convUuid || !sessionUuid || !peer) return;
   const path = join(convIdxDir(), encodeURIComponent(convUuid) + ".json");
-  if (readEntryFile(path)?.sessionUuid) return; // already bound — keep the first owner
   try {
     mkdirSync(convIdxDir(), { recursive: true });
-    writeFileSync(path, JSON.stringify({ sessionUuid, peer }) + "\n", { mode: 0o600 });
-  } catch {
-    /* best-effort */
+    const fd = openSync(path, "wx", 0o600); // CAS: create only if absent — first owner wins
+    try {
+      writeSync(fd, JSON.stringify({ sessionUuid, peer }) + "\n");
+    } finally {
+      closeSync(fd);
+    }
+  } catch (e) {
+    if (e?.code === "EEXIST") return; // already bound — keep the first owner (idempotent)
+    /* best-effort otherwise — inbound routing falls back to policy if the write fails */
   }
 }
 

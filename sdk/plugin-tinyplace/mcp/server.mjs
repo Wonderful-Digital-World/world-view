@@ -333,15 +333,14 @@ function replyConvUuid(inReplyTo) {
   return session.convByMsgId.get(String(inReplyTo)) ?? session.buffer.find((m) => String(m.id) === String(inReplyTo))?.fromSessionUuid ?? null;
 }
 
-async function dispatchSend({ to, text, role, toSession, toSessionUuid, inReplyTo, auto }) {
+async function dispatchSend({ to, text, role, toSession, inReplyTo, auto }) {
   const s = requireActive();
   const id = newMessageId();
   // Single shared session id per thread. A reply REUSES the id of the thread it
-  // answers — the peer's wrapper_session_id, carried as `toSessionUuid` on an
-  // explicitly-targeted reply or resolved from the replied-to message — so both
-  // sides key the conversation on the SAME id. Only a brand-new thread WE open mints
-  // a fresh id. It rides in scope.wrapper_session_id; there is no separate peer-id echo.
-  const threadUuid = toSessionUuid ?? replyConvUuid(inReplyTo);
+  // answers (resolved from the replied-to message via in_reply_to) so both sides key
+  // the conversation on the SAME id. Only a brand-new thread WE open mints a fresh id.
+  // It rides in scope.wrapper_session_id; there is no separate peer-id echo.
+  const threadUuid = replyConvUuid(inReplyTo);
   const conversationUuid = threadUuid ?? resolveConversationUuid(s.sessionUuid, to);
   // Adopt a peer-opened thread id into our conversation index so later inbound
   // messages on it route to THIS session deterministically (not just via primary policy).

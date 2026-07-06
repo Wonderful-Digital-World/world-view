@@ -19,7 +19,7 @@ import { FileSessionStore } from "@tinyhumansai/tinyplace/node";
 import { sendMessage, readMessages, publishKeys } from "@tinyhumansai/tinyplace/agent";
 
 import { buildEnvelope, decodeBody } from "../mcp/format.mjs";
-import { liveSessions } from "../mcp/registry.mjs";
+import { liveSessions, sessionUuidForConversation } from "../mcp/registry.mjs";
 import { enqueueRouted, redeliverUnrouted, reapClosedTargets } from "../mcp/routing.mjs";
 import { claimOutboxJobs, writeOutboxJob } from "../mcp/outbox.mjs";
 import { acquireLock, heartbeatLock, releaseLock } from "../mcp/daemon-lock.mjs";
@@ -141,13 +141,13 @@ async function drainInbound() {
     const pendingByLabel = new Map(); // label -> [decoded]
     let headlessPending = false;
     for (const raw of messages) {
-      const { auto, inReplyTo, text, messageId, fromSession, fromSessionUuid, role, toSession, toSessionUuid } = decodeBody(raw.text);
+      const { auto, inReplyTo, text, messageId, fromSession, fromSessionUuid, role, toSession } = decodeBody(raw.text);
       if (text === RESET_SENTINEL) continue; // handshake ping — consumed on decrypt
       // Correlate on the in-body envelope id when present, else the relay id.
       const id = messageId ?? raw.id;
       // Carry the conversation uuids so enqueueRouted can do reuse-proof routing and
       // held/closed mail keeps the sender's conversation id for the notice.
-      const decoded = { id, from: raw.from, fromSession, fromSessionUuid, role, text, inReplyTo, toSession, toSessionUuid, ts: raw.timestamp ?? new Date().toISOString() };
+      const decoded = { id, from: raw.from, fromSession, fromSessionUuid, role, text, inReplyTo, toSession, ts: raw.timestamp ?? new Date().toISOString() };
       const { target } = enqueueRouted(AGENT, decoded); // route to the session inbox(es)
       // Non-auto messages need a reply (loop guard: an auto-tagged reply is never
       // itself answered).
@@ -157,9 +157,10 @@ async function drainInbound() {
           if (!pendingByLabel.has(label)) pendingByLabel.set(label, []);
           pendingByLabel.get(label).push(decoded);
         }
-      } else if (!decoded.toSession && !decoded.toSessionUuid) {
-        // Untargeted + no live session → isolated responder (headless agent still
-        // auto-replies).
+      } else if (!decoded.toSession && !(decoded.fromSessionUuid && sessionUuidForConversation(decoded.fromSessionUuid))) {
+        // Truly untargeted (no toSession label, and the shared id — if any — is one we
+        // never minted, i.e. a brand-new thread) + no live session → isolated
+        // responder (headless agent still auto-replies).
         enqueueForAutoResponse(decoded);
         headlessPending = true;
       }
@@ -235,7 +236,7 @@ function notifyClosedTargets() {
       // the notice threads into the conversation they opened.
       conversationUuid: p.fromSessionUuid ?? null,
       role: "system",
-      text: `The session "${p.toSession}" you addressed is no longer active; your message was not delivered. Start a new message to reach this agent.`,
+      text: `The session${p.toSession ? ` "${p.toSession}"` : ""} you addressed is no longer active; your message was not delivered. Start a new message to reach this agent.`,
       inReplyTo: p.id,
       auto: true,
       fromSession: "system",

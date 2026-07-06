@@ -115,16 +115,19 @@ const dok = decodeBody(JSON.stringify(okLabelEnv));
 expect("safe labels (codex:1 / codex:2) pass validation", dok.fromSession === "codex:1" && dok.toSession === "codex:2");
 
 // ── conversation uuids on the wire ───────────────────────────────────────────
-// The sender's conversation id rides in scope.wrapper_session_id and decodes as
-// fromSessionUuid; to_session_uuid (addressing the peer's conversation) roundtrips.
+// One shared session id per thread: the conversation id rides in
+// scope.wrapper_session_id and decodes as fromSessionUuid. There is no separate
+// peer-id field — tp.to_session_uuid is neither emitted nor decoded.
 const CONV = "11111111-2222-3333-4444-555555555555";
-const PEER_CONV = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-const convEnv = JSON.parse(encodeEnvelope({ text: "hi", fromSession: "codex:1", conversationUuid: CONV, toSessionUuid: PEER_CONV }));
+const convEnv = JSON.parse(encodeEnvelope({ text: "hi", fromSession: "codex:1", conversationUuid: CONV }));
 expect("conversationUuid is written to scope.wrapper_session_id", convEnv.scope.wrapper_session_id === CONV);
+expect("no tp.to_session_uuid is emitted (single shared id)", convEnv.tp.to_session_uuid === undefined);
 const dconv = decodeBody(JSON.stringify(convEnv));
 expect("wrapper_session_id decodes as fromSessionUuid", dconv.fromSessionUuid === CONV);
-expect("to_session_uuid roundtrips as toSessionUuid", dconv.toSessionUuid === PEER_CONV);
 expect("the routing label still rides in tp.from_session", dconv.fromSession === "codex:1");
+// Even if an envelope carries tp.to_session_uuid, decodeBody does not surface it.
+const withPeerId = { ...convEnv, tp: { ...convEnv.tp, to_session_uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" } };
+expect("tp.to_session_uuid is not decoded (no dual-id addressing)", decodeBody(JSON.stringify(withPeerId)).toSessionUuid === undefined);
 // A non-uuid wrapper_session_id (old peers put the harness id there) → no uuid.
 const legacyWrap = JSON.parse(encodeEnvelope({ text: "hi", fromSession: "codex:1", harnessSessionId: "legacy-harness-id" }));
 expect("non-uuid wrapper_session_id → fromSessionUuid null (label fallback)", decodeBody(JSON.stringify(legacyWrap)).fromSessionUuid === null);

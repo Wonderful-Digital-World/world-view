@@ -100,11 +100,14 @@ const suE1 = reg.resolveSessionUuid("he1"); // codex:1's durable session anchor
 const convE = reg.resolveConversationUuid(suE1, "peerE"); // its wire-visible conversation id
 expect("resolveConversationUuid mints a uuid, indexed to the session", reg.sessionUuidForConversation(convE) === suE1);
 expect("resolveConversationUuid is idempotent per (session,peer)", reg.resolveConversationUuid(suE1, "peerE") === convE);
-const er1 = routing.enqueueRouted(E, { id: "e1", from: "peerE", text: "by conv uuid", toSession: "codex:1", toSessionUuid: convE });
-expect("conversation uuid of a live session → routed to its label", er1.target.kind === "session" && er1.target.labels[0] === "codex:1");
-const er2 = routing.enqueueRouted(E, { id: "e2", from: "peerE", text: "ghost", toSession: "codex:1", toSessionUuid: "00000000-0000-0000-0000-000000000000" });
-expect("unknown conversation uuid → unrouted even though the label is live", er2.target.kind === "unrouted");
-expect("no leak: live codex:1 did not get the unknown-uuid message", !existsSync(join(routing.sessionInboxDir(E, "codex:1"), "e2.json")));
+// A reply echoing the shared id (wrapper_session_id → fromSessionUuid) of a LIVE
+// session is delivered to it.
+const er1 = routing.enqueueRouted(E, { id: "e1", from: "peerE", text: "by shared id", fromSessionUuid: convE });
+expect("shared session id of a live session → routed to its label", er1.target.kind === "session" && er1.target.labels[0] === "codex:1");
+// An id we never minted (a brand-new thread) isn't in our index → it falls through to
+// policy routing (default primary → the live codex:1): first-contact delivery.
+const er2 = routing.enqueueRouted(E, { id: "e2", from: "peerE", text: "new thread", fromSessionUuid: "00000000-0000-0000-0000-000000000000" });
+expect("unknown shared id → falls through to policy (primary), not held", er2.target.kind === "session" && er2.target.labels[0] === "codex:1");
 
 // ── per-pair session-id routing (a peer like OpenHuman addresses a reply by the
 //    per-pair session id WE minted — the conversation uuid — carried back in
@@ -129,8 +132,10 @@ const suOld = reg.resolveSessionUuid("old-sess");
 const convOld = reg.resolveConversationUuid(suOld, "peerF"); // the old session's conversation with peerF
 reg.removePresence(F, "codex:1"); // old session closes → codex:1 frees
 reg.writePresence(F, { label: "codex:1", harnessSessionId: "new-sess", cwd: "/w", startedAt: new Date().toISOString() }); // stranger takes codex:1
-const fr = routing.enqueueRouted(F, { id: "f1", from: "peerF", text: "for the old one", toSession: "codex:1", toSessionUuid: convOld });
-expect("label reuse: old conversation uuid is NOT delivered to the reused label", fr.target.kind === "unrouted");
+// The peer echoes the OLD session's shared id; its owner is gone and the label was
+// reused by a stranger. Known-but-offline id → held (P1), never misdelivered.
+const fr = routing.enqueueRouted(F, { id: "f1", from: "peerF", text: "for the old one", fromSessionUuid: convOld });
+expect("label reuse: a shared id whose owner is gone is NOT delivered to the reused label", fr.target.kind === "unrouted");
 expect("reused codex:1 inbox did not receive the old thread", !existsSync(join(routing.sessionInboxDir(F, "codex:1"), "f1.json")));
 spawnSync("sleep", ["0.05"]);
 const fReap = routing.reapClosedTargets(F, { graceMs: 10 });
