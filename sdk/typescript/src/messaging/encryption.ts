@@ -1,5 +1,5 @@
 import type { KeysApi } from "../api/keys.js";
-import { cryptoIdToPublicKey } from "../crypto.js";
+import { cryptoIdToPublicKey, deriveCryptoId } from "../crypto.js";
 import type { Signer } from "../signer.js";
 import {
   SignalSession,
@@ -74,7 +74,10 @@ export class EncryptionContext implements MessageCipher {
 
     // Route/store the bundle under the base58 cryptoId (`address`), but keep the
     // `identityKey` field as the base64 Ed25519 key: it is Signal key material a
-    // peer decodes to bootstrap X3DH, not a routing address.
+    // peer decodes to bootstrap X3DH, not a routing address. (main landed the same
+    // base58-routing fix via a `keyPathId`/`identityKey: address` naming where
+    // `address` was the base64 key; this branch's `address` is the base58 cryptoId,
+    // so the equivalent form is route=address, identityKey=publicKeyBase64.)
     const identityKey = this.signer.publicKeyBase64;
     await this.keys.rotateSignedPreKey(address, {
       identityKey,
@@ -92,9 +95,12 @@ export class EncryptionContext implements MessageCipher {
     const recipientX25519 = ed25519PubToX25519Pub(recipientEd25519);
     // First message to a peer needs their bundle to bootstrap X3DH; later messages
     // ride the established Double Ratchet session and need no bundle fetch.
+    // Fetch by the recipient's base58 cryptoId, NOT their base64 key: the relay
+    // key routes (/keys/:cryptoId/bundle) match a single path segment, which a
+    // base64 key's `/` breaks (→ 404). Mirrors publishKeyBundle.
     const bundle = (await session.hasSession(envelope.to))
       ? undefined
-      : await this.keys.getBundle(envelope.to);
+      : await this.keys.getBundle(deriveCryptoId(recipientEd25519));
 
     const encrypted = await session.encrypt(
       envelope.to,

@@ -1,6 +1,7 @@
 import { spawn as spawnChild } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -8,8 +9,10 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, platform } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { createRequire } from "node:module";
+import { homedir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
+import { spawn as spawnPty, type IPty } from "node-pty";
 
 import { resolveRecipientKey, sendMessage } from "../agent/messaging.js";
 import {
@@ -25,6 +28,8 @@ import type { TinyPlaceCliOptions, TinyPlaceCliResult } from "./types.js";
 import type { Writable } from "node:stream";
 
 type StreamName = "input" | "output" | "error" | "lifecycle";
+
+const requireForHarness = createRequire(import.meta.url);
 
 interface HarnessWrapperProfile {
   binEnv: Array<string>;
@@ -117,6 +122,17 @@ interface SemanticMessage {
   timestamp: Date;
 }
 
+interface AgentLaunch {
+  args: Array<string>;
+  command: string;
+}
+
+interface HarnessStdio {
+  stdin: NodeJS.ReadableStream;
+  stdout: Writable;
+  stderr: Writable;
+}
+
 const PROFILES: Record<HarnessProvider, HarnessWrapperProfile> = {
   codex: {
     binEnv: ["TINYPLACE_CODEX_BIN"],
@@ -156,9 +172,88 @@ export async function runHarnessCommand(
     : undefined;
   const launch = buildAgentLaunch(config);
 
+  const usePty = config.usePty && options.spawn === undefined;
+  writer.pty = usePty;
   writer.write("lifecycle", `start ${launch.command} ${launch.args.join(" ")}`.trim());
   sessionTailer?.start(new Date());
 
+  const exitCode = usePty
+    ? await runPtyAgent(launch, config, cwd, env, writer, stdio)
+    : await runPipeAgent(launch, config, cwd, env, writer, stdio, spawnFn);
+
+  const dmFailures = (await sessionTailer?.stop()) ?? 0;
+
+  return { code: exitCode === 0 && dmFailures > 0 ? 1 : exitCode, stdout: "", stderr: "" };
+}
+
+async function runPtyAgent(
+  launch: AgentLaunch,
+  config: HarnessWrapperConfig,
+  cwd: string,
+  env: Record<string, string | undefined>,
+  writer: TerminalEnvelopeWriter,
+  stdio: HarnessStdio,
+): Promise<number> {
+  let pty: IPty;
+  try {
+    fixNodePtyHelperPermissions();
+    pty = spawnPty(launch.command, launch.args, {
+      cols: terminalColumns(stdio.stdout),
+      cwd,
+      env: childEnv(env),
+      name: terminalName(env),
+      rows: terminalRows(stdio.stdout),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    writer.write("lifecycle", `node-pty unavailable: ${message}`);
+    stdio.stderr.write(`tinyplace ${config.provider}: node-pty unavailable: ${message}\n`);
+    writer.pty = false;
+    return runPipeAgent(launch, config, cwd, env, writer, stdio, spawnChild);
+  }
+
+  writer.pid = pty.pid;
+  const restoreRawMode = configureRawInput(stdio.stdin);
+  const onInput = (chunk: Buffer | string): void => {
+    if (config.captureInput) {
+      writer.write("input", String(chunk));
+    }
+    pty.write(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk);
+  };
+  stdio.stdin.on("data", onInput);
+  pty.onData((chunk: string) => {
+    if (config.captureOutput) {
+      writer.write("output", chunk);
+    }
+    stdio.stdout.write(chunk);
+  });
+
+  const exitCode = await new Promise<number>((resolveExit) => {
+    pty.onExit(({ exitCode: code, signal }) => {
+      if (signal) {
+        writer.write("lifecycle", `exit signal ${signal}`);
+        resolveExit(1);
+        return;
+      }
+      writer.write("lifecycle", `exit code ${code}`);
+      resolveExit(code);
+    });
+  });
+
+  restoreInput(stdio.stdin, onInput);
+  restoreRawMode();
+  return exitCode;
+}
+
+async function runPipeAgent(
+  launch: AgentLaunch,
+  config: HarnessWrapperConfig,
+  cwd: string,
+  env: Record<string, string | undefined>,
+  writer: TerminalEnvelopeWriter,
+  stdio: HarnessStdio,
+  spawnFn: NonNullable<TinyPlaceCliOptions["spawn"]>,
+): Promise<number> {
   const child = spawnFn(launch.command, launch.args, {
     cwd,
     env: { ...process.env, ...env, TERM: env.TERM ?? process.env.TERM ?? "xterm-256color" },
@@ -193,7 +288,9 @@ export async function runHarnessCommand(
   const exitCode = await new Promise<number>((resolveExit) => {
     child.on("error", (error) => {
       writer.write("lifecycle", `error: ${error.message}`);
-      stdio.stderr.write(`tinyplace ${provider}: failed to start ${config.agentBin}: ${error.message}\n`);
+      stdio.stderr.write(
+        `tinyplace ${config.provider}: failed to start ${config.agentBin}: ${error.message}\n`,
+      );
       resolveExit(1);
     });
     child.on("exit", (code, signal) => {
@@ -207,11 +304,9 @@ export async function runHarnessCommand(
     });
   });
 
-  stdio.stdin.off("data", onInput);
+  restoreInput(stdio.stdin, onInput);
   restoreRawMode();
-  const dmFailures = (await sessionTailer?.stop()) ?? 0;
-
-  return { code: exitCode === 0 && dmFailures > 0 ? 1 : exitCode, stdout: "", stderr: "" };
+  return exitCode;
 }
 
 export function parseHarnessWrapperArgs(
@@ -364,19 +459,8 @@ export function asCodexWrapperConfig(config: HarnessWrapperConfig): CodexWrapper
   };
 }
 
-function buildAgentLaunch(config: HarnessWrapperConfig): {
-  args: Array<string>;
-  command: string;
-  pty: boolean;
-} {
-  if (config.usePty && platform() === "darwin") {
-    return {
-      command: "script",
-      args: ["-q", "/dev/null", config.agentBin, ...config.agentArgs],
-      pty: true,
-    };
-  }
-  return { command: config.agentBin, args: config.agentArgs, pty: false };
+function buildAgentLaunch(config: HarnessWrapperConfig): AgentLaunch {
+  return { command: config.agentBin, args: config.agentArgs };
 }
 
 class HarnessSessionTailer {
@@ -650,6 +734,7 @@ function isNotAContactError(error: unknown): boolean {
 class TerminalEnvelopeWriter {
   private sequence = 0;
   public pid: number | undefined;
+  public pty = false;
 
   public constructor(
     private readonly config: HarnessWrapperConfig,
@@ -688,14 +773,14 @@ class TerminalEnvelopeWriter {
         argv: this.config.agentArgs,
         command: this.config.agentBin,
         ...(this.pid === undefined ? {} : { pid: this.pid }),
-        pty: this.config.usePty && platform() === "darwin",
+        pty: this.pty,
       },
     };
     envelope[this.config.provider] = {
       argv: this.config.agentArgs,
       command: this.config.agentBin,
       ...(this.pid === undefined ? {} : { pid: this.pid }),
-      pty: this.config.usePty && platform() === "darwin",
+      pty: this.pty,
     };
     this.writeEnvelope(envelope);
   }
@@ -740,6 +825,63 @@ function configureRawInput(stdin: NodeJS.ReadableStream): () => void {
   return () => {
     maybeRaw.setRawMode(Boolean(wasRaw));
   };
+}
+
+function restoreInput(
+  stdin: NodeJS.ReadableStream,
+  onInput: ((chunk: Buffer | string) => void) | undefined,
+): void {
+  if (onInput) {
+    stdin.off("data", onInput);
+  }
+}
+
+function childEnv(env: Record<string, string | undefined>): Record<string, string> {
+  const merged: Record<string, string | undefined> = {
+    ...process.env,
+    ...env,
+    TERM: terminalName(env),
+  };
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(merged)) {
+    if (value !== undefined) {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+function terminalName(env: Record<string, string | undefined>): string {
+  const value = env.TERM ?? process.env.TERM;
+  return value && value !== "dumb" ? value : "xterm-256color";
+}
+
+function terminalColumns(stdout: Writable): number {
+  const columns = (stdout as { columns?: number }).columns ?? process.stdout.columns ?? 80;
+  return Math.max(20, columns);
+}
+
+function terminalRows(stdout: Writable): number {
+  const rows = (stdout as { rows?: number }).rows ?? process.stdout.rows ?? 24;
+  return Math.max(5, rows);
+}
+
+function fixNodePtyHelperPermissions(): void {
+  let packageDir: string;
+  try {
+    packageDir = dirname(requireForHarness.resolve("node-pty/package.json"));
+  } catch {
+    return;
+  }
+  for (const helperPath of [
+    join(packageDir, "build", "Release", "spawn-helper"),
+    join(packageDir, "prebuilds", `${process.platform}-${process.arch}`, "spawn-helper"),
+  ]) {
+    if (!existsSync(helperPath)) {
+      continue;
+    }
+    chmodSync(helperPath, 0o755);
+  }
 }
 
 function listSessionFiles(config: HarnessWrapperConfig): Array<string> {
