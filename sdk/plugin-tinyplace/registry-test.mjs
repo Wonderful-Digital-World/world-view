@@ -129,6 +129,25 @@ const again = reg.claimLabel(F, { harnessSessionId: "restart-me" });
 expect("claimLabel reuses same label for same harnessSessionId", again.label === "worker");
 expect("no duplicate label files after reclaim", reg.readSessions(F).filter((e) => e.label === "worker").length === 1);
 
+// ── bindConversationUuid: adopt a PEER-minted thread id (single shared id) ─────
+// A peer (e.g. OpenHuman) opens a thread with ITS wrapper_session_id "S". We never
+// minted it, so it isn't in our forward map — but once a local session replies on it
+// we bind it, and subsequent inbound "S" routes straight to that session.
+const G = "AgentGGGGGGGGGGGGGGGGGGGGGGGGGGGG";
+reg.writePresence(G, { label: "codex:1", harnessSessionId: "HG1", cwd: "/x", startedAt: now() });
+const suG = reg.resolveSessionUuid("HG1");
+reg.bindConversationUuid("peer-thread-S", suG, "openhuman");
+expect("adopted peer id resolves to its owning sessionUuid", reg.sessionUuidForConversation("peer-thread-S") === suG);
+expect("adopted peer id routes to the bound live session", reg.labelForConversationUuid(G, "peer-thread-S") === "codex:1");
+// Idempotent: re-adopting (every reply calls it) must NOT clobber the first owner.
+reg.bindConversationUuid("peer-thread-S", "some-other-sessionuuid", "openhuman");
+expect("bindConversationUuid keeps the first owner (idempotent)", reg.sessionUuidForConversation("peer-thread-S") === suG);
+// Unknown / empty ids: no route, no write, no throw.
+expect("unknown conversation id → null label", reg.labelForConversationUuid(G, "never-seen") === null);
+reg.bindConversationUuid("", suG, "openhuman");
+reg.bindConversationUuid("x", "", "openhuman");
+expect("bindConversationUuid no-ops on missing args", reg.sessionUuidForConversation("") === null);
+
 const failed = checks.filter((c) => !c.ok);
 console.log("\n" + (failed.length === 0 ? `ALL ${checks.length} CHECKS PASSED ✅` : `${failed.length} FAILED ❌`));
 process.exit(failed.length === 0 ? 0 : 1);

@@ -120,11 +120,12 @@ export function encodeEnvelope(opts) {
     tp: { v: PLUGIN_TP_VERSION, from_session: label },
   };
   if (opts.toSession) envelope.tp.to_session = opts.toSession;
-  // Address a reply to the exact conversation the peer opened: to_session_uuid is the
-  // peer's wrapper_session_id (their per-conversation id), echoed back so their side
-  // routes it to the originating session — immune to label reuse. (The sender's own
-  // conversation id rides in scope.wrapper_session_id above.)
-  if (opts.toSessionUuid) envelope.tp.to_session_uuid = opts.toSessionUuid;
+  // Single shared session id: every message — whoever sends it — carries exactly one
+  // id, in scope.wrapper_session_id (the shared per-thread conversation id). A reply
+  // REUSES the id of the thread it answers (see dispatchSend), so there is no separate
+  // "peer session id" to echo. (Historically tp.to_session_uuid carried the peer's id
+  // back; that dual-id addressing is gone — routing keys on wrapper_session_id alone.
+  // tp.to_session above is an explicit label target, orthogonal to the session id.)
   if (opts.inReplyTo) envelope.tp.in_reply_to = opts.inReplyTo;
   if (opts.auto) envelope.tp.auto = true;
   return JSON.stringify(envelope);
@@ -156,10 +157,10 @@ function decodeEnvelope(obj) {
     // fallback still only catches an OLD body that stored a short label there.
     fromSession: safeLabel(tp.from_session) ?? safeLabel(obj.scope?.wrapper_session_id),
     toSession: safeLabel(tp.to_session),
-    // The sender's per-conversation id is scope.wrapper_session_id (a uuid now);
-    // older peers put a non-uuid there, which safeUuid drops → label routing.
+    // The single shared session id for the thread is scope.wrapper_session_id (a
+    // uuid); a non-uuid there (e.g. a plain harness/label id) is dropped by safeUuid
+    // → label routing. There is no separate peer-id field — one id per message.
     fromSessionUuid: safeUuid(obj.scope?.wrapper_session_id),
-    toSessionUuid: safeUuid(tp.to_session_uuid),
     role,
     envelope: true,
   };
@@ -183,7 +184,7 @@ function decodeLegacyBody(raw) {
       }
     }
   }
-  return { auto, inReplyTo, text, messageId: null, fromSession: null, toSession: null, fromSessionUuid: null, toSessionUuid: null, role: null, envelope: false };
+  return { auto, inReplyTo, text, messageId: null, fromSession: null, toSession: null, fromSessionUuid: null, role: null, envelope: false };
 }
 
 // Build a legacy auto-reply body (auto tag + optional re: header + plaintext).

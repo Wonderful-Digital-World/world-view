@@ -49,6 +49,7 @@ import {
   gcStale,
   resolveSessionUuid,
   resolveConversationUuid,
+  bindConversationUuid,
 } from "./registry.mjs";
 import { loadWallets, saveWallets } from "./wallets.mjs";
 import { drainInbox, redeliverUnrouted } from "./routing.mjs";
@@ -322,30 +323,33 @@ async function maybeRecoverSession(peer) {
 // a daemon-mode sender's reply still matches a self-mode receiver's echo. In
 // daemon mode the send is deferred to the daemon (single ratchet writer) via an
 // outbox job; in self mode we send directly. Returns { id, via }.
-// The peer conversation id to address a reply to: the from_session_uuid of the
-// buffered message we're replying to (correlated by in_reply_to). Lets a reply route
-// to the exact session that opened the thread WITHOUT the model handling uuids. Null
-// (→ fall back to label routing) if the original was already drained from the buffer.
+// The shared session id of the thread we're replying to: the wrapper_session_id of the
+// message being answered (correlated by in_reply_to). dispatchSend REUSES it as our own
+// wrapper_session_id, so both peers key the thread on ONE id WITHOUT the model handling
+// uuids. Null (→ mint a fresh id for a new thread) if the original already drained.
 function replyConvUuid(inReplyTo) {
   if (!inReplyTo || !session) return null;
   // Prefer the durable map (survives an inbox drain); fall back to a still-buffered msg.
   return session.convByMsgId.get(String(inReplyTo)) ?? session.buffer.find((m) => String(m.id) === String(inReplyTo))?.fromSessionUuid ?? null;
 }
 
-async function dispatchSend({ to, text, role, toSession, toSessionUuid, inReplyTo, auto }) {
+async function dispatchSend({ to, text, role, toSession, inReplyTo, auto }) {
   const s = requireActive();
   const id = newMessageId();
-  // This session's per-conversation id with `to` (minted once, stable) → wire as
-  // wrapper_session_id so the peer's reply routes back to us reuse-proof.
-  const conversationUuid = resolveConversationUuid(s.sessionUuid, to);
-  // Address the peer's conversation (explicit arg, else echo the replied-to message's).
-  const peerConvUuid = toSessionUuid ?? replyConvUuid(inReplyTo);
+  // Single shared session id per thread. A reply REUSES the id of the thread it
+  // answers (resolved from the replied-to message via in_reply_to) so both sides key
+  // the conversation on the SAME id. Only a brand-new thread WE open mints a fresh id.
+  // It rides in scope.wrapper_session_id; there is no separate peer-id echo.
+  const threadUuid = replyConvUuid(inReplyTo);
+  const conversationUuid = threadUuid ?? resolveConversationUuid(s.sessionUuid, to);
+  // Adopt a peer-opened thread id into our conversation index so later inbound
+  // messages on it route to THIS session deterministically (not just via primary policy).
+  if (threadUuid) bindConversationUuid(threadUuid, s.sessionUuid, to);
   if (s.mode === "daemon") {
     writeOutboxJob(s.address, {
       id,
       to,
       toSession: toSession ?? null,
-      toSessionUuid: peerConvUuid ?? null,
       conversationUuid: conversationUuid ?? null,
       role: role ?? null,
       text,
@@ -362,7 +366,6 @@ async function dispatchSend({ to, text, role, toSession, toSessionUuid, inReplyT
     text,
     role,
     toSession,
-    toSessionUuid: peerConvUuid,
     conversationUuid,
     inReplyTo,
     auto,
@@ -407,8 +410,9 @@ async function buildClient(seedHex) {
 //   "auto"           — an auto-tagged reply; buffered only (loop guard: never answered)
 //   "needs-response" — a fresh peer DM buffered and awaiting a reply
 function deliverToSession(msg, { auto }) {
-  // Remember the sender's conversation uuid keyed by message id, so a later reply
-  // (in_reply_to) can echo it as to_session_uuid even after `inbox` drained buffer.
+  // Remember the thread's shared session id (the sender's wrapper_session_id) keyed by
+  // message id, so a later reply (in_reply_to) REUSES it as our own wrapper_session_id
+  // even after `inbox` drained the buffer — one shared id per thread, both directions.
   if (msg.fromSessionUuid && msg.id != null) {
     session.convByMsgId.set(String(msg.id), msg.fromSessionUuid);
     if (session.convByMsgId.size > 500) session.convByMsgId.delete(session.convByMsgId.keys().next().value);

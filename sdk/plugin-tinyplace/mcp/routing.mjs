@@ -4,7 +4,7 @@
 import { mkdirSync, writeFileSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-import { sessionsDir, liveSessions, primarySession, labelForConversationUuid } from "./registry.mjs";
+import { sessionsDir, liveSessions, primarySession, labelForConversationUuid, sessionUuidForConversation } from "./registry.mjs";
 
 // No-target delivery policy (TINYPLACE_UNROUTED_POLICY): primary (default),
 // broadcast (fan out to all live), or drop.
@@ -54,10 +54,16 @@ export function routeTarget({ toSession, liveLabels, primary, policy = "primary"
 // addressed a session UUID, deliver ONLY to the live session that actually owns it —
 // never to a reused label slot; no live owner → unrouted (held). Falls back to the
 // label/policy routing when there's no UUID (older peers, untargeted mail).
-function resolveBound(agentAddress, { toSession, toSessionUuid }, { liveList, primary, policy }) {
-  if (toSessionUuid) {
-    const label = labelForConversationUuid(agentAddress, toSessionUuid);
-    return label ? { kind: "session", labels: [label] } : { kind: "unrouted" };
+function resolveBound(agentAddress, { toSession, fromSessionUuid }, { liveList, primary, policy }) {
+  // Every message carries ONE shared session id: the thread's conversation uuid, in
+  // wrapper_session_id (decoded as fromSessionUuid). Resolve it through our index.
+  if (fromSessionUuid) {
+    const label = labelForConversationUuid(agentAddress, fromSessionUuid);
+    if (label) return { kind: "session", labels: [label] }; // owner live → deliver
+    // A convUuid WE minted/adopted but whose owner is offline names a SPECIFIC,
+    // now-closed session — hold it (reuse-proof), never misdeliver to another live
+    // session via policy. Only a truly unknown id falls through to policy routing.
+    if (sessionUuidForConversation(fromSessionUuid)) return { kind: "unrouted" };
   }
   return routeTarget({ toSession, liveLabels: liveList, primary, policy });
 }
@@ -87,7 +93,6 @@ export function enqueueRouted(agentAddress, decoded, { policy = unroutedPolicy()
     text: decoded.text,
     inReplyTo: decoded.inReplyTo ?? null,
     toSession: decoded.toSession ?? null,
-    toSessionUuid: decoded.toSessionUuid ?? null,
     ts: decoded.ts ?? new Date().toISOString(),
   };
   const written = [];
@@ -167,11 +172,15 @@ export function reapClosedTargets(agentAddress, { graceMs = CLOSED_GRACE_MS } = 
     } catch {
       continue;
     }
-    if (!payload.toSession && !payload.toSessionUuid) continue; // untargeted → not a "closed session" case
-    // Is the addressed session still reachable? Prefer the UUID (a match is the SAME
-    // session, never a reused label); fall back to the label for older peers.
-    const stillLive = payload.toSessionUuid
-      ? Boolean(labelForConversationUuid(agentAddress, payload.toSessionUuid))
+    // Was this addressed to a SPECIFIC session (now gone), vs merely "no live
+    // session right now"? A known shared id (a convUuid in our index) names a
+    // specific thread; an explicit toSession names a specific label.
+    const knownConv = payload.fromSessionUuid && Boolean(sessionUuidForConversation(payload.fromSessionUuid));
+    if (!payload.toSession && !knownConv) continue; // untargeted → not a "closed session" case
+    // Is the addressed session still reachable? Prefer the shared id (a match is the
+    // SAME session, never a reused label); fall back to the explicit label.
+    const stillLive = knownConv
+      ? Boolean(labelForConversationUuid(agentAddress, payload.fromSessionUuid))
       : live.has(payload.toSession);
     if (stillLive) continue; // target is live → let redelivery handle it
     if (now - mtimeMs < graceMs) continue; // still within the grace window
