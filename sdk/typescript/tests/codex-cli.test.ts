@@ -7,7 +7,11 @@ import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 
 import { runTinyPlaceCli } from "../src/cli.js";
-import { parseCodexWrapperArgs } from "../src/cli/codex.js";
+import {
+  parseAgentArgs,
+  parseCodexWrapperArgs,
+  wantsAgentMode,
+} from "../src/cli/codex.js";
 import {
   LocalSigner,
   MemorySessionStore,
@@ -417,6 +421,52 @@ describe("tinyplace codex", () => {
     expect(relay.contactRequests).toEqual([recipient.signer.agentId]);
     expect(stderrChunks.join("")).toContain("contact request pending");
     await expect(readMessages(recipient.client, recipient.signer)).resolves.toHaveLength(0);
+  });
+
+  describe("agent mode routing (--agent)", () => {
+    it("selects agent mode only for a leading --agent, not one after --", () => {
+      expect(wantsAgentMode(["--agent"])).toBe(true);
+      expect(wantsAgentMode(["--wallet", "alice", "--agent", "--", "-m", "gpt-5.4"])).toBe(true);
+      expect(wantsAgentMode(["--model", "gpt-5"])).toBe(false);
+      // `--agent` after the `--` belongs to the forwarded codex args, not us.
+      expect(wantsAgentMode(["--", "--agent"])).toBe(false);
+      expect(wantsAgentMode([])).toBe(false);
+    });
+
+    it("strips our flags and forwards the rest to the launcher", () => {
+      const parsed = parseAgentArgs([
+        "--agent",
+        "--wallet",
+        "alice",
+        "--autorespond",
+        "--profile",
+        "work",
+        "--",
+        "-m",
+        "gpt-5.4",
+      ]);
+      expect(parsed.wallet).toBe("alice");
+      expect(parsed.autorespond).toBe(true);
+      expect(parsed.passthrough).toEqual(["--profile", "work"]);
+      expect(parsed.forwarded).toEqual(["-m", "gpt-5.4"]);
+    });
+
+    it("accepts --wallet=<value> and defaults autorespond off", () => {
+      const parsed = parseAgentArgs(["--agent", "--wallet=bob"]);
+      expect(parsed.wallet).toBe("bob");
+      expect(parsed.autorespond).toBe(false);
+      expect(parsed.passthrough).toEqual([]);
+      expect(parsed.forwarded).toEqual([]);
+    });
+
+    it("fails with an actionable message when the plugin has no installed deps", async () => {
+      // The unified plugin ships in-repo but is excluded from the workspace, so
+      // its node_modules is absent in a fresh checkout / CI — the guard should
+      // surface an install hint rather than a cryptic module-resolution crash.
+      const result = await runTinyPlaceCli(["codex", "--agent"], { env: {} });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toMatch(/node_modules|tiny\.place plugin|not bundled/i);
+    });
   });
 
   it("mirrors the wrapper for Claude Code session JSONL", async () => {

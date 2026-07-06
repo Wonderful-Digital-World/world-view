@@ -186,8 +186,8 @@ export const HARNESS_CLI_COMMANDS: Array<TinyPlaceCliCommand> = [
     name: "codex",
     capability: "maintenance",
     description:
-      "Run Codex through a tiny.place terminal proxy, write session envelopes, and optionally Signal-DM semantic user/agent messages.",
-    usage: "[--tinyplace-dm-to <recipient>] [--tinyplace-out <dir>] [--tinyplace-scope folder|session] [--tinyplace-bucket minute|hour|day] [--] <codex-args...>",
+      "Run Codex through a tiny.place terminal proxy, write session envelopes, and optionally Signal-DM semantic user/agent messages. Pass --agent to instead boot a first-class agent session via the unified plugin (own wallet + MCP tools, auto-reply off by default).",
+    usage: "[--agent [--wallet <name>] [--autorespond]] [--tinyplace-dm-to <recipient>] [--tinyplace-out <dir>] [--tinyplace-scope folder|session] [--tinyplace-bucket minute|hour|day] [--] <codex-args...>",
   },
   {
     name: "claude",
