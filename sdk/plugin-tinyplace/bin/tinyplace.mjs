@@ -14,10 +14,10 @@
 // auto-detects from the environment (defaults to claude in a plain shell).
 //
 // Usage:
-//   tinyplace                       # interactive TUI (auto-detect harness)
-//   tinyplace --harness codex       # force the Codex adapter
-//   tinyplace --wallet alice        # skip the menu, launch straight in as `alice`
-//   tinyplace -- --resume           # anything after `--` is forwarded to the harness
+//   tinyplace-plugin                       # interactive TUI (auto-detect harness)
+//   tinyplace-plugin --harness codex       # force the Codex adapter
+//   tinyplace-plugin --wallet alice        # skip the menu, launch straight in as `alice`
+//   tinyplace-plugin -- --resume           # anything after `--` is forwarded to the harness
 
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -426,19 +426,19 @@ async function main() {
   ADAPTER = activeAdapter();
   DATA_DIR = harnessDataDir(ADAPTER);
 
-  // Non-interactive fast path: `tinyplace --wallet alice`.
+  // Non-interactive fast path: `tinyplace-plugin --wallet alice`.
   const walletFlag = flags.indexOf("--wallet");
   if (walletFlag !== -1) {
     const name = flags[walletFlag + 1];
     if (!name || !loadWallets().some((w) => w.name === name)) {
-      console.error(`No wallet named '${name ?? ""}'. Run 'tinyplace' with no args to create one.`);
+      console.error(`No wallet named '${name ?? ""}'. Run 'tinyplace-plugin' with no args to create one.`);
       process.exit(1);
     }
     return launch(name, forwardedArgs);
   }
 
   if (!process.stdin.isTTY) {
-    console.error("tinyplace: interactive menu needs a TTY. Use 'tinyplace --wallet <name>' in non-interactive contexts.");
+    console.error("tinyplace-plugin: interactive menu needs a TTY. Use 'tinyplace-plugin --wallet <name>' in non-interactive contexts.");
     process.exit(1);
   }
 
