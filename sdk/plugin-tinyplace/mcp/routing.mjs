@@ -54,10 +54,19 @@ export function routeTarget({ toSession, liveLabels, primary, policy = "primary"
 // addressed a session UUID, deliver ONLY to the live session that actually owns it —
 // never to a reused label slot; no live owner → unrouted (held). Falls back to the
 // label/policy routing when there's no UUID (older peers, untargeted mail).
-function resolveBound(agentAddress, { toSession, toSessionUuid }, { liveList, primary, policy }) {
+function resolveBound(agentAddress, { toSession, toSessionUuid, fromSessionUuid }, { liveList, primary, policy }) {
   if (toSessionUuid) {
     const label = labelForConversationUuid(agentAddress, toSessionUuid);
     return label ? { kind: "session", labels: [label] } : { kind: "unrouted" };
+  }
+  // Some peers (e.g. OpenHuman) address a reply by the per-pair session id itself —
+  // the conversation uuid WE minted for the pair — carried in wrapper_session_id
+  // (decoded as fromSessionUuid), with no separate to_session_uuid. Resolve it
+  // through our conversation index. It matches ONLY ids we minted, so an ordinary
+  // peer's own wrapper convUuid (not in our index) falls through to policy routing.
+  if (fromSessionUuid) {
+    const label = labelForConversationUuid(agentAddress, fromSessionUuid);
+    if (label) return { kind: "session", labels: [label] };
   }
   return routeTarget({ toSession, liveLabels: liveList, primary, policy });
 }

@@ -106,6 +106,22 @@ const er2 = routing.enqueueRouted(E, { id: "e2", from: "peerE", text: "ghost", t
 expect("unknown conversation uuid → unrouted even though the label is live", er2.target.kind === "unrouted");
 expect("no leak: live codex:1 did not get the unknown-uuid message", !existsSync(join(routing.sessionInboxDir(E, "codex:1"), "e2.json")));
 
+// ── per-pair session-id routing (a peer like OpenHuman addresses a reply by the
+//    per-pair session id WE minted — the conversation uuid — carried back in
+//    wrapper_session_id / fromSessionUuid, with no separate to_session_uuid) ────
+const H = "AgentHHHHHHHHHHHHHHHHHHHHHHHHHHHH";
+reg.writePresence(H, { label: "codex:1", harnessSessionId: "hH1", cwd: "/w", startedAt: new Date().toISOString() });
+const suH1 = reg.resolveSessionUuid("hH1");
+const sid = reg.resolveConversationUuid(suH1, "openhuman"); // the per-pair session id we minted
+// The peer echoes that same per-pair id back in wrapper_session_id (→ fromSessionUuid).
+const hr1 = routing.enqueueRouted(H, { id: "h1s", from: "openhuman", text: "reply", fromSessionUuid: sid });
+expect("per-pair session id (no to_session) → routed to its session", hr1.target.kind === "session" && hr1.target.labels[0] === "codex:1");
+expect("per-pair reply landed in codex:1 inbox", existsSync(join(routing.sessionInboxDir(H, "codex:1"), "h1s.json")));
+// An id we never minted isn't in our conversation index → the per-pair path is a
+// no-op and the message falls through to normal policy routing (here `drop`).
+const hr2 = routing.enqueueRouted(H, { id: "h2s", from: "openhuman", text: "ghost", fromSessionUuid: "99999999-9999-9999-9999-999999999999" }, { policy: "drop" });
+expect("unknown id → not hijacked by the per-pair path (falls through to policy)", hr2.target.kind === "drop");
+
 // The crux: a label reused by a DIFFERENT session must not inherit the old thread.
 const F = "AgentFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
 reg.writePresence(F, { label: "codex:1", harnessSessionId: "old-sess", cwd: "/w", startedAt: new Date().toISOString() });

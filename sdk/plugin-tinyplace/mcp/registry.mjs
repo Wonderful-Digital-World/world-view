@@ -192,7 +192,9 @@ export function sessionUuidForConversation(convUuid) {
 }
 
 // The label of the LIVE local session owning a conversation uuid, or null. Resolves
-// convUuid → sessionUuid (index) → live session (presence).
+// convUuid → sessionUuid (index) → live session (presence). The conversation uuid IS
+// the per-pair session id: a peer (including OpenHuman) that addresses a reply by the
+// id we minted for the pair resolves straight back to the owning local session.
 export function labelForConversationUuid(agentAddress, convUuid) {
   return labelForUuid(agentAddress, sessionUuidForConversation(convUuid));
 }
