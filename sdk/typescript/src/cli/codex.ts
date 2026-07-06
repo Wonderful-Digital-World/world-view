@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { createRequire } from "node:module";
+import { dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -65,11 +66,21 @@ export function wantsAgentMode(argv: Array<string>): boolean {
   return splitAtForward(argv).pre.some((a) => a === "--agent");
 }
 
+/** The published launcher package + its bin subpath, resolved when installed. */
+const PLUGIN_PACKAGE = "@tinyhumansai/tinyplace-plugin";
+const PLUGIN_BIN_SUBPATH = "bin/tinyplace.mjs";
+
 /**
- * Walk up from this module to find the in-repo unified plugin launcher.
- * Compiled path is `sdk/typescript/dist/cli/codex.js`, so the launcher sits at
- * `sdk/plugin-tinyplace/bin/tinyplace.mjs` a few levels up. Returns null when it
- * cannot be located (e.g. a published SDK that doesn't bundle the plugin).
+ * Locate the unified plugin launcher, preferring an in-repo checkout and falling
+ * back to an installed `@tinyhumansai/tinyplace-plugin` dependency. Returns null
+ * when neither is present (e.g. a published SDK with the plugin not installed).
+ *
+ * Resolution ladder:
+ *   1. In-repo: `codex.js` lives at `sdk/typescript/dist/cli/`, so the launcher
+ *      sits at `sdk/plugin-tinyplace/bin/tinyplace.mjs` a few levels up. This is
+ *      the path used by OpenHuman's vendored/submodule build.
+ *   2. Installed dependency: resolve the package's launcher bin via Node
+ *      resolution (works once the plugin is published and depended on).
  */
 function resolveUnifiedLauncher(): string | null {
   let dir = dirname(fileURLToPath(import.meta.url));
@@ -80,7 +91,11 @@ function resolveUnifiedLauncher(): string | null {
     if (parent === dir) break;
     dir = parent;
   }
-  return null;
+  try {
+    return createRequire(import.meta.url).resolve(`${PLUGIN_PACKAGE}/${PLUGIN_BIN_SUBPATH}`);
+  } catch {
+    return null;
+  }
 }
 
 function resolveBaseUrl(env: Record<string, string | undefined>): string {
@@ -133,13 +148,18 @@ async function runCodexAgentTui(
   const launcher = resolveUnifiedLauncher();
   if (!launcher) {
     return failure(
-      "tinyplace codex --agent needs the unified plugin (@tinyhumansai/tinyplace-plugin), " +
-        "which is not bundled with the published SDK. Run it from a tiny.place checkout, " +
-        "or launch the plugin directly: node sdk/plugin-tinyplace/bin/tinyplace.mjs --harness codex",
+      `tinyplace codex --agent needs the unified plugin (${PLUGIN_PACKAGE}), which is not ` +
+        "installed. Install it (npm i " +
+        `${PLUGIN_PACKAGE}) and re-run, run from a tiny.place checkout, or launch the ` +
+        "plugin directly: node sdk/plugin-tinyplace/bin/tinyplace.mjs --harness codex",
     );
   }
+  // An installed dependency (resolved from node_modules) already has its deps;
+  // only the in-repo checkout — a standalone package excluded from the workspace
+  // — can be missing them, and would otherwise crash with ERR_MODULE_NOT_FOUND.
+  const isInstalledDependency = launcher.includes(`${sep}node_modules${sep}`);
   const pluginDir = dirname(dirname(launcher));
-  if (!existsSync(join(pluginDir, "node_modules"))) {
+  if (!isInstalledDependency && !existsSync(join(pluginDir, "node_modules"))) {
     return failure(
       `The tiny.place plugin at ${pluginDir} has no node_modules — it is a standalone ` +
         "package excluded from the workspace. Install its deps first: " +
