@@ -4,8 +4,16 @@ import { chmodSync, existsSync, readdirSync, readFileSync, statSync } from "node
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, relative, resolve, join, sep } from "node:path";
+import { Writable } from "node:stream";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { IPty } from "node-pty";
+
+import {
+  HarnessSessionTailer,
+  InboundMessageReceiver,
+  SessionEnvelopePublisher,
+  parseHarnessWrapperArgs,
+} from "./harness-wrapper.js";
 import type { CliContext, TinyPlaceCliOptions, TinyPlaceCliResult } from "./types.js";
 
 export type TinyVerseAgentKind = "claude" | "codex";
@@ -119,6 +127,10 @@ class BlessedTinyPlaceTui {
   private terminal?: Widgets.TerminalElement;
   private tmuxSession?: string;
   private tmuxSocket?: string;
+  // Real OpenHuman bridge (replaces the mock): publisher + outbound tailer +
+  // inbound receiver, reused from the harness wrapper.
+  private bridgeTailer?: HarnessSessionTailer;
+  private bridgeReceiver?: InboundMessageReceiver;
 
   public constructor(
     private readonly ctx: CliContext,
@@ -296,14 +308,64 @@ class BlessedTinyPlaceTui {
 
   private connectOpenHuman(): void {
     this.clearAutoStart();
-    const sessionId = this.state.openHumanSessionId ?? mockOpenHumanSessionId(this.ctx);
+    const owner = bridgeOwner(this.ctx.env);
+    this.state = owner
+      ? {
+          ...this.state,
+          notice: `OpenHuman bridge will connect to ${owner} when ${this.profile.displayName} launches.`,
+          openHumanConnected: true,
+          openHumanSessionId: owner,
+        }
+      : {
+          ...this.state,
+          notice: "No OpenHuman owner configured. Set TINYPLACE_OPENHUMAN_OWNER (or TINYPLACE_HARNESS_DM_TO).",
+        };
+    this.render();
+  }
+
+  /** Start the real bidirectional OpenHuman bridge alongside the agent: publish
+   *  keys, stream the agent's turns out (tailer), and inject inbound DMs into the
+   *  live agent (receiver → writeAgentInput). No-op without a configured owner. */
+  private startBridge(): void {
+    if (this.bridgeTailer || this.bridgeReceiver) {
+      return;
+    }
+    const config = parseHarnessWrapperArgs(this.profile.kind, [], this.ctx.env);
+    const owner = bridgeOwner(this.ctx.env);
+    if (!owner) {
+      return;
+    }
+    // Diagnostics from the bridge are discarded — writing to process.stderr would
+    // corrupt the Blessed screen.
+    const sink = new Writable({ write: (_chunk, _enc, cb) => cb() });
+    const publisher = new SessionEnvelopePublisher(config, this.options, sink);
+    this.bridgeTailer = config.captureSession
+      ? new HarnessSessionTailer(config, this.options.cwd ?? process.cwd(), sink, publisher)
+      : undefined;
+    this.bridgeReceiver = config.receiveEnabled
+      ? new InboundMessageReceiver(config, publisher, sink)
+      : undefined;
+    this.bridgeReceiver?.setSink((text) => {
+      this.writeAgentInput(Buffer.from(text, "utf8"));
+    });
+    this.bridgeTailer?.start(new Date());
+    void this.bridgeReceiver?.start();
     this.state = {
       ...this.state,
-      notice: `Connected to OpenHuman session ${sessionId}.`,
       openHumanConnected: true,
-      openHumanSessionId: sessionId,
+      openHumanSessionId: owner,
     };
-    this.render();
+    if (!this.nativeRelayActive) {
+      this.renderFooter();
+      this.queueScreenRender();
+    }
+  }
+
+  private stopBridge(): void {
+    void this.bridgeTailer?.stop();
+    void this.bridgeReceiver?.stop();
+    this.bridgeTailer = undefined;
+    this.bridgeReceiver = undefined;
   }
 
   private async startAgent(): Promise<void> {
@@ -332,6 +394,9 @@ class BlessedTinyPlaceTui {
       }
     });
     this.agentSessionMonitor.start(new Date());
+    // Start the real OpenHuman bridge; the receiver's sink reads this.pty/this.child
+    // lazily, so starting before spawn is safe (first inbound poll is ~1.5s out).
+    this.startBridge();
     this.renderFooter();
     this.screen.render();
     this.clearBody();
@@ -594,6 +659,7 @@ class BlessedTinyPlaceTui {
     this.child = undefined;
     this.agentSessionMonitor?.stop();
     this.agentSessionMonitor = undefined;
+    this.stopBridge();
     this.cleanupNativeRelay();
     this.pty = undefined;
     this.terminal?.destroy();
@@ -619,8 +685,11 @@ class BlessedTinyPlaceTui {
     const status = connected
       ? "{green-fg}Connected to tiny.place{/green-fg}"
       : "{red-fg}Disconnected{/red-fg}";
+    const openHuman = this.state.openHumanConnected
+      ? `{green-fg}OpenHuman ${blessed.escape(this.state.openHumanSessionId ?? "")}{/green-fg}`
+      : "{gray-fg}OpenHuman off{/gray-fg}";
     this.footer.setContent(
-      ` ${status} {gray-fg}- Chat id:{/gray-fg} {yellow-fg}${blessed.escape(activeSession)}{/yellow-fg}`,
+      ` ${status} {gray-fg}-{/gray-fg} ${openHuman} {gray-fg}- Chat id:{/gray-fg} {yellow-fg}${blessed.escape(activeSession)}{/yellow-fg}`,
     );
   }
 
@@ -638,6 +707,7 @@ class BlessedTinyPlaceTui {
       this.child.kill();
       this.child = undefined;
     }
+    this.stopBridge();
     this.cleanupNativeRelay();
     this.agentSessionMonitor?.stop();
     this.agentSessionMonitor = undefined;
@@ -1238,9 +1308,19 @@ function walletIdFor(ctx: CliContext): string {
   return ctx.signer?.agentId ?? "mock-wallet-8Hf3Qp2N";
 }
 
-function mockOpenHumanSessionId(ctx: CliContext): string {
-  const compact = walletIdFor(ctx).replace(/[^a-zA-Z0-9]/g, "").slice(0, 8);
-  return `openhuman:${compact || "mock"}`;
+/** The configured OpenHuman owner (whom we bridge to), if any. Mirrors the
+ *  wrapper's recipient resolution order. */
+function bridgeOwner(env: Record<string, string | undefined>): string | undefined {
+  return firstEnv(env, [
+    "TINYPLACE_CODEX_DM_TO",
+    "TINYPLACE_CLAUDE_DM_TO",
+    "TINYPLACE_HARNESS_DM_TO",
+    "TINYPLACE_OPENHUMAN_OWNER",
+    "OPENHUMAN_OWNER_AGENT",
+    "TINYPLACE_CODEX_RECEIVE_FROM",
+    "TINYPLACE_CLAUDE_RECEIVE_FROM",
+    "TINYPLACE_HARNESS_RECEIVE_FROM",
+  ]);
 }
 
 function clamp(value: number, min: number, max: number): number {

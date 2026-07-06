@@ -533,7 +533,7 @@ function buildAgentLaunch(config: HarnessWrapperConfig): AgentLaunch {
   return { command: config.agentBin, args: config.agentArgs };
 }
 
-class HarnessSessionTailer {
+export class HarnessSessionTailer {
   private ignoredSessionFiles = new Set<string>();
   private lineOffset = 0;
   private startedAt: Date | undefined;
@@ -693,7 +693,7 @@ class HarnessSessionTailer {
   }
 }
 
-class SessionEnvelopePublisher {
+export class SessionEnvelopePublisher {
   private contactPromise: Promise<string> | undefined;
   private contextPromise:
     | ReturnType<typeof makeContext>
@@ -822,7 +822,7 @@ const RESET_SENTINEL = "\x01tp-rehandshake\x01";
  * Reuses the publisher's memoized context (one client / FileSessionStore / ratchet)
  * and the SDK primitives `publishKeys` (be messageable) + `readMessages` (decrypt).
  */
-class InboundMessageReceiver {
+export class InboundMessageReceiver {
   private sink: ((text: string) => void) | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
   private draining = false;
