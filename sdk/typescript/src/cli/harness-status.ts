@@ -145,6 +145,11 @@ function lifecycleStatus(phase: string): Derived | undefined {
       return { state: "running", detail: "working" };
     case "turn_end":
       return { state: "idle", detail: "idle" };
+    case "compact":
+      // Context compaction is active background work (emitted by the hook mapper
+      // for a "compact" SessionStart); surface it rather than leaving a stale
+      // status, but keep it distinct from a fresh turn's "working".
+      return { state: "running", detail: "compacting" };
     case "session_end":
       return { state: "stopped", detail: "stopped" };
     default:

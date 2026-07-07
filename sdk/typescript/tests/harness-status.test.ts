@@ -119,6 +119,15 @@ describe("reduceStatus", () => {
     expect(soft.next.state).toBe("running");
   });
 
+  it("surfaces a compact lifecycle phase as active compaction", () => {
+    const step = reduceStatus(
+      initialStatus(),
+      ev({ kind: "lifecycle", role: "agent", payload: { phase: "compact" } }),
+    );
+    expect(step.next.state).toBe("running");
+    expect(step.emit).toMatchObject({ state: "running", detail: "compacting" });
+  });
+
   it("stops on a session_end lifecycle event", () => {
     const step = reduceStatus(
       initialStatus(),
