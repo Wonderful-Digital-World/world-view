@@ -115,40 +115,21 @@ export {
   SESSION_ENVELOPE_VERSION_V1,
   SESSION_ENVELOPE_VERSION_V2,
 } from "./types/harness.js";
-export {
-  claudeEventsFromLine,
-  codexEventsFromLine,
-  harnessEventsFromLine,
-  normalizeToolKind,
-  toolDisplay,
-} from "./cli/harness-events.js";
+// Harness runtime helpers (value exports) live behind the Node subpath
+// (`@tinyhumansai/tinyplace/node`), NOT this browser-facing root: `harness-hooks`
+// imports `node:process` and `harness-envelope` imports `node:crypto`, so
+// re-exporting their runtime values here would force browser bundlers
+// (Next/Webpack client builds) to resolve Node built-ins even when unused. Types
+// are erased at build time, so the type-only re-exports below stay browser-safe.
 export type {
   HarnessLineMapper,
   HarnessSemanticEvent,
 } from "./cli/harness-events.js";
-export {
-  claudeHookEventToSemantic,
-  claudeHookEventsFromStdin,
-  claudeHookStringToSemantic,
-} from "./cli/harness-hooks.js";
-export {
-  initialStatus,
-  reduceStatus,
-  tickStatus,
-} from "./cli/harness-status.js";
 export type {
   SessionStatusState,
   StatusStep,
 } from "./cli/harness-status.js";
-export { buildEventEnvelopeV2 } from "./cli/harness-envelope.js";
 export type { EnvelopeContext } from "./cli/harness-envelope.js";
-export {
-  applySessionEnvelope,
-  foldSessionEnvelopes,
-  initialSessionView,
-  isV2,
-  parseSessionEnvelope,
-} from "./cli/harness-consumer.js";
 export type {
   FeedEntry,
   SessionView,
