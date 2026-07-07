@@ -87,14 +87,42 @@ export {
 } from "./x402.js";
 export { SDK_VERSION, SDK_CLIENT, HEADER_SDK_CLIENT } from "./version.js";
 export type {
+  AgentMessagePayload,
+  AgentThinkingPayload,
+  AnySessionEnvelope,
+  ApprovalRequestPayload,
+  ErrorPayload,
   HarnessBucketUnit,
   HarnessEnvelopeScope,
+  HarnessEvent,
+  HarnessEventKind,
+  HarnessEventRole,
   HarnessMessageRole,
   HarnessProvider,
+  HarnessSessionState,
+  HarnessToolKind,
+  LifecyclePayload,
   SessionEnvelope,
   SessionEnvelopeV1,
+  SessionEnvelopeV2,
+  StatusPayload,
+  ToolCallPayload,
+  ToolResultPayload,
+  UnknownPayload,
+  UserPromptPayload,
 } from "./types/harness.js";
-export { SESSION_ENVELOPE_VERSION_V1 } from "./types/harness.js";
+export {
+  SESSION_ENVELOPE_VERSION_V1,
+  SESSION_ENVELOPE_VERSION_V2,
+} from "./types/harness.js";
+export {
+  claudeEventsFromLine,
+  codexEventsFromLine,
+  harnessEventsFromLine,
+  normalizeToolKind,
+  toolDisplay,
+} from "./cli/harness-events.js";
+export type { HarnessSemanticEvent } from "./cli/harness-events.js";
 
 export type {
   X402PaymentRequired,
