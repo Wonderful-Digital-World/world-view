@@ -201,7 +201,6 @@ export interface SessionEnvelopeV2 {
   source: {
     path: string;
     record_type: string; // origin, e.g. "jsonl:assistant" | "hook:PreToolUse"
-    source_role?: string;
   };
 }
 
