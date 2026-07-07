@@ -33,14 +33,29 @@ export interface HarnessSemanticEvent {
 const OUTPUT_CAP = 4096;
 const ELISION = "\n…[truncated]";
 
+/** Maps one raw transcript line from a given provider into typed events. */
+export type HarnessLineMapper = (
+  raw: string,
+  line: number,
+) => Array<HarnessSemanticEvent>;
+
+// Provider registry. Typed as Record<HarnessProvider, …> so adding a new
+// provider to the HarnessProvider union (e.g. "gemini") is a compile error
+// until its mapper is registered here — no silent fall-through to a wrong
+// branch. The envelope's `harness.provider` field is what lets OpenHuman tell
+// claude / codex / (future) gemini packets apart at the receiver.
+const LINE_MAPPERS: Record<HarnessProvider, HarnessLineMapper> = {
+  claude: claudeEventsFromLine,
+  codex: codexEventsFromLine,
+};
+
 export function harnessEventsFromLine(
   provider: HarnessProvider,
   raw: string,
   line: number,
 ): Array<HarnessSemanticEvent> {
-  return provider === "claude"
-    ? claudeEventsFromLine(raw, line)
-    : codexEventsFromLine(raw, line);
+  const mapper = LINE_MAPPERS[provider] as HarnessLineMapper | undefined;
+  return mapper ? mapper(raw, line) : [];
 }
 
 // ── Claude ───────────────────────────────────────────────────────────────────

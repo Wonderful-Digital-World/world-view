@@ -7,6 +7,7 @@ import {
   toolDisplay,
 } from "../src/cli/harness-events.js";
 import type { HarnessSemanticEvent } from "../src/cli/harness-events.js";
+import type { HarnessProvider } from "../src/types/harness.js";
 
 // Fixture lines mirror the real on-disk shapes verified against live sessions:
 //   Claude ~/.claude/projects/*/*.jsonl, Codex ~/.codex/sessions/**/rollout-*.jsonl
@@ -280,6 +281,15 @@ describe("harnessEventsFromLine dispatch", () => {
       1,
     );
     expect(codex[0].event.kind).toBe("user_prompt");
+  });
+
+  it("returns [] for an unregistered provider instead of guessing a branch", () => {
+    const events = harnessEventsFromLine(
+      "gemini" as HarnessProvider,
+      claudeLine({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "x" }] } }),
+      1,
+    );
+    expect(events).toStrictEqual([]);
   });
 });
 
