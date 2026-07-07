@@ -1752,15 +1752,17 @@ function asString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
-// Env-configured numeric knob: fall back to the default when the var is unset
-// OR non-numeric, so a typo'd `TINYPLACE_..._IDLE_MS=abc` can't yield NaN and
-// silently disable the idle/heartbeat tick (Number("abc") === NaN).
+// Env-configured positive-millisecond knob: fall back to the default unless the
+// var parses to a finite value > 0. This rejects the three ways a bad env var
+// would otherwise poison a timer — unset, non-numeric (`Number("abc")` → NaN),
+// blank (`Number("")`/`Number(" ")` → 0), and negative — any of which would
+// disable the idle/heartbeat tick or spin a 0 ms poll loop.
 function numberEnvOr(raw: string | undefined, fallback: number): number {
   if (raw === undefined) {
     return fallback;
   }
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) ? parsed : fallback;
+  const parsed = Number(raw.trim());
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function requiredValue(flag: string, value: string | undefined): string {
