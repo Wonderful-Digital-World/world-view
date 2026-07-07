@@ -477,10 +477,15 @@ function firstLine(value: string): string {
 }
 
 function truncate(value: string): string {
-  if (byteLength(value) <= OUTPUT_CAP) {
+  const buffer = Buffer.from(value, "utf8");
+  if (buffer.length <= OUTPUT_CAP) {
     return value;
   }
-  return `${value.slice(0, OUTPUT_CAP)}${ELISION}`;
+  // Slice by BYTES, not characters: `String.slice` is code-unit indexed, so a
+  // multi-byte payload (emoji / CJK / non-ASCII file contents) would blow past
+  // the byte cap this function exists to enforce for envelope transport.
+  // `Buffer.toString("utf8")` drops a trailing partial code point safely.
+  return `${buffer.subarray(0, OUTPUT_CAP).toString("utf8")}${ELISION}`;
 }
 
 function byteLength(value: string): number {

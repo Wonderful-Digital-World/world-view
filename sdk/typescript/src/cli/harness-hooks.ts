@@ -362,10 +362,13 @@ function unknownEvent(
 /** Keeps small raw payloads structured; truncates large ones to a bounded string. */
 function boundRaw(value: unknown): unknown {
   const serialized = safeStringify(value);
-  if (byteLength(serialized) <= RAW_CAP) {
+  const buffer = Buffer.from(serialized, "utf8");
+  if (buffer.length <= RAW_CAP) {
     return value;
   }
-  return `${serialized.slice(0, RAW_CAP)}${ELISION}`;
+  // Byte-indexed slice (see truncate): keep the bounded string within RAW_CAP
+  // bytes even for multi-byte serialized payloads.
+  return `${buffer.subarray(0, RAW_CAP).toString("utf8")}${ELISION}`;
 }
 
 function safeStringify(value: unknown): string {
@@ -385,10 +388,14 @@ function firstLine(value: string): string {
 }
 
 function truncate(value: string): string {
-  if (byteLength(value) <= OUTPUT_CAP) {
+  const buffer = Buffer.from(value, "utf8");
+  if (buffer.length <= OUTPUT_CAP) {
     return value;
   }
-  return `${value.slice(0, OUTPUT_CAP)}${ELISION}`;
+  // Byte-indexed slice (see harness-events.ts truncate): `String.slice` counts
+  // code units, so multi-byte content could still exceed the byte cap.
+  // `Buffer.toString("utf8")` trims a trailing partial code point safely.
+  return `${buffer.subarray(0, OUTPUT_CAP).toString("utf8")}${ELISION}`;
 }
 
 function byteLength(value: string): number {

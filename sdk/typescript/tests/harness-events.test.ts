@@ -179,6 +179,28 @@ describe("claudeEventsFromLine", () => {
     expect(claudeEventsFromLine("not json", 9)).toStrictEqual([]);
     expect(claudeEventsFromLine(claudeLine({ type: "system" }), 10)).toStrictEqual([]);
   });
+
+  it("byte-caps multi-byte tool_result output within the byte budget", () => {
+    // 3000 four-byte emoji = 12000 UTF-8 bytes. A code-unit `slice(0, 4096)`
+    // would keep ~8192 bytes and defeat the cap, so this asserts a true byte
+    // bound and that the boundary never leaves a split code point.
+    const huge = "😀".repeat(3000);
+    const events = claudeEventsFromLine(
+      claudeLine({
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_big", content: huge }],
+        },
+      }),
+      11,
+    );
+    const output = (events[0].event.payload as { output: string }).output;
+    const elisionBytes = Buffer.byteLength("\n…[truncated]", "utf8");
+    expect(Buffer.byteLength(output, "utf8")).toBeLessThanOrEqual(4096 + elisionBytes);
+    expect(output.endsWith("…[truncated]")).toBe(true);
+    expect(output).not.toContain("�");
+  });
 });
 
 describe("codexEventsFromLine", () => {
