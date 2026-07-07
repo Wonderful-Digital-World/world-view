@@ -27,13 +27,38 @@ export function parseSessionEnvelope(
     return undefined;
   }
   const version = (record as { envelope_version?: unknown }).envelope_version;
-  if (
-    version === SESSION_ENVELOPE_VERSION_V2 ||
-    version === SESSION_ENVELOPE_VERSION_V1
-  ) {
+  // Inbound Signal DMs are untrusted: a version-tagged body with a missing or
+  // malformed `event` must be DROPPED, not cast through — otherwise the seq
+  // reads in applySessionEnvelope/foldSessionEnvelopes throw on `event.seq` and
+  // take down the whole fold. Shape-check the v2 event before trusting it.
+  if (version === SESSION_ENVELOPE_VERSION_V2) {
+    return hasUsableV2Event(record) ? (record as AnySessionEnvelope) : undefined;
+  }
+  if (version === SESSION_ENVELOPE_VERSION_V1) {
     return record as AnySessionEnvelope;
   }
   return undefined;
+}
+
+/**
+ * A v2 envelope is only foldable if it carries an `event` with a numeric `seq`
+ * and a string `id` — the two fields the fold reads. Both the parser and the
+ * fold path gate on this so a malformed body is dropped rather than throwing,
+ * whether it arrives via parseSessionEnvelope or is passed in pre-parsed.
+ */
+function hasUsableV2Event(envelope: unknown): boolean {
+  if (
+    envelope === null ||
+    typeof envelope !== "object" ||
+    (envelope as { envelope_version?: unknown }).envelope_version !==
+      SESSION_ENVELOPE_VERSION_V2
+  ) {
+    return false;
+  }
+  const event = (envelope as { event?: { seq?: unknown; id?: unknown } }).event;
+  return (
+    !!event && typeof event.seq === "number" && typeof event.id === "string"
+  );
 }
 
 export function isV2(
@@ -108,7 +133,7 @@ export function applySessionEnvelope(
   envelope: AnySessionEnvelope,
   limits: SessionViewLimits = DEFAULT_LIMITS,
 ): SessionView {
-  if (!isV2(envelope)) {
+  if (!isV2(envelope) || !hasUsableV2Event(envelope)) {
     return view;
   }
   const { event } = envelope;
@@ -140,6 +165,7 @@ export function foldSessionEnvelopes(
 ): SessionView {
   return [...envelopes]
     .filter(isV2)
+    .filter(hasUsableV2Event)
     .sort((a, b) => a.event.seq - b.event.seq)
     .reduce(
       (view, envelope) => applySessionEnvelope(view, envelope, limits),

@@ -76,6 +76,37 @@ describe("parseSessionEnvelope", () => {
     expect(parseSessionEnvelope(42)).toBeUndefined();
   });
 
+  it("drops a version-tagged v2 body with a missing or malformed event", () => {
+    // Untrusted inbound DM: correct version tag but no usable event. Must be
+    // dropped, not cast through (else event.seq reads throw downstream).
+    expect(
+      parseSessionEnvelope({ envelope_version: "tinyplace.harness.session.v2" }),
+    ).toBeUndefined();
+    expect(
+      parseSessionEnvelope({
+        envelope_version: "tinyplace.harness.session.v2",
+        event: { id: "x" }, // seq missing
+      }),
+    ).toBeUndefined();
+    expect(
+      parseSessionEnvelope({
+        envelope_version: "tinyplace.harness.session.v2",
+        event: { seq: 1, id: 5 }, // id not a string
+      }),
+    ).toBeUndefined();
+  });
+
+  it("folds a stream containing a malformed v2 body without throwing", () => {
+    const good = streamFrom(LINES);
+    const poisoned = [
+      { envelope_version: "tinyplace.harness.session.v2" } as unknown as AnySessionEnvelope,
+      ...good,
+    ];
+    expect(() => foldSessionEnvelopes(poisoned)).not.toThrow();
+    const view = foldSessionEnvelopes(poisoned);
+    expect(view.provider).toBe("claude");
+  });
+
   it("recognises a v1 envelope but isV2 is false", () => {
     const v1 = { envelope_version: "tinyplace.harness.session.v1" } as unknown;
     const parsed = parseSessionEnvelope(v1);
@@ -102,6 +133,15 @@ describe("applySessionEnvelope", () => {
     const view = initialSessionView();
     const v1 = { envelope_version: "tinyplace.harness.session.v1" } as unknown as AnySessionEnvelope;
     expect(applySessionEnvelope(view, v1)).toBe(view);
+  });
+
+  it("returns the same view (no throw) for a malformed v2 envelope", () => {
+    const view = initialSessionView();
+    const malformed = {
+      envelope_version: "tinyplace.harness.session.v2",
+    } as unknown as AnySessionEnvelope;
+    expect(() => applySessionEnvelope(view, malformed)).not.toThrow();
+    expect(applySessionEnvelope(view, malformed)).toBe(view);
   });
 
   it("drops duplicate / out-of-order packets by seq", () => {
