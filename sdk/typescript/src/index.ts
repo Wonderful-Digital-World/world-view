@@ -122,7 +122,21 @@ export {
   normalizeToolKind,
   toolDisplay,
 } from "./cli/harness-events.js";
-export type { HarnessSemanticEvent } from "./cli/harness-events.js";
+export type {
+  HarnessLineMapper,
+  HarnessSemanticEvent,
+} from "./cli/harness-events.js";
+export {
+  initialStatus,
+  reduceStatus,
+  tickStatus,
+} from "./cli/harness-status.js";
+export type {
+  SessionStatusState,
+  StatusStep,
+} from "./cli/harness-status.js";
+export { buildEventEnvelopeV2 } from "./cli/harness-envelope.js";
+export type { EnvelopeContext } from "./cli/harness-envelope.js";
 
 export type {
   X402PaymentRequired,
