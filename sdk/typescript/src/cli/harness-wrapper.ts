@@ -445,31 +445,35 @@ export function parseHarnessWrapperArgs(
       ]) === "1",
     outDir,
     provider,
-    statusHeartbeatMs: Number(
+    statusHeartbeatMs: numberEnvOr(
       firstEnv(env, [
         `TINYPLACE_${provider.toUpperCase()}_STATUS_HEARTBEAT_MS`,
         "TINYPLACE_HARNESS_STATUS_HEARTBEAT_MS",
-      ]) ?? 15_000,
+      ]),
+      15_000,
     ),
-    statusIdleMs: Number(
+    statusIdleMs: numberEnvOr(
       firstEnv(env, [
         `TINYPLACE_${provider.toUpperCase()}_STATUS_IDLE_MS`,
         "TINYPLACE_HARNESS_STATUS_IDLE_MS",
-      ]) ?? 30_000,
+      ]),
+      30_000,
     ),
     ...(receiveFrom ? { receiveFrom } : {}),
     receiveEnabled: receiveFrom !== undefined && !receiveDisabled,
-    receivePollMs: Number(
+    receivePollMs: numberEnvOr(
       firstEnv(env, [
         `TINYPLACE_${provider.toUpperCase()}_RECEIVE_POLL_MS`,
         "TINYPLACE_HARNESS_RECEIVE_POLL_MS",
-      ]) ?? 1500,
+      ]),
+      1500,
     ),
-    sessionPollMs: Number(
+    sessionPollMs: numberEnvOr(
       firstEnv(env, [
         `TINYPLACE_${provider.toUpperCase()}_SESSION_POLL_MS`,
         "TINYPLACE_HARNESS_SESSION_POLL_MS",
-      ]) ?? 500,
+      ]),
+      500,
     ),
     sessionsDir:
       firstEnv(env, [
@@ -477,11 +481,12 @@ export function parseHarnessWrapperArgs(
         provider === "claude" ? "TINYVERSE_CLAUDE_SESSIONS_DIR" : "",
         "TINYPLACE_HARNESS_SESSIONS_DIR",
       ]) ?? profile.defaultSessionsDir,
-    sessionTailGraceMs: Number(
+    sessionTailGraceMs: numberEnvOr(
       firstEnv(env, [
         `TINYPLACE_${provider.toUpperCase()}_SESSION_TAIL_GRACE_MS`,
         "TINYPLACE_HARNESS_SESSION_TAIL_GRACE_MS",
-      ]) ?? 750,
+      ]),
+      750,
     ),
     scope: "folder",
     usePty: true,
@@ -1745,6 +1750,17 @@ function asObject(value: unknown): Record<string, unknown> | undefined {
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+// Env-configured numeric knob: fall back to the default when the var is unset
+// OR non-numeric, so a typo'd `TINYPLACE_..._IDLE_MS=abc` can't yield NaN and
+// silently disable the idle/heartbeat tick (Number("abc") === NaN).
+function numberEnvOr(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) {
+    return fallback;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function requiredValue(flag: string, value: string | undefined): string {
