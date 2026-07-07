@@ -16,3 +16,30 @@ registerDefaultSessionStore(async (signer) => {
 });
 
 export { FileSessionStore } from "./file-session-store.js";
+
+// Harness runtime helpers. These carry Node built-in imports transitively
+// (`harness-hooks` → `node:process`, `harness-envelope` → `node:crypto`), so
+// they are exposed here on the Node subpath rather than the isomorphic root,
+// keeping browser bundles free of Node-only module resolution. The matching
+// types are re-exported from the root (`@tinyhumansai/tinyplace`).
+export {
+  claudeEventsFromLine,
+  codexEventsFromLine,
+  harnessEventsFromLine,
+  normalizeToolKind,
+  toolDisplay,
+} from "../cli/harness-events.js";
+export {
+  claudeHookEventToSemantic,
+  claudeHookEventsFromStdin,
+  claudeHookStringToSemantic,
+} from "../cli/harness-hooks.js";
+export { initialStatus, reduceStatus, tickStatus } from "../cli/harness-status.js";
+export { buildEventEnvelopeV2 } from "../cli/harness-envelope.js";
+export {
+  applySessionEnvelope,
+  foldSessionEnvelopes,
+  initialSessionView,
+  isV2,
+  parseSessionEnvelope,
+} from "../cli/harness-consumer.js";
