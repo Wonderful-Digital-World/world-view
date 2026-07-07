@@ -1,20 +1,30 @@
 import blessed, { type Widgets } from "blessed";
 import { spawn as spawnChild, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, relative, resolve, join, sep } from "node:path";
-import { Writable } from "node:stream";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { IPty } from "node-pty";
 
+import { bridgeLog, createBridgeDiagSink } from "./bridge-debug.js";
 import {
   HarnessSessionTailer,
   InboundMessageReceiver,
   SessionEnvelopePublisher,
   parseHarnessWrapperArgs,
 } from "./harness-wrapper.js";
-import type { CliContext, TinyPlaceCliOptions, TinyPlaceCliResult } from "./types.js";
+import type {
+  CliContext,
+  TinyPlaceCliOptions,
+  TinyPlaceCliResult,
+} from "./types.js";
 
 export type TinyVerseAgentKind = "claude" | "codex";
 
@@ -82,14 +92,18 @@ export async function runTinyPlaceTui(
   return { code: 0, stderr: "", stdout: "" };
 }
 
-export function parseTinyVerseAgentKind(value: string | undefined): TinyVerseAgentKind {
+export function parseTinyVerseAgentKind(
+  value: string | undefined,
+): TinyVerseAgentKind {
   if (value === undefined || value === "" || value === "codex") {
     return "codex";
   }
   if (value === "claude") {
     return "claude";
   }
-  throw new Error(`unknown tinyverse agent "${value}" (expected codex or claude)`);
+  throw new Error(
+    `unknown tinyverse agent "${value}" (expected codex or claude)`,
+  );
 }
 
 function runInteractiveBlessedTui(
@@ -263,7 +277,11 @@ class BlessedTinyPlaceTui {
     this.state = {
       ...this.state,
       notice: undefined,
-      selectedIndex: clamp(this.state.selectedIndex + delta, 0, QUIT_ACTION_INDEX),
+      selectedIndex: clamp(
+        this.state.selectedIndex + delta,
+        0,
+        QUIT_ACTION_INDEX,
+      ),
     };
     this.render();
   }
@@ -318,18 +336,46 @@ class BlessedTinyPlaceTui {
   private connectOpenHuman(): void {
     this.clearAutoStart();
     const current = this.resolveOwner() ?? "";
-    const input = blessed.textbox({
+    // Wrap the prompt + a hint line in a centered container so the hint (and the
+    // long "@handle or address / Enter / Esc" guidance) sits *outside* the input
+    // box instead of stuffed into the border label, where it overflows and
+    // corrupts the border on narrow terminals.
+    const modal = blessed.box({
       parent: this.screen,
       top: "center",
       left: "center",
       width: "80%",
+      height: 5,
+      style: { bg: "black" },
+      tags: true,
+    });
+    const input = blessed.textbox({
+      parent: modal,
+      top: 0,
+      left: 0,
+      width: "100%",
       height: 3,
       border: { type: "line" },
       inputOnFocus: true,
       keys: true,
-      mouse: true,
-      label: " OpenHuman owner — @handle or address (Enter to save, Esc to cancel) ",
+      // Deliberately NOT `mouse: true`: enabling mouse on any Blessed element
+      // flips the terminal into SGR mouse-capture mode (program.enableMouse()),
+      // which Blessed never turns back off when this modal closes. That kills
+      // the terminal's native text selection / copy for the rest of the session.
+      // The prompt is fully keyboard-driven (type · Enter · Esc), so mouse
+      // capture buys nothing and costs the user their selection.
+      label: " OpenHuman owner ",
       style: { fg: "white", bg: "black", border: { fg: "cyan" } },
+      tags: true,
+    });
+    blessed.text({
+      parent: modal,
+      top: 3,
+      left: 1,
+      height: 1,
+      width: "100%-2",
+      content: "@handle or address · Enter to save · Esc to cancel",
+      style: { fg: "gray", bg: "black" },
       tags: true,
     });
     input.setValue(current);
@@ -342,7 +388,7 @@ class BlessedTinyPlaceTui {
         return;
       }
       settled = true;
-      input.destroy();
+      modal.destroy();
       const owner = value?.trim();
       if (owner) {
         this.state = {
@@ -365,8 +411,15 @@ class BlessedTinyPlaceTui {
       }
       this.render();
     };
+    // `inputOnFocus` makes the textbox call `readInput(null)` on focus, so a
+    // second `readInput(callback)` here would be dropped (`_reading` already
+    // set) and Enter would never resolve — the box would hang on screen. Wire
+    // the outcome through the textbox's own submit/cancel events instead.
+    input.on("submit", (value: unknown) =>
+      done(typeof value === "string" ? value : input.getValue()),
+    );
+    input.on("cancel", () => done(undefined));
     input.key(["escape"], () => done(undefined));
-    input.readInput((_err, value) => done(typeof value === "string" ? value : undefined));
   }
 
   /** Start the real bidirectional OpenHuman bridge alongside the agent: publish
@@ -385,17 +438,32 @@ class BlessedTinyPlaceTui {
     config.dmRecipient = owner;
     config.receiveFrom = owner;
     config.receiveEnabled = true;
-    // Diagnostics from the bridge are discarded — writing to process.stderr would
-    // corrupt the Blessed screen.
-    const sink = new Writable({ write: (_chunk, _enc, cb) => cb() });
+    const cwd = this.options.cwd ?? process.cwd();
+    bridgeLog("bridge.start", {
+      owner,
+      provider: config.provider,
+      cwd,
+      captureSession: config.captureSession,
+      receiveEnabled: config.receiveEnabled,
+      dmRecipient: config.dmRecipient,
+      receiveFrom: config.receiveFrom,
+      sessionsDir: this.profile.sessionsDir,
+      dryRun: config.dryRun,
+    });
+    // Diagnostics from the bridge would corrupt the Blessed screen if written to
+    // the real stderr, so they go to a discarding sink — but when
+    // TINYPLACE_BRIDGE_LOG is set, `createBridgeDiagSink` tees them into the log
+    // file instead so bridge failures are visible while debugging.
+    const sink = createBridgeDiagSink();
     const publisher = new SessionEnvelopePublisher(config, this.options, sink);
     this.bridgeTailer = config.captureSession
-      ? new HarnessSessionTailer(config, this.options.cwd ?? process.cwd(), sink, publisher)
+      ? new HarnessSessionTailer(config, cwd, sink, publisher)
       : undefined;
     this.bridgeReceiver = config.receiveEnabled
       ? new InboundMessageReceiver(config, publisher, sink)
       : undefined;
     this.bridgeReceiver?.setSink((text) => {
+      bridgeLog("inbound.inject", { chars: text.length });
       this.writeAgentInput(Buffer.from(text, "utf8"));
     });
     this.bridgeTailer?.start(new Date());
@@ -431,18 +499,23 @@ class BlessedTinyPlaceTui {
       notice: undefined,
       view: "agent",
     };
-    this.agentSessionMonitor = new AgentSessionMonitor(this.ctx, this.options, this.profile, (meta) => {
-      this.state = {
-        ...this.state,
-        activeSessionId: meta.sessionId,
-      };
-      if (this.nativeRelayActive) {
-        this.updateNativeTerminalTitle();
-      } else {
-        this.renderFooter();
-        this.queueScreenRender();
-      }
-    });
+    this.agentSessionMonitor = new AgentSessionMonitor(
+      this.ctx,
+      this.options,
+      this.profile,
+      (meta) => {
+        this.state = {
+          ...this.state,
+          activeSessionId: meta.sessionId,
+        };
+        if (this.nativeRelayActive) {
+          this.updateNativeTerminalTitle();
+        } else {
+          this.renderFooter();
+          this.queueScreenRender();
+        }
+      },
+    );
     this.agentSessionMonitor.start(new Date());
     // Start the real OpenHuman bridge; the receiver's sink reads this.pty/this.child
     // lazily, so starting before spawn is safe (first inbound poll is ~1.5s out).
@@ -491,12 +564,16 @@ class BlessedTinyPlaceTui {
         });
         pty.onExit(({ exitCode, signal }) => {
           const detail = signal ? `signal ${signal}` : `exit code ${exitCode}`;
-          this.finishAgent(`${this.profile.displayName} exited with ${detail}.`);
+          this.finishAgent(
+            `${this.profile.displayName} exited with ${detail}.`,
+          );
         });
         return;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        this.terminal?.write(`node-pty unavailable: ${message}\r\nFalling back to pipe mode.\r\n`);
+        this.terminal?.write(
+          `node-pty unavailable: ${message}\r\nFalling back to pipe mode.\r\n`,
+        );
         this.screen.render();
       }
     }
@@ -515,7 +592,9 @@ class BlessedTinyPlaceTui {
       this.writeAgentOutput(chunk);
     });
     child.on("error", (error) => {
-      this.finishAgent(`${this.profile.displayName} failed to start: ${error.message}`);
+      this.finishAgent(
+        `${this.profile.displayName} failed to start: ${error.message}`,
+      );
     });
     child.on("exit", (code, signal) => {
       const detail = signal ? `signal ${signal}` : `exit code ${code ?? 0}`;
@@ -540,7 +619,9 @@ class BlessedTinyPlaceTui {
       stdout.write(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk);
       return;
     }
-    this.terminal?.write(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk);
+    this.terminal?.write(
+      Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk,
+    );
     this.queueScreenRender();
   }
 
@@ -566,13 +647,17 @@ class BlessedTinyPlaceTui {
       this.tmuxSocket = socket;
       this.tmuxSession = session;
       this.updateNativeTerminalTitle();
-      const pty = spawn("tmux", ["-L", socket, "attach-session", "-t", session], {
-        cols: terminalColumns(this.options),
-        cwd: this.options.cwd ?? process.cwd(),
-        env: tmuxEnv(this.ctx.env),
-        name: terminalName(this.ctx.env),
-        rows: terminalPhysicalRows(this.options),
-      });
+      const pty = spawn(
+        "tmux",
+        ["-L", socket, "attach-session", "-t", session],
+        {
+          cols: terminalColumns(this.options),
+          cwd: this.options.cwd ?? process.cwd(),
+          env: tmuxEnv(this.ctx.env),
+          name: terminalName(this.ctx.env),
+          rows: terminalPhysicalRows(this.options),
+        },
+      );
       this.pty = pty;
       this.nativeRelayActive = true;
       this.nativeInputHandler = (chunk) => {
@@ -586,7 +671,10 @@ class BlessedTinyPlaceTui {
       this.nativeResizeHandler = () => {
         this.resizeAgentPty();
       };
-      addResizeListener(this.options.stdout ?? process.stdout, this.nativeResizeHandler);
+      addResizeListener(
+        this.options.stdout ?? process.stdout,
+        this.nativeResizeHandler,
+      );
       process.on("SIGWINCH", this.nativeResizeHandler);
       pty.onData((chunk) => {
         this.writeAgentOutput(chunk);
@@ -619,13 +707,18 @@ class BlessedTinyPlaceTui {
       return;
     }
     const activeSession = this.state.activeSessionId ?? "none";
-    runTmuxCommand(this.tmuxSocket, [
-      "set-option",
-      "-t",
-      this.tmuxSession,
-      "status-left",
-      tmuxFooterContent(this.ctx, activeSession),
-    ], this.ctx.env, this.options.cwd);
+    runTmuxCommand(
+      this.tmuxSocket,
+      [
+        "set-option",
+        "-t",
+        this.tmuxSession,
+        "status-left",
+        tmuxFooterContent(this.ctx, activeSession),
+      ],
+      this.ctx.env,
+      this.options.cwd,
+    );
   }
 
   private cleanupNativeRelay(): void {
@@ -635,12 +728,17 @@ class BlessedTinyPlaceTui {
       this.nativeInputHandler = undefined;
     }
     if (this.nativeResizeHandler) {
-      removeResizeListener(this.options.stdout ?? process.stdout, this.nativeResizeHandler);
+      removeResizeListener(
+        this.options.stdout ?? process.stdout,
+        this.nativeResizeHandler,
+      );
       process.off("SIGWINCH", this.nativeResizeHandler);
       this.nativeResizeHandler = undefined;
     }
     if (this.nativeHadRawMode !== undefined) {
-      (stdin as { setRawMode?: (mode: boolean) => void }).setRawMode?.(this.nativeHadRawMode);
+      (stdin as { setRawMode?: (mode: boolean) => void }).setRawMode?.(
+        this.nativeHadRawMode,
+      );
       this.nativeHadRawMode = undefined;
     }
     this.nativeRelayActive = false;
@@ -651,10 +749,21 @@ class BlessedTinyPlaceTui {
     }
   }
 
-  private createTmuxSession(socket: string, session: string, launch: AgentLaunch): boolean {
+  private createTmuxSession(
+    socket: string,
+    session: string,
+    launch: AgentLaunch,
+  ): boolean {
     const command = shellCommandFor(launch);
     const cwd = this.options.cwd ?? process.cwd();
-    if (!runTmuxCommand(socket, ["new-session", "-d", "-s", session, "-c", cwd, command], this.ctx.env, cwd)) {
+    if (
+      !runTmuxCommand(
+        socket,
+        ["new-session", "-d", "-s", session, "-c", cwd, command],
+        this.ctx.env,
+        cwd,
+      )
+    ) {
       return false;
     }
     for (const args of [
@@ -665,7 +774,13 @@ class BlessedTinyPlaceTui {
       ["set-option", "-t", session, "status-style", "bg=black,fg=white"],
       ["set-window-option", "-t", session, "window-status-format", ""],
       ["set-window-option", "-t", session, "window-status-current-format", ""],
-      ["set-option", "-t", session, "status-left", tmuxFooterContent(this.ctx, this.state.activeSessionId ?? "none")],
+      [
+        "set-option",
+        "-t",
+        session,
+        "status-left",
+        tmuxFooterContent(this.ctx, this.state.activeSessionId ?? "none"),
+      ],
     ]) {
       if (!runTmuxCommand(socket, args, this.ctx.env, cwd)) {
         this.killTmuxSession(socket, session);
@@ -676,7 +791,12 @@ class BlessedTinyPlaceTui {
   }
 
   private killTmuxSession(socket: string, session: string): void {
-    runTmuxCommand(socket, ["kill-session", "-t", session], this.ctx.env, this.options.cwd);
+    runTmuxCommand(
+      socket,
+      ["kill-session", "-t", session],
+      this.ctx.env,
+      this.options.cwd,
+    );
   }
 
   private queueScreenRender(): void {
@@ -698,7 +818,9 @@ class BlessedTinyPlaceTui {
     }
     this.pty.resize(
       terminalColumns(this.options),
-      this.nativeRelayActive ? terminalPhysicalRows(this.options) : terminalRows(this.options),
+      this.nativeRelayActive
+        ? terminalPhysicalRows(this.options)
+        : terminalRows(this.options),
     );
   }
 
@@ -723,7 +845,9 @@ class BlessedTinyPlaceTui {
     if (this.state.view === "settings") {
       this.body.setContent(renderSettingsContent(this.ctx, this.profile));
     } else {
-      this.body.setContent(renderWelcomeContent(this.ctx, this.profile, this.state));
+      this.body.setContent(
+        renderWelcomeContent(this.ctx, this.profile, this.state),
+      );
     }
     this.renderFooter();
     this.screen.render();
@@ -782,7 +906,10 @@ class BlessedTinyPlaceTui {
     if (this.autoStartUsed) {
       return;
     }
-    if (this.state.view !== "welcome" || this.state.selectedIndex !== CODEX_ACTION_INDEX) {
+    if (
+      this.state.view !== "welcome" ||
+      this.state.selectedIndex !== CODEX_ACTION_INDEX
+    ) {
       return;
     }
     const timeoutMs = autoStartMs(this.ctx.env);
@@ -847,9 +974,12 @@ class AgentSessionMonitor {
     this.startedAt = startedAt;
     this.poll(startedAt);
     const pollMs = Number(this.ctx.env[this.profile.sessionPollEnv] ?? 500);
-    this.timer = setInterval(() => {
-      this.poll(startedAt);
-    }, Number.isFinite(pollMs) && pollMs > 0 ? pollMs : 500);
+    this.timer = setInterval(
+      () => {
+        this.poll(startedAt);
+      },
+      Number.isFinite(pollMs) && pollMs > 0 ? pollMs : 500,
+    );
   }
 
   public stop(): void {
@@ -935,7 +1065,11 @@ function renderWelcomeContent(
   return `${lines.join("\n")}\n`;
 }
 
-function renderActionRow(selected: boolean, label: string, colorTag: string): string {
+function renderActionRow(
+  selected: boolean,
+  label: string,
+  colorTag: string,
+): string {
   const row = `${selected ? ">" : " "} ${label}`;
   if (selected) {
     return `{inverse}${row}{/inverse}`;
@@ -943,7 +1077,11 @@ function renderActionRow(selected: boolean, label: string, colorTag: string): st
   return `${colorTag}${row}{/${colorTag.slice(1)}`;
 }
 
-function renderKeyValue(label: string, value: string, colorTag: string): string {
+function renderKeyValue(
+  label: string,
+  value: string,
+  colorTag: string,
+): string {
   return `{gray-fg}${label}:{/gray-fg} ${colorTag}${value}{/${colorTag.slice(1)}`;
 }
 
@@ -972,7 +1110,9 @@ function buildAgentProfile(
   kind: TinyVerseAgentKind,
 ): AgentProfile {
   if (kind === "claude") {
-    const command = firstEnv(env, ["TINYVERSE_CLAUDE_BIN", "TINYPLACE_CLAUDE_BIN"]) ?? "claude";
+    const command =
+      firstEnv(env, ["TINYVERSE_CLAUDE_BIN", "TINYPLACE_CLAUDE_BIN"]) ??
+      "claude";
     const args = splitShellWords(
       firstEnv(env, ["TINYVERSE_CLAUDE_ARGS", "TINYPLACE_CLAUDE_ARGS"]) ?? "",
     );
@@ -984,8 +1124,10 @@ function buildAgentProfile(
       pendingSessionId: "claude:pending",
       sessionPollEnv: "TINYPLACE_CLAUDE_SESSION_POLL_MS",
       sessionsDir:
-        firstEnv(env, ["TINYVERSE_CLAUDE_SESSIONS_DIR", "TINYPLACE_CLAUDE_SESSIONS_DIR"]) ??
-        join(homedir(), ".claude", "projects"),
+        firstEnv(env, [
+          "TINYVERSE_CLAUDE_SESSIONS_DIR",
+          "TINYPLACE_CLAUDE_SESSIONS_DIR",
+        ]) ?? join(homedir(), ".claude", "projects"),
     };
   }
   const command = env.TINYPLACE_CODEX_BIN ?? "codex";
@@ -997,7 +1139,8 @@ function buildAgentProfile(
     launch: buildLaunch(command, args),
     pendingSessionId: "codex:pending",
     sessionPollEnv: "TINYPLACE_CODEX_SESSION_POLL_MS",
-    sessionsDir: env.TINYPLACE_CODEX_SESSIONS_DIR ?? join(homedir(), ".codex", "sessions"),
+    sessionsDir:
+      env.TINYPLACE_CODEX_SESSIONS_DIR ?? join(homedir(), ".codex", "sessions"),
   };
 }
 
@@ -1013,7 +1156,9 @@ function firstEnv(
   env: Record<string, string | undefined>,
   names: Array<string>,
 ): string | undefined {
-  return names.map((name) => env[name]).find((value) => value !== undefined && value !== "");
+  return names
+    .map((name) => env[name])
+    .find((value) => value !== undefined && value !== "");
 }
 
 function profileOverrideNames(profile: AgentProfile): Array<string> {
@@ -1024,10 +1169,16 @@ function profileOverrideNames(profile: AgentProfile): Array<string> {
       "TINYPLACE_CLAUDE_SESSIONS_DIR",
     ];
   }
-  return ["TINYPLACE_CODEX_BIN", "TINYPLACE_CODEX_ARGS", "TINYPLACE_CODEX_SESSIONS_DIR"];
+  return [
+    "TINYPLACE_CODEX_BIN",
+    "TINYPLACE_CODEX_ARGS",
+    "TINYPLACE_CODEX_SESSIONS_DIR",
+  ];
 }
 
-function childEnv(env: Record<string, string | undefined>): Record<string, string> {
+function childEnv(
+  env: Record<string, string | undefined>,
+): Record<string, string> {
   const merged: Record<string, string | undefined> = {
     ...process.env,
     ...env,
@@ -1047,7 +1198,9 @@ function terminalName(env: Record<string, string | undefined>): string {
   return value && value !== "dumb" ? value : "xterm-256color";
 }
 
-function tmuxEnv(env: Record<string, string | undefined>): Record<string, string> {
+function tmuxEnv(
+  env: Record<string, string | undefined>,
+): Record<string, string> {
   const result = childEnv(env);
   delete result.TMUX;
   return result;
@@ -1068,7 +1221,9 @@ function runTmuxCommand(
 }
 
 function shellCommandFor(launch: AgentLaunch): string {
-  return [launch.command, ...launch.args].map((part) => shellQuote(part)).join(" ");
+  return [launch.command, ...launch.args]
+    .map((part) => shellQuote(part))
+    .join(" ");
 }
 
 function shellQuote(value: string): string {
@@ -1096,17 +1251,25 @@ function locateCodexSession(
     .filter((path) => {
       try {
         const mtimeMs = statSync(path).mtimeMs;
-        return mtimeMs >= startedAt.getTime() - 2_000 || mtimeMs > (baselineMtimes.get(path) ?? 0);
+        return (
+          mtimeMs >= startedAt.getTime() - 2_000 ||
+          mtimeMs > (baselineMtimes.get(path) ?? 0)
+        );
       } catch {
         return false;
       }
     })
     .map((path) => readAgentSessionMeta(profile, path))
     .filter((meta): meta is AgentSessionMeta => meta !== undefined)
-    .sort((left, right) => statSync(right.path).mtimeMs - statSync(left.path).mtimeMs);
+    .sort(
+      (left, right) =>
+        statSync(right.path).mtimeMs - statSync(left.path).mtimeMs,
+    );
   return (
     candidates.find((meta) => meta.cwd === cwd) ??
-    candidates.find((meta) => meta.cwd !== undefined && relatedCwd(meta.cwd, cwd)) ??
+    candidates.find(
+      (meta) => meta.cwd !== undefined && relatedCwd(meta.cwd, cwd),
+    ) ??
     (Date.now() - startedAt.getTime() > 2_000 ? candidates[0] : undefined)
   );
 }
@@ -1133,7 +1296,10 @@ function listAgentSessionFiles(profile: AgentProfile): Array<string> {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) {
         visit(path);
-      } else if (entry.isFile() && isAgentSessionFile(profile, path, entry.name)) {
+      } else if (
+        entry.isFile() &&
+        isAgentSessionFile(profile, path, entry.name)
+      ) {
         out.push(path);
       }
     }
@@ -1142,7 +1308,11 @@ function listAgentSessionFiles(profile: AgentProfile): Array<string> {
   return out;
 }
 
-function isAgentSessionFile(profile: AgentProfile, path: string, name: string): boolean {
+function isAgentSessionFile(
+  profile: AgentProfile,
+  path: string,
+  name: string,
+): boolean {
   if (profile.kind === "codex") {
     return name.startsWith("rollout-") && name.endsWith(".jsonl");
   }
@@ -1153,7 +1323,9 @@ function readAgentSessionMeta(
   profile: AgentProfile,
   path: string,
 ): AgentSessionMeta | undefined {
-  return profile.kind === "claude" ? readClaudeSessionMeta(path) : readCodexSessionMeta(path);
+  return profile.kind === "claude"
+    ? readClaudeSessionMeta(path)
+    : readCodexSessionMeta(path);
 }
 
 function readCodexSessionMeta(path: string): AgentSessionMeta | undefined {
@@ -1210,12 +1382,16 @@ function relatedCwd(left: string, right: string): boolean {
 }
 
 function isRelativeDescendant(value: string): boolean {
-  return value.length === 0 || (!value.startsWith("..") && !value.startsWith("/"));
+  return (
+    value.length === 0 || (!value.startsWith("..") && !value.startsWith("/"))
+  );
 }
 
 function readAllLines(path: string): Array<string> {
   try {
-    return readFileSync(path, "utf8").split(/\r?\n/).filter((line) => line.length > 0);
+    return readFileSync(path, "utf8")
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0);
   } catch {
     return [];
   }
@@ -1250,7 +1426,12 @@ function fixNodePtyHelperPermissions(): void {
   }
   for (const helperPath of [
     join(packageDir, "build", "Release", "spawn-helper"),
-    join(packageDir, "prebuilds", `${process.platform}-${process.arch}`, "spawn-helper"),
+    join(
+      packageDir,
+      "prebuilds",
+      `${process.platform}-${process.arch}`,
+      "spawn-helper",
+    ),
   ]) {
     if (!existsSync(helperPath)) {
       continue;
@@ -1261,7 +1442,9 @@ function fixNodePtyHelperPermissions(): void {
 
 function terminalColumns(options: TinyPlaceCliOptions): number {
   const columns =
-    (options.stdout as { columns?: number } | undefined)?.columns ?? process.stdout.columns ?? 80;
+    (options.stdout as { columns?: number } | undefined)?.columns ??
+    process.stdout.columns ??
+    80;
   return Math.max(20, columns);
 }
 
@@ -1270,22 +1453,31 @@ function terminalRows(options: TinyPlaceCliOptions): number {
 }
 
 function terminalPhysicalRows(options: TinyPlaceCliOptions): number {
-  const rows = (options.stdout as { rows?: number } | undefined)?.rows ?? process.stdout.rows ?? 24;
+  const rows =
+    (options.stdout as { rows?: number } | undefined)?.rows ??
+    process.stdout.rows ??
+    24;
   return Math.max(5, rows);
 }
 
 function addResizeListener(stream: unknown, handler: () => void): void {
-  (stream as { on?: (event: "resize", listener: () => void) => void }).on?.("resize", handler);
+  (stream as { on?: (event: "resize", listener: () => void) => void }).on?.(
+    "resize",
+    handler,
+  );
 }
 
 function removeResizeListener(stream: unknown, handler: () => void): void {
-  (stream as { off?: (event: "resize", listener: () => void) => void }).off?.("resize", handler);
+  (stream as { off?: (event: "resize", listener: () => void) => void }).off?.(
+    "resize",
+    handler,
+  );
 }
 
 function splitShellWords(input: string): Array<string> {
   const words: Array<string> = [];
   let current = "";
-  let quote: "\"" | "'" | undefined;
+  let quote: '"' | "'" | undefined;
   let escaped = false;
   for (const char of input) {
     if (escaped) {
@@ -1305,7 +1497,7 @@ function splitShellWords(input: string): Array<string> {
       }
       continue;
     }
-    if (char === "\"" || char === "'") {
+    if (char === '"' || char === "'") {
       quote = char;
       continue;
     }
@@ -1360,7 +1552,9 @@ function walletIdFor(ctx: CliContext): string {
 
 /** The configured OpenHuman owner (whom we bridge to), if any. Mirrors the
  *  wrapper's recipient resolution order. */
-function bridgeOwner(env: Record<string, string | undefined>): string | undefined {
+function bridgeOwner(
+  env: Record<string, string | undefined>,
+): string | undefined {
   return firstEnv(env, [
     "TINYPLACE_CODEX_DM_TO",
     "TINYPLACE_CLAUDE_DM_TO",
