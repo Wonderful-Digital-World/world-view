@@ -84,6 +84,11 @@ export function buildEventEnvelopeV2(
   };
 }
 
+// Deterministic id scoped to (wrapperSessionId, recordType, seq, kind) — NOT a
+// content hash of the payload. It is stable for a given event within one wrapper
+// run (so a resend carries the same id and the consumer dedups), and unique
+// across runs because wrapperSessionId is freshly minted per process — so seq
+// restarting at 0 after a relaunch cannot collide with a prior run's ids.
 function stableEventId(
   wrapperSessionId: string,
   recordType: string,
