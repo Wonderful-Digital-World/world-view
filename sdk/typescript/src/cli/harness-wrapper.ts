@@ -777,20 +777,16 @@ export class SessionEnvelopePublisher {
       return recipient;
     }
 
-    const before = await ctx.client.contacts.status(recipient);
-    if (before.status === "accepted") {
-      return recipient;
-    }
-    if (before.status === "blocked") {
-      throw new Error(`tiny.place contact blocked for ${recipient}; unblock before DM forwarding`);
-    }
-
+    // Request first (idempotent; auto-accepts a reverse-pending request), then
+    // read status. Never pre-check status: the backend 404s on a fresh
+    // relationship, so a status-first probe would throw before we ever send the
+    // request.
     await ctx.client.contacts.request(recipient);
-    const after = await ctx.client.contacts.status(recipient);
-    if (after.status === "accepted") {
+    const status = await ctx.client.contacts.status(recipient);
+    if (status.status === "accepted") {
       return recipient;
     }
-    if (after.status === "blocked") {
+    if (status.status === "blocked") {
       throw new Error(`tiny.place contact blocked for ${recipient}; unblock before DM forwarding`);
     }
     throw new Error(
@@ -893,19 +889,17 @@ export class InboundMessageReceiver {
     if (!ctx.signer || owner === ctx.signer.agentId) {
       return;
     }
-    const before = await ctx.client.contacts.status(owner);
-    if (before.status === "accepted") {
-      return;
-    }
-    if (before.status === "blocked") {
+    // Request first (idempotent; auto-accepts a reverse-pending request), then
+    // read status — never pre-check, since a fresh relationship 404s.
+    await ctx.client.contacts.request(owner);
+    const status = await ctx.client.contacts.status(owner);
+    if (status.status === "blocked") {
       this.stderr.write(
         `tinyplace ${this.config.provider}: inbound owner ${owner} is blocked; unblock to receive\n`,
       );
       return;
     }
-    await ctx.client.contacts.request(owner);
-    const after = await ctx.client.contacts.status(owner);
-    if (after.status !== "accepted") {
+    if (status.status !== "accepted") {
       this.stderr.write(
         `tinyplace ${this.config.provider}: contact with ${owner} pending; approve it in OpenHuman to receive inbound\n`,
       );

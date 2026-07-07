@@ -795,7 +795,12 @@ function makeRelay(options: { autoAcceptContacts?: boolean } = {}): HarnessRelay
       const requester = actorId(request);
       const status = options.autoAcceptContacts ? "accepted" : "pending";
       const now = "2026-06-16T00:00:00.000Z";
-      relay.contactRequests.push(agentId);
+      // contacts.request is idempotent server-side; model that (the wrapper may
+      // request the same owner from both the outbound publisher and the inbound
+      // receiver).
+      if (!relay.contactRequests.includes(agentId)) {
+        relay.contactRequests.push(agentId);
+      }
       contacts.set(contactKey(requester, agentId), status);
       return Response.json({
         requester,
