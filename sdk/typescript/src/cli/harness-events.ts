@@ -1,0 +1,524 @@
+// Pure JSONL-line -> typed HarnessEvent mapper for the v2 session stream.
+//
+// This module is deliberately self-contained: it depends only on the v2 types
+// and carries its own small JSON accessors. That keeps it free of any collision
+// with the transport/tailer code in `harness-wrapper.ts` (which owns envelope
+// framing: id/seq/bucket/scope). The tailer calls `harnessEventsFromLine` and
+// wraps each result in a `SessionEnvelopeV2`.
+//
+// Verified against real interactive sessions on both providers:
+//   Claude  ~/.claude/projects/*/*.jsonl   — record types user|assistant|system,
+//           message.content[] blocks: text | thinking | tool_use | tool_result.
+//   Codex   ~/.codex/sessions/**/rollout-*.jsonl — record types event_msg |
+//           response_item, payload types: user_message | agent_message |
+//           reasoning | function_call | function_call_output | mcp_tool_call_* |
+//           tool_search_call | tool_search_output | task_started | task_complete.
+
+import type {
+  HarnessEvent,
+  HarnessProvider,
+  HarnessToolKind,
+} from "../types/harness.js";
+
+/** One typed event parsed from a single transcript line, pre-envelope. */
+export interface HarnessSemanticEvent {
+  line: number;
+  timestamp: Date;
+  /** origin record type, e.g. "assistant" / "response_item:function_call". */
+  recordType: string;
+  event: HarnessEvent;
+}
+
+/** Truncate cap for tool_result output text (bytes are reported separately). */
+const OUTPUT_CAP = 4096;
+const ELISION = "\n…[truncated]";
+
+export function harnessEventsFromLine(
+  provider: HarnessProvider,
+  raw: string,
+  line: number,
+): Array<HarnessSemanticEvent> {
+  return provider === "claude"
+    ? claudeEventsFromLine(raw, line)
+    : codexEventsFromLine(raw, line);
+}
+
+// ── Claude ───────────────────────────────────────────────────────────────────
+
+export function claudeEventsFromLine(
+  raw: string,
+  line: number,
+): Array<HarnessSemanticEvent> {
+  const record = parseJsonObject(raw);
+  if (!record) {
+    return [];
+  }
+  const timestamp = parseTimestamp(record.timestamp);
+  const message = asObject(record.message);
+  if (!message) {
+    return [];
+  }
+  const sourceRole = asString(message.role);
+  const blocks = asArray(message.content);
+
+  // A Claude `user` record carries the human prompt AND tool_result blocks.
+  if (record.type === "user" && sourceRole === "user") {
+    if (typeof message.content === "string") {
+      return message.content
+        ? [userPromptEvent(line, timestamp, message.content)]
+        : [];
+    }
+    return blocks.flatMap((block) =>
+      claudeUserBlock(block, line, timestamp),
+    );
+  }
+
+  // An `assistant` record carries text / thinking / tool_use blocks.
+  if (record.type === "assistant" && sourceRole === "assistant") {
+    return blocks.flatMap((block) =>
+      claudeAssistantBlock(block, line, timestamp),
+    );
+  }
+
+  return [];
+}
+
+function claudeUserBlock(
+  block: unknown,
+  line: number,
+  timestamp: Date,
+): Array<HarnessSemanticEvent> {
+  const object = asObject(block);
+  if (!object) {
+    return [];
+  }
+  if (object.type === "text") {
+    const text = asString(object.text) ?? "";
+    return text ? [userPromptEvent(line, timestamp, text)] : [];
+  }
+  if (object.type === "tool_result") {
+    const callId = asString(object.tool_use_id) ?? "";
+    const isError = object.is_error === true;
+    const output = flattenClaudeToolResult(object.content);
+    return [
+      {
+        line,
+        timestamp,
+        recordType: "user:tool_result",
+        event: {
+          kind: "tool_result",
+          role: "agent",
+          payload: {
+            call_id: callId,
+            ok: !isError,
+            is_error: isError,
+            output: truncate(output),
+            output_bytes: byteLength(output),
+          },
+        },
+      },
+    ];
+  }
+  return [];
+}
+
+function claudeAssistantBlock(
+  block: unknown,
+  line: number,
+  timestamp: Date,
+): Array<HarnessSemanticEvent> {
+  const object = asObject(block);
+  if (!object) {
+    return [];
+  }
+  if (object.type === "text") {
+    const text = asString(object.text) ?? "";
+    return text
+      ? [
+          {
+            line,
+            timestamp,
+            recordType: "assistant:text",
+            event: { kind: "agent_message", role: "agent", payload: { text } },
+          },
+        ]
+      : [];
+  }
+  if (object.type === "thinking") {
+    const text = asString(object.thinking) ?? asString(object.text) ?? "";
+    return text
+      ? [
+          {
+            line,
+            timestamp,
+            recordType: "assistant:thinking",
+            event: { kind: "agent_thinking", role: "agent", payload: { text } },
+          },
+        ]
+      : [];
+  }
+  if (object.type === "tool_use") {
+    const toolName = asString(object.name) ?? "unknown";
+    const input = object.input;
+    return [
+      {
+        line,
+        timestamp,
+        recordType: "assistant:tool_use",
+        event: {
+          kind: "tool_call",
+          role: "agent",
+          payload: {
+            call_id: asString(object.id) ?? "",
+            tool_name: toolName,
+            tool_kind: normalizeToolKind(toolName),
+            display: toolDisplay(toolName, input),
+            input,
+          },
+        },
+      },
+    ];
+  }
+  return [];
+}
+
+function flattenClaudeToolResult(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .flatMap((item) => {
+      const object = asObject(item);
+      if (!object || object.type !== "text") {
+        return [];
+      }
+      const text = asString(object.text);
+      return text ? [text] : [];
+    })
+    .join("\n");
+}
+
+// ── Codex ──────────────────────────────────────────────────────────────────
+
+export function codexEventsFromLine(
+  raw: string,
+  line: number,
+): Array<HarnessSemanticEvent> {
+  const record = parseJsonObject(raw);
+  if (!record) {
+    return [];
+  }
+  const timestamp = parseTimestamp(record.timestamp);
+  const payload = asObject(record.payload);
+  if (!payload) {
+    return [];
+  }
+  const type = asString(payload.type);
+
+  if (record.type === "event_msg" && type === "user_message") {
+    const text = asString(payload.message) ?? "";
+    return text ? [userPromptEvent(line, timestamp, text)] : [];
+  }
+
+  if (
+    (record.type === "event_msg" && type === "agent_message") ||
+    (record.type === "response_item" &&
+      type === "message" &&
+      payload.role === "assistant")
+  ) {
+    const text =
+      asString(payload.message) ??
+      textFromContent(payload.content, new Set(["output_text", "text"]));
+    return text
+      ? [
+          {
+            line,
+            timestamp,
+            recordType: `${asString(record.type) ?? "record"}:agent_message`,
+            event: { kind: "agent_message", role: "agent", payload: { text } },
+          },
+        ]
+      : [];
+  }
+
+  if (type === "reasoning") {
+    const text =
+      textFromContent(payload.summary, new Set(["summary_text", "text"])) ||
+      textFromContent(payload.content, new Set(["reasoning_text", "text"]));
+    return text
+      ? [
+          {
+            line,
+            timestamp,
+            recordType: "response_item:reasoning",
+            event: { kind: "agent_thinking", role: "agent", payload: { text } },
+          },
+        ]
+      : [];
+  }
+
+  if (type === "function_call" || type === "tool_search_call") {
+    const toolName = asString(payload.name) ?? asString(payload.query) ?? "tool";
+    const input = payload.arguments ?? payload.query ?? payload.input;
+    return [
+      {
+        line,
+        timestamp,
+        recordType: `response_item:${type}`,
+        event: {
+          kind: "tool_call",
+          role: "agent",
+          payload: {
+            call_id: asString(payload.call_id) ?? asString(payload.id) ?? "",
+            tool_name: toolName,
+            tool_kind: normalizeToolKind(toolName),
+            display: toolDisplay(toolName, input),
+            input,
+          },
+        },
+      },
+    ];
+  }
+
+  if (
+    type === "function_call_output" ||
+    type === "tool_search_output" ||
+    type === "mcp_tool_call_end"
+  ) {
+    const output = codexOutputText(payload.output ?? payload.result);
+    const isError = codexIsError(payload);
+    return [
+      {
+        line,
+        timestamp,
+        recordType: `response_item:${type}`,
+        event: {
+          kind: "tool_result",
+          role: "agent",
+          payload: {
+            call_id: asString(payload.call_id) ?? asString(payload.id) ?? "",
+            ok: !isError,
+            is_error: isError,
+            output: truncate(output),
+            output_bytes: byteLength(output),
+          },
+        },
+      },
+    ];
+  }
+
+  if (type === "mcp_tool_call_begin") {
+    const toolName = asString(payload.tool) ?? asString(payload.name) ?? "mcp";
+    return [
+      {
+        line,
+        timestamp,
+        recordType: "response_item:mcp_tool_call_begin",
+        event: {
+          kind: "tool_call",
+          role: "agent",
+          payload: {
+            call_id: asString(payload.call_id) ?? asString(payload.id) ?? "",
+            tool_name: toolName,
+            tool_kind: "mcp",
+            display: toolDisplay(toolName, payload.arguments),
+            input: payload.arguments,
+          },
+        },
+      },
+    ];
+  }
+
+  if (type === "task_started" || type === "task_complete") {
+    const running = type === "task_started";
+    return [
+      {
+        line,
+        timestamp,
+        recordType: `event_msg:${type}`,
+        event: {
+          kind: "status",
+          role: "agent",
+          payload: {
+            state: running ? "running" : "idle",
+            detail: running ? "working" : "idle",
+          },
+        },
+      },
+    ];
+  }
+
+  return [];
+}
+
+function codexOutputText(output: unknown): string {
+  if (typeof output === "string") {
+    return output;
+  }
+  const object = asObject(output);
+  if (object) {
+    const content = object.content ?? object.output ?? object.text;
+    if (typeof content === "string") {
+      return content;
+    }
+    return textFromContent(content, new Set(["output_text", "text"]));
+  }
+  return textFromContent(output, new Set(["output_text", "text"]));
+}
+
+function codexIsError(payload: Record<string, unknown>): boolean {
+  if (payload.success === false || payload.is_error === true) {
+    return true;
+  }
+  const output = asObject(payload.output);
+  if (output && (output.success === false || output.is_error === true)) {
+    return true;
+  }
+  return false;
+}
+
+// ── shared helpers ───────────────────────────────────────────────────────────
+
+function userPromptEvent(
+  line: number,
+  timestamp: Date,
+  text: string,
+): HarnessSemanticEvent {
+  return {
+    line,
+    timestamp,
+    recordType: "user:prompt",
+    event: {
+      kind: "user_prompt",
+      role: "owner",
+      payload: { text, source: "human" },
+    },
+  };
+}
+
+export function normalizeToolKind(name: string): HarnessToolKind {
+  const lower = name.toLowerCase();
+  if (lower.startsWith("mcp__") || lower.includes("mcp")) {
+    return "mcp";
+  }
+  if (/(bash|shell|exec|command|terminal|run)/.test(lower)) {
+    return "shell";
+  }
+  if (/(multiedit|edit|apply_patch|patch)/.test(lower)) {
+    return "edit";
+  }
+  if (/(write|create_file)/.test(lower)) {
+    return "file_write";
+  }
+  if (/(read|cat|open_file|view)/.test(lower)) {
+    return "file_read";
+  }
+  if (/(grep|glob|search|find|ripgrep)/.test(lower)) {
+    return "search";
+  }
+  if (/(web|fetch|http|browse|url)/.test(lower)) {
+    return "web";
+  }
+  if (/(task|agent|subagent|spawn)/.test(lower)) {
+    return "task";
+  }
+  return "other";
+}
+
+/** Best-effort one-line summary of what a tool call is doing. */
+export function toolDisplay(name: string, input: unknown): string {
+  const object = asObject(input);
+  if (object) {
+    const preferred = [
+      "command",
+      "cmd",
+      "file_path",
+      "path",
+      "pattern",
+      "query",
+      "url",
+      "prompt",
+      "description",
+    ];
+    for (const key of preferred) {
+      const value = asString(object[key]);
+      if (value) {
+        return firstLine(value);
+      }
+    }
+  }
+  if (typeof input === "string" && input) {
+    return firstLine(input);
+  }
+  return name;
+}
+
+function firstLine(value: string): string {
+  const line = value.split("\n", 1)[0] ?? value;
+  return line.length > 200 ? `${line.slice(0, 197)}...` : line;
+}
+
+function truncate(value: string): string {
+  if (byteLength(value) <= OUTPUT_CAP) {
+    return value;
+  }
+  return `${value.slice(0, OUTPUT_CAP)}${ELISION}`;
+}
+
+function byteLength(value: string): number {
+  return Buffer.byteLength(value, "utf8");
+}
+
+function textFromContent(content: unknown, allowedTypes: Set<string>): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .flatMap((item) => {
+      const object = asObject(item);
+      if (!object || !allowedTypes.has(String(object.type))) {
+        return [];
+      }
+      const text = asString(object.text);
+      return text ? [text] : [];
+    })
+    .join("\n");
+}
+
+function parseJsonObject(raw: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return asObject(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
+function parseTimestamp(value: unknown): Date {
+  if (typeof value !== "string") {
+    return new Date(0);
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? new Date(0) : parsed;
+}
+
+function asObject(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as Record<string, unknown>;
+}
+
+function asArray(value: unknown): Array<unknown> {
+  return Array.isArray(value) ? value : [];
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
