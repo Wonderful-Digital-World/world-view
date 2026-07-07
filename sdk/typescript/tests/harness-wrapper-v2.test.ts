@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -101,6 +101,9 @@ async function drive(config: HarnessWrapperConfig, out: Writable): Promise<void>
 describe("HarnessSessionTailer v2 emission", () => {
   const dirs: Array<string> = [];
   afterEach(() => {
+    for (const dir of dirs) {
+      rmSync(dir, { recursive: true, force: true });
+    }
     dirs.length = 0;
   });
 
