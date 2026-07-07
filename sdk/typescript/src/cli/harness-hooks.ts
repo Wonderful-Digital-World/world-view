@@ -135,7 +135,7 @@ function preToolUse(
           tool_name: toolName,
           tool_kind: normalizeToolKind(toolName),
           display: toolDisplay(toolName, input),
-          input,
+          input: boundRaw(input),
         },
       },
     },

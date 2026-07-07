@@ -31,6 +31,8 @@ export interface HarnessSemanticEvent {
 
 /** Truncate cap for tool_result output text (bytes are reported separately). */
 const OUTPUT_CAP = 4096;
+/** Truncate cap for raw tool_input carried in tool_call envelopes. */
+const INPUT_CAP = OUTPUT_CAP;
 const ELISION = "\n…[truncated]";
 
 /** Maps one raw transcript line from a given provider into typed events. */
@@ -188,7 +190,7 @@ function claudeAssistantBlock(
             tool_name: toolName,
             tool_kind: normalizeToolKind(toolName),
             display: toolDisplay(toolName, input),
-            input,
+            input: boundToolInput(input),
           },
         },
       },
@@ -291,7 +293,7 @@ export function codexEventsFromLine(
             tool_name: toolName,
             tool_kind: normalizeToolKind(toolName),
             display: toolDisplay(toolName, input),
-            input,
+            input: boundToolInput(input),
           },
         },
       },
@@ -341,7 +343,7 @@ export function codexEventsFromLine(
             tool_name: toolName,
             tool_kind: "mcp",
             display: toolDisplay(toolName, input),
-            input,
+            input: boundToolInput(input),
           },
         },
       },
@@ -491,6 +493,33 @@ function truncate(value: string): string {
 
 function byteLength(value: string): number {
   return Buffer.byteLength(value, "utf8");
+}
+
+/**
+ * Bound the raw tool_input before it goes on the wire. Write/Edit/MCP inputs can
+ * carry full file contents or very large request payloads, and the
+ * ToolCallPayload contract promises input is bounded before publish. Small
+ * inputs keep their structure; oversized ones collapse to a byte-capped
+ * serialized string so one large edit can't exceed relay/message limits.
+ */
+function boundToolInput(input: unknown): unknown {
+  const serialized = safeStringify(input);
+  const buffer = Buffer.from(serialized, "utf8");
+  if (buffer.length <= INPUT_CAP) {
+    return input;
+  }
+  return `${buffer.subarray(0, INPUT_CAP).toString("utf8")}${ELISION}`;
+}
+
+function safeStringify(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function textFromContent(content: unknown, allowedTypes: Set<string>): string {

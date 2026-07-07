@@ -201,6 +201,42 @@ describe("claudeEventsFromLine", () => {
     expect(output.endsWith("…[truncated]")).toBe(true);
     expect(output).not.toContain("�");
   });
+
+  it("bounds an oversized tool_input but keeps small inputs structured", () => {
+    const big = claudeEventsFromLine(
+      claudeLine({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_big",
+              name: "Write",
+              input: { file_path: "/a.ts", content: "x".repeat(20000) },
+            },
+          ],
+        },
+      }),
+      12,
+    );
+    const input = (big[0].event.payload as { input: unknown }).input;
+    const elisionBytes = Buffer.byteLength("\n…[truncated]", "utf8");
+    expect(typeof input).toBe("string");
+    expect(Buffer.byteLength(input as string, "utf8")).toBeLessThanOrEqual(4096 + elisionBytes);
+
+    const small = claudeEventsFromLine(
+      claudeLine({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "t2", name: "Read", input: { file_path: "/a.ts" } }],
+        },
+      }),
+      13,
+    );
+    expect((small[0].event.payload as { input: unknown }).input).toEqual({ file_path: "/a.ts" });
+  });
 });
 
 describe("codexEventsFromLine", () => {
