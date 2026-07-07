@@ -23,13 +23,28 @@ import {
 } from "../agent/messaging.js";
 import {
   SESSION_ENVELOPE_VERSION_V1,
+  SESSION_ENVELOPE_VERSION_V2,
+  type AnySessionEnvelope,
   type HarnessBucketUnit,
   type HarnessEnvelopeScope,
   type HarnessMessageRole,
   type HarnessProvider,
   type SessionEnvelope,
+  type StatusPayload,
 } from "../types/harness.js";
 import { bridgeLog } from "./bridge-debug.js";
+import { harnessEventsFromLine } from "./harness-events.js";
+import type { HarnessSemanticEvent } from "./harness-events.js";
+import {
+  buildEventEnvelopeV2,
+  type EnvelopeContext,
+} from "./harness-envelope.js";
+import {
+  initialStatus,
+  reduceStatus,
+  tickStatus,
+  type SessionStatusState,
+} from "./harness-status.js";
 import { makeContext } from "./context.js";
 import type { TinyPlaceCliOptions, TinyPlaceCliResult } from "./types.js";
 import type { Writable } from "node:stream";
@@ -57,8 +72,16 @@ export interface HarnessWrapperConfig {
   captureSession: boolean;
   dmRecipient?: string;
   dryRun: boolean;
+  // Opt-in: also emit the v2 typed-event stream (tool_call/tool_result/status/
+  // thinking) alongside v1. Default off so current v1 consumers are untouched
+  // until the OpenHuman receiver understands v2.
+  emitV2: boolean;
   outDir: string;
   provider: HarnessProvider;
+  // v2 status derivation: idle a silent session after this long, and re-emit a
+  // heartbeat status no more often than this. Only used when emitV2 is on.
+  statusHeartbeatMs: number;
+  statusIdleMs: number;
   receiveEnabled: boolean;
   receiveFrom?: string;
   receivePollMs: number;
@@ -415,8 +438,25 @@ export function parseHarnessWrapperArgs(
     captureSession: true,
     ...(owner ? { dmRecipient: owner } : {}),
     dryRun: false,
+    emitV2:
+      firstEnv(env, [
+        `TINYPLACE_${provider.toUpperCase()}_V2`,
+        "TINYPLACE_HARNESS_V2",
+      ]) === "1",
     outDir,
     provider,
+    statusHeartbeatMs: Number(
+      firstEnv(env, [
+        `TINYPLACE_${provider.toUpperCase()}_STATUS_HEARTBEAT_MS`,
+        "TINYPLACE_HARNESS_STATUS_HEARTBEAT_MS",
+      ]) ?? 15_000,
+    ),
+    statusIdleMs: Number(
+      firstEnv(env, [
+        `TINYPLACE_${provider.toUpperCase()}_STATUS_IDLE_MS`,
+        "TINYPLACE_HARNESS_STATUS_IDLE_MS",
+      ]) ?? 30_000,
+    ),
     ...(receiveFrom ? { receiveFrom } : {}),
     receiveEnabled: receiveFrom !== undefined && !receiveDisabled,
     receivePollMs: Number(
@@ -587,6 +627,10 @@ export class HarnessSessionTailer {
   private sessionFile: string | undefined;
   private sessionMeta: SessionMeta | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
+  // v2 typed-event stream state (only used when config.emitV2 is on).
+  private status: SessionStatusState = initialStatus();
+  private v2Seq = 0;
+  private lastHeartbeatMs = 0;
 
   public constructor(
     private readonly config: HarnessWrapperConfig,
@@ -655,12 +699,25 @@ export class HarnessSessionTailer {
           semanticCount += 1;
           this.write(message);
         }
+        if (this.config.emitV2) {
+          for (const event of harnessEventsFromLine(
+            this.config.provider,
+            raw,
+            line,
+          )) {
+            this.writeV2(event);
+          }
+        }
       }
       bridgeLog("tailer.poll", {
         newLines: lines.length,
         semanticMessages: semanticCount,
         lineOffset: this.lineOffset,
       });
+    }
+    // Even with no new lines, age a silent session toward idle and heartbeat.
+    if (this.config.emitV2) {
+      this.tickV2Status();
     }
   }
 
@@ -771,7 +828,86 @@ export class HarnessSessionTailer {
     this.publisher.publish(envelope);
   }
 
-  private writeEnvelope(envelope: SessionEnvelope): void {
+  /** Emit one typed v2 event, then the status transition it implies. */
+  private writeV2(semantic: HarnessSemanticEvent): void {
+    if (!this.sessionFile || !this.sessionMeta) {
+      return;
+    }
+    const ctx = this.v2Context(this.sessionFile, this.sessionMeta);
+    const envelope = buildEventEnvelopeV2(ctx, semantic, this.nextV2Seq());
+    bridgeLog("tailer.v2.event", {
+      id: envelope.event.id,
+      seq: envelope.event.seq,
+      kind: envelope.event.kind,
+      line: semantic.line,
+    });
+    this.writeEnvelope(envelope);
+    this.publisher.publish(envelope);
+
+    const step = reduceStatus(this.status, semantic);
+    this.status = step.next;
+    if (step.emit) {
+      this.publishStatus(step.emit, Date.now());
+    }
+  }
+
+  /** Age a silent session toward idle and emit a periodic heartbeat status. */
+  private tickV2Status(): void {
+    if (!this.sessionFile || !this.sessionMeta) {
+      return;
+    }
+    const now = Date.now();
+    const heartbeat =
+      now - this.lastHeartbeatMs >= this.config.statusHeartbeatMs;
+    const step = tickStatus(this.status, now, {
+      idleAfterMs: this.config.statusIdleMs,
+      heartbeat,
+    });
+    this.status = step.next;
+    if (step.emit) {
+      this.lastHeartbeatMs = now;
+      this.publishStatus(step.emit, now);
+    }
+  }
+
+  private publishStatus(payload: StatusPayload, nowMs: number): void {
+    if (!this.sessionFile || !this.sessionMeta) {
+      return;
+    }
+    const semantic: HarnessSemanticEvent = {
+      line: this.lineOffset,
+      timestamp: new Date(nowMs),
+      recordType: "derived:status",
+      event: { kind: "status", role: "agent", payload },
+    };
+    const ctx = this.v2Context(this.sessionFile, this.sessionMeta);
+    const envelope = buildEventEnvelopeV2(ctx, semantic, this.nextV2Seq());
+    this.writeEnvelope(envelope);
+    this.publisher.publish(envelope);
+  }
+
+  private v2Context(sessionFile: string, meta: SessionMeta): EnvelopeContext {
+    return {
+      provider: this.config.provider,
+      command: this.config.agentBin,
+      argv: this.config.agentArgs,
+      scopeType: this.config.scope,
+      scopeKey: this.scopeKey(),
+      cwd: this.cwd,
+      wrapperSessionId: this.config.wrapperSessionId,
+      harnessSessionId: meta.sessionId,
+      bucketUnit: this.config.bucket,
+      sourcePath: sessionFile,
+    };
+  }
+
+  private nextV2Seq(): number {
+    const seq = this.v2Seq;
+    this.v2Seq += 1;
+    return seq;
+  }
+
+  private writeEnvelope(envelope: AnySessionEnvelope): void {
     const encoded = `${JSON.stringify(envelope)}\n`;
     if (this.config.dryRun) {
       this.dryRunOutput.write(encoded);
@@ -782,7 +918,7 @@ export class HarnessSessionTailer {
     writeFileSync(target, encoded, { encoding: "utf8", flag: "a" });
   }
 
-  private outputPath(envelope: SessionEnvelope): string {
+  private outputPath(envelope: AnySessionEnvelope): string {
     const bucketStart = new Date(envelope.bucket.start);
     const fileName = bucketFileName(bucketStart, this.config.bucket);
     if (this.config.scope === "session") {
@@ -828,32 +964,33 @@ export class SessionEnvelopePublisher {
     private readonly stderr: Writable,
   ) {}
 
-  public publish(envelope: SessionEnvelope): void {
+  public publish(envelope: AnySessionEnvelope): void {
+    const id = envelopeId(envelope);
     if (!this.config.dmRecipient || this.config.dryRun) {
       bridgeLog("publish.skip", {
-        id: envelope.message.id,
+        id,
         reason: !this.config.dmRecipient ? "no-dmRecipient" : "dryRun",
       });
       return;
     }
     bridgeLog("publish.enqueue", {
-      id: envelope.message.id,
-      role: envelope.message.role,
+      id,
+      role: envelopeRole(envelope),
       recipient: this.config.dmRecipient,
     });
     const run = this.queue
       .then(() => this.publishNow(envelope))
       .then(() => {
-        bridgeLog("publish.ok", { id: envelope.message.id });
+        bridgeLog("publish.ok", { id });
       })
       .catch((error: unknown) => {
         this.failures += 1;
         bridgeLog("publish.error", {
-          id: envelope.message.id,
+          id,
           error: error instanceof Error ? error.message : String(error),
         });
         this.stderr.write(
-          `tinyplace ${this.config.provider}: failed to DM session envelope ${envelope.message.id}: ${
+          `tinyplace ${this.config.provider}: failed to DM session envelope ${id}: ${
             error instanceof Error ? error.message : String(error)
           }\n`,
         );
@@ -870,7 +1007,7 @@ export class SessionEnvelopePublisher {
     return this.failures;
   }
 
-  private async publishNow(envelope: SessionEnvelope): Promise<void> {
+  private async publishNow(envelope: AnySessionEnvelope): Promise<void> {
     const ctx = await this.context();
     if (!ctx.signer) {
       throw new Error("DM forwarding requires a tiny.place signer");
@@ -948,6 +1085,18 @@ export class SessionEnvelopePublisher {
       `tiny.place contact request pending for ${recipient}; approve it in OpenHuman before DM forwarding`,
     );
   }
+}
+
+function envelopeId(envelope: AnySessionEnvelope): string {
+  return envelope.envelope_version === SESSION_ENVELOPE_VERSION_V2
+    ? envelope.event.id
+    : envelope.message.id;
+}
+
+function envelopeRole(envelope: AnySessionEnvelope): string {
+  return envelope.envelope_version === SESSION_ENVELOPE_VERSION_V2
+    ? envelope.event.role
+    : envelope.message.role;
 }
 
 function isNotAContactError(error: unknown): boolean {
