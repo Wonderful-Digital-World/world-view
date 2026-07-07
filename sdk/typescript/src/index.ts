@@ -137,6 +137,19 @@ export type {
 } from "./cli/harness-status.js";
 export { buildEventEnvelopeV2 } from "./cli/harness-envelope.js";
 export type { EnvelopeContext } from "./cli/harness-envelope.js";
+export {
+  applySessionEnvelope,
+  foldSessionEnvelopes,
+  initialSessionView,
+  isV2,
+  parseSessionEnvelope,
+} from "./cli/harness-consumer.js";
+export type {
+  FeedEntry,
+  SessionView,
+  SessionViewLimits,
+  ToolActivity,
+} from "./cli/harness-consumer.js";
 
 export type {
   X402PaymentRequired,
