@@ -238,6 +238,25 @@ describe("codexEventsFromLine", () => {
     });
   });
 
+  it("parses JSON-string arguments into structured input and a field display", () => {
+    const events = codexEventsFromLine(
+      claudeLine({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "shell",
+          call_id: "call_args",
+          arguments: '{"command":"cargo test","description":"run tests"}',
+        },
+      }),
+      6,
+    );
+    expect(events[0].event.payload).toMatchObject({
+      display: "cargo test",
+      input: { command: "cargo test", description: "run tests" },
+    });
+  });
+
   it("maps a function_call_output to a tool_result with the same call_id", () => {
     const events = codexEventsFromLine(
       claudeLine({

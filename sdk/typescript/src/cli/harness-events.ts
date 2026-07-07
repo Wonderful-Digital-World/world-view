@@ -277,7 +277,7 @@ export function codexEventsFromLine(
 
   if (type === "function_call" || type === "tool_search_call") {
     const toolName = asString(payload.name) ?? asString(payload.query) ?? "tool";
-    const input = payload.arguments ?? payload.query ?? payload.input;
+    const input = parseMaybeJson(payload.arguments) ?? payload.query ?? payload.input;
     return [
       {
         line,
@@ -327,6 +327,7 @@ export function codexEventsFromLine(
 
   if (type === "mcp_tool_call_begin") {
     const toolName = asString(payload.tool) ?? asString(payload.name) ?? "mcp";
+    const input = parseMaybeJson(payload.arguments);
     return [
       {
         line,
@@ -339,8 +340,8 @@ export function codexEventsFromLine(
             call_id: asString(payload.call_id) ?? asString(payload.id) ?? "",
             tool_name: toolName,
             tool_kind: "mcp",
-            display: toolDisplay(toolName, payload.arguments),
-            input: payload.arguments,
+            display: toolDisplay(toolName, input),
+            input,
           },
         },
       },
@@ -509,6 +510,27 @@ function textFromContent(content: unknown, allowedTypes: Set<string>): string {
       return text ? [text] : [];
     })
     .join("\n");
+}
+
+/**
+ * Codex serializes `function_call` / MCP `arguments` as a JSON string. Parse it
+ * back to structured data so `toolDisplay` can extract fields (command,
+ * file_path, …) and the published `input` matches Claude's object shape.
+ * Non-JSON or unparseable strings are returned untouched.
+ */
+function parseMaybeJson(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+    return value;
+  }
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return value;
+  }
 }
 
 function parseJsonObject(raw: string): Record<string, unknown> | undefined {
