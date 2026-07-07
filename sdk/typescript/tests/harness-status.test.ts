@@ -4,7 +4,10 @@ import {
   reduceStatus,
   tickStatus,
 } from "../src/cli/harness-status.js";
-import type { HarnessSemanticEvent } from "../src/cli/harness-events.js";
+import {
+  codexEventsFromLine,
+  type HarnessSemanticEvent,
+} from "../src/cli/harness-events.js";
 import type { HarnessEvent } from "../src/types/harness.js";
 
 function ev(inner: HarnessEvent, atMs = 1_000): HarnessSemanticEvent {
@@ -122,6 +125,26 @@ describe("reduceStatus", () => {
       ev({ kind: "lifecycle", role: "agent", payload: { phase: "session_end" } }),
     );
     expect(step.next.state).toBe("stopped");
+  });
+
+  it("keeps a timestamp-less Codex tool_call active instead of idling it", () => {
+    // A Codex record with no timestamp used to stamp the Unix epoch, so the
+    // activity clock never advanced and the very next tick idled a live session.
+    const [event] = codexEventsFromLine(
+      JSON.stringify({
+        type: "response_item",
+        payload: { type: "function_call", name: "shell", call_id: "c1", arguments: "{}" },
+      }),
+      1,
+    );
+    const step = reduceStatus(initialStatus(0), event);
+    expect(step.next.state).toBe("running_tool");
+    expect(step.next.lastEventAtMs).toBeGreaterThan(0);
+    const tick = tickStatus(step.next, step.next.lastEventAtMs + 1_000, {
+      idleAfterMs: 30_000,
+    });
+    expect(tick.emit).toBeUndefined();
+    expect(tick.next.state).toBe("running_tool");
   });
 
   it("ignores unknown events but advances the activity clock", () => {

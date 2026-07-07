@@ -572,11 +572,16 @@ function parseJsonObject(raw: string): Record<string, unknown> | undefined {
 }
 
 function parseTimestamp(value: unknown): Date {
+  // Default missing/invalid timestamps to receive time, not the Unix epoch.
+  // reduceStatus consumes this semantic timestamp; an epoch value never advances
+  // the activity clock, so the next tick sees the session as stale and flips a
+  // live session to idle right after a tool call or response. new Date() mirrors
+  // how the hook mappers stamp receivedAt for events with no source timestamp.
   if (typeof value !== "string") {
-    return new Date(0);
+    return new Date();
   }
   const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? new Date(0) : parsed;
+  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
 }
 
 function asObject(value: unknown): Record<string, unknown> | undefined {
