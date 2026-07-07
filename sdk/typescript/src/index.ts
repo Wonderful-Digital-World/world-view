@@ -127,6 +127,11 @@ export type {
   HarnessSemanticEvent,
 } from "./cli/harness-events.js";
 export {
+  claudeHookEventToSemantic,
+  claudeHookEventsFromStdin,
+  claudeHookStringToSemantic,
+} from "./cli/harness-hooks.js";
+export {
   initialStatus,
   reduceStatus,
   tickStatus,
