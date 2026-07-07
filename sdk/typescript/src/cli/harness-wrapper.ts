@@ -29,6 +29,7 @@ import {
   type HarnessProvider,
   type SessionEnvelope,
 } from "../types/harness.js";
+import { bridgeLog } from "./bridge-debug.js";
 import { makeContext } from "./context.js";
 import type { TinyPlaceCliOptions, TinyPlaceCliResult } from "./types.js";
 import type { Writable } from "node:stream";
@@ -186,7 +187,10 @@ export async function runHarnessCommand(
 
   const usePty = config.usePty && options.spawn === undefined;
   writer.pty = usePty;
-  writer.write("lifecycle", `start ${launch.command} ${launch.args.join(" ")}`.trim());
+  writer.write(
+    "lifecycle",
+    `start ${launch.command} ${launch.args.join(" ")}`.trim(),
+  );
   sessionTailer?.start(new Date());
   // Publish keys + start the inbound poll before spawn; injection stays a no-op
   // until the child registers its input sink below. Guarded (not `?.`) so the
@@ -200,14 +204,27 @@ export async function runHarnessCommand(
     : undefined;
   const exitCode = usePty
     ? await runPtyAgent(launch, config, cwd, env, writer, stdio, onInputSink)
-    : await runPipeAgent(launch, config, cwd, env, writer, stdio, spawnFn, onInputSink);
+    : await runPipeAgent(
+        launch,
+        config,
+        cwd,
+        env,
+        writer,
+        stdio,
+        spawnFn,
+        onInputSink,
+      );
 
   const dmFailures = (await sessionTailer?.stop()) ?? 0;
   if (receiver) {
     await receiver.stop();
   }
 
-  return { code: exitCode === 0 && dmFailures > 0 ? 1 : exitCode, stdout: "", stderr: "" };
+  return {
+    code: exitCode === 0 && dmFailures > 0 ? 1 : exitCode,
+    stdout: "",
+    stderr: "",
+  };
 }
 
 async function runPtyAgent(
@@ -232,9 +249,20 @@ async function runPtyAgent(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     writer.write("lifecycle", `node-pty unavailable: ${message}`);
-    stdio.stderr.write(`tinyplace ${config.provider}: node-pty unavailable: ${message}\n`);
+    stdio.stderr.write(
+      `tinyplace ${config.provider}: node-pty unavailable: ${message}\n`,
+    );
     writer.pty = false;
-    return runPipeAgent(launch, config, cwd, env, writer, stdio, spawnChild, onInputSink);
+    return runPipeAgent(
+      launch,
+      config,
+      cwd,
+      env,
+      writer,
+      stdio,
+      spawnChild,
+      onInputSink,
+    );
   }
 
   writer.pid = pty.pid;
@@ -292,7 +320,11 @@ async function runPipeAgent(
 ): Promise<number> {
   const child = spawnFn(launch.command, launch.args, {
     cwd,
-    env: { ...process.env, ...env, TERM: env.TERM ?? process.env.TERM ?? "xterm-256color" },
+    env: {
+      ...process.env,
+      ...env,
+      TERM: env.TERM ?? process.env.TERM ?? "xterm-256color",
+    },
   });
 
   if (child.pid !== undefined) {
@@ -356,8 +388,10 @@ export function parseHarnessWrapperArgs(
   const profile = PROFILES[provider];
   const agentArgs: Array<string> = [];
   const outDir =
-    firstEnv(env, [`TINYPLACE_${provider.toUpperCase()}_ENVELOPES`, "TINYPLACE_HARNESS_ENVELOPES"]) ??
-    profile.defaultOutDir;
+    firstEnv(env, [
+      `TINYPLACE_${provider.toUpperCase()}_ENVELOPES`,
+      "TINYPLACE_HARNESS_ENVELOPES",
+    ]) ?? profile.defaultOutDir;
   const owner = configuredRecipient(provider, env);
   // Inbound receive-from: an explicit override, else the same owner we DM to.
   // Receive is ON by default whenever an owner is known, unless TINYPLACE_..._RECEIVE=0.
@@ -367,8 +401,10 @@ export function parseHarnessWrapperArgs(
       "TINYPLACE_HARNESS_RECEIVE_FROM",
     ]) ?? owner;
   const receiveDisabled =
-    firstEnv(env, [`TINYPLACE_${provider.toUpperCase()}_RECEIVE`, "TINYPLACE_HARNESS_RECEIVE"]) ===
-    "0";
+    firstEnv(env, [
+      `TINYPLACE_${provider.toUpperCase()}_RECEIVE`,
+      "TINYPLACE_HARNESS_RECEIVE",
+    ]) === "0";
   const config: HarnessWrapperConfig = {
     agentArgs,
     agentBin: firstEnv(env, profile.binEnv) ?? profile.defaultBin,
@@ -467,7 +503,10 @@ export function parseHarnessWrapperArgs(
         index += 1;
         break;
       case "--tinyplace-receive-poll-ms":
-        config.receivePollMs = parsePositiveInteger(token, requiredValue(token, next));
+        config.receivePollMs = parsePositiveInteger(
+          token,
+          requiredValue(token, next),
+        );
         index += 1;
         break;
       case "--tinyplace-no-input":
@@ -502,11 +541,17 @@ export function parseHarnessWrapperArgs(
         index += 1;
         break;
       case "--tinyplace-session-poll-ms":
-        config.sessionPollMs = parsePositiveInteger(token, requiredValue(token, next));
+        config.sessionPollMs = parsePositiveInteger(
+          token,
+          requiredValue(token, next),
+        );
         index += 1;
         break;
       case "--tinyplace-session-tail-grace-ms":
-        config.sessionTailGraceMs = parsePositiveInteger(token, requiredValue(token, next));
+        config.sessionTailGraceMs = parsePositiveInteger(
+          token,
+          requiredValue(token, next),
+        );
         index += 1;
         break;
       case "--tinyplace-sessions-dir":
@@ -521,7 +566,9 @@ export function parseHarnessWrapperArgs(
   return config;
 }
 
-export function asCodexWrapperConfig(config: HarnessWrapperConfig): CodexWrapperConfig {
+export function asCodexWrapperConfig(
+  config: HarnessWrapperConfig,
+): CodexWrapperConfig {
   return {
     ...config,
     codexArgs: config.agentArgs,
@@ -551,6 +598,16 @@ export class HarnessSessionTailer {
   public start(startedAt: Date): void {
     this.startedAt = startedAt;
     this.ignoredSessionFiles = new Set(listSessionFiles(this.config));
+    bridgeLog("tailer.start", {
+      startedAt: startedAt.toISOString(),
+      cwd: this.cwd,
+      provider: this.config.provider,
+      pollMs: this.config.sessionPollMs,
+      sessionFileOverride: this.config.sessionFile,
+      // Pre-existing sessions we will skip (only NEWER files get tailed).
+      ignoredCount: this.ignoredSessionFiles.size,
+      ignored: [...this.ignoredSessionFiles],
+    });
     this.timer = setInterval(() => {
       this.poll(startedAt);
     }, this.config.sessionPollMs);
@@ -578,26 +635,50 @@ export class HarnessSessionTailer {
       this.sessionFile = located.path;
       this.sessionMeta = located.meta;
       this.lineOffset = 0;
+      bridgeLog("tailer.located", {
+        path: located.path,
+        sessionId: located.meta?.sessionId,
+        metaCwd: located.meta?.cwd,
+      });
     }
 
     const lines = readNewLines(this.sessionFile, this.lineOffset);
     this.lineOffset += lines.length;
-    for (const { line, raw } of lines) {
-      for (const message of semanticMessagesFromLine(this.config.provider, raw, line)) {
-        this.write(message);
+    if (lines.length > 0) {
+      let semanticCount = 0;
+      for (const { line, raw } of lines) {
+        for (const message of semanticMessagesFromLine(
+          this.config.provider,
+          raw,
+          line,
+        )) {
+          semanticCount += 1;
+          this.write(message);
+        }
       }
+      bridgeLog("tailer.poll", {
+        newLines: lines.length,
+        semanticMessages: semanticCount,
+        lineOffset: this.lineOffset,
+      });
     }
   }
 
-  private locateSession(startedAt: Date): { meta: SessionMeta; path: string } | undefined {
+  private locateSession(
+    startedAt: Date,
+  ): { meta: SessionMeta; path: string } | undefined {
     if (this.config.sessionFile) {
-      const meta = readSessionMeta(this.config.provider, this.config.sessionFile) ?? {
+      const meta = readSessionMeta(
+        this.config.provider,
+        this.config.sessionFile,
+      ) ?? {
         sessionId: basename(this.config.sessionFile),
       };
       return { meta, path: this.config.sessionFile };
     }
 
-    const candidates = listSessionFiles(this.config)
+    const all = listSessionFiles(this.config);
+    const fresh = all
       .filter((path) => !this.ignoredSessionFiles.has(path))
       .filter((path) => {
         try {
@@ -605,12 +686,32 @@ export class HarnessSessionTailer {
         } catch {
           return false;
         }
-      })
-      .map((path) => ({ meta: readSessionMeta(this.config.provider, path), path }))
+      });
+    const withMeta = fresh.map((path) => ({
+      meta: readSessionMeta(this.config.provider, path),
+      path,
+    }));
+    const candidates = withMeta
       .filter((entry): entry is { meta: SessionMeta; path: string } => {
         return entry.meta?.cwd === this.cwd;
       })
-      .sort((left, right) => statSync(right.path).mtimeMs - statSync(left.path).mtimeMs);
+      .sort(
+        (left, right) =>
+          statSync(right.path).mtimeMs - statSync(left.path).mtimeMs,
+      );
+    // Only log when there ARE fresh candidates but none matched, or when we found
+    // one — avoids spamming the log every poll before the session file exists.
+    if (fresh.length > 0 && candidates.length === 0) {
+      bridgeLog("tailer.locate.cwdMismatch", {
+        wantCwd: this.cwd,
+        freshCount: fresh.length,
+        // Surface the cwd each fresh session recorded so a mismatch is obvious.
+        sawCwds: withMeta.map((entry) => ({
+          path: entry.path,
+          cwd: entry.meta?.cwd,
+        })),
+      });
+    }
     return candidates[0];
   }
 
@@ -641,7 +742,12 @@ export class HarnessSessionTailer {
         argv: this.config.agentArgs,
       },
       message: {
-        id: stableEventId(this.sessionMeta.sessionId, message.role, message.line, message.text),
+        id: stableEventId(
+          this.sessionMeta.sessionId,
+          message.role,
+          message.line,
+          message.text,
+        ),
         line: message.line,
         ...(message.phase ? { phase: message.phase } : {}),
         role: message.role,
@@ -654,6 +760,13 @@ export class HarnessSessionTailer {
         ...(message.sourceRole ? { source_role: message.sourceRole } : {}),
       },
     };
+    bridgeLog("tailer.message", {
+      id: envelope.message.id,
+      role: message.role,
+      line: message.line,
+      recordType: message.recordType,
+      textPreview: message.text,
+    });
     this.writeEnvelope(envelope);
     this.publisher.publish(envelope);
   }
@@ -681,23 +794,30 @@ export class HarnessSessionTailer {
         fileName,
       );
     }
-    return join(this.config.outDir, "messages", "folders", safeSlug(this.scopeKey()), fileName);
+    return join(
+      this.config.outDir,
+      "messages",
+      "folders",
+      safeSlug(this.scopeKey()),
+      fileName,
+    );
   }
 
   private scopeKey(): string {
     if (this.config.scope === "session") {
       return this.config.wrapperSessionId;
     }
-    const digest = createHash("sha256").update(this.cwd).digest("hex").slice(0, 12);
+    const digest = createHash("sha256")
+      .update(this.cwd)
+      .digest("hex")
+      .slice(0, 12);
     return `${basename(this.cwd) || "root"}-${digest}`;
   }
 }
 
 export class SessionEnvelopePublisher {
   private contactPromise: Promise<string> | undefined;
-  private contextPromise:
-    | ReturnType<typeof makeContext>
-    | undefined;
+  private contextPromise: ReturnType<typeof makeContext> | undefined;
   private failures = 0;
   private pending = new Set<Promise<void>>();
   private queue: Promise<void> = Promise.resolve();
@@ -710,12 +830,28 @@ export class SessionEnvelopePublisher {
 
   public publish(envelope: SessionEnvelope): void {
     if (!this.config.dmRecipient || this.config.dryRun) {
+      bridgeLog("publish.skip", {
+        id: envelope.message.id,
+        reason: !this.config.dmRecipient ? "no-dmRecipient" : "dryRun",
+      });
       return;
     }
+    bridgeLog("publish.enqueue", {
+      id: envelope.message.id,
+      role: envelope.message.role,
+      recipient: this.config.dmRecipient,
+    });
     const run = this.queue
       .then(() => this.publishNow(envelope))
+      .then(() => {
+        bridgeLog("publish.ok", { id: envelope.message.id });
+      })
       .catch((error: unknown) => {
         this.failures += 1;
+        bridgeLog("publish.error", {
+          id: envelope.message.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
         this.stderr.write(
           `tinyplace ${this.config.provider}: failed to DM session envelope ${envelope.message.id}: ${
             error instanceof Error ? error.message : String(error)
@@ -741,14 +877,24 @@ export class SessionEnvelopePublisher {
     }
     const recipient = await this.ensureContact(ctx);
     try {
-      await sendMessage(ctx.client, ctx.signer, recipient, JSON.stringify(envelope));
+      await sendMessage(
+        ctx.client,
+        ctx.signer,
+        recipient,
+        JSON.stringify(envelope),
+      );
     } catch (error) {
       if (!isNotAContactError(error)) {
         throw error;
       }
       this.contactPromise = undefined;
       const refreshedRecipient = await this.ensureContact(ctx);
-      await sendMessage(ctx.client, ctx.signer, refreshedRecipient, JSON.stringify(envelope));
+      await sendMessage(
+        ctx.client,
+        ctx.signer,
+        refreshedRecipient,
+        JSON.stringify(envelope),
+      );
     }
   }
 
@@ -763,16 +909,23 @@ export class SessionEnvelopePublisher {
     return this.contextPromise;
   }
 
-  private ensureContact(ctx: Awaited<ReturnType<typeof makeContext>>): Promise<string> {
+  private ensureContact(
+    ctx: Awaited<ReturnType<typeof makeContext>>,
+  ): Promise<string> {
     this.contactPromise ??= this.ensureContactNow(ctx);
     return this.contactPromise;
   }
 
-  private async ensureContactNow(ctx: Awaited<ReturnType<typeof makeContext>>): Promise<string> {
+  private async ensureContactNow(
+    ctx: Awaited<ReturnType<typeof makeContext>>,
+  ): Promise<string> {
     if (!ctx.signer) {
       throw new Error("DM forwarding requires a tiny.place signer");
     }
-    const recipient = await resolveRecipientKey(ctx.client, this.config.dmRecipient ?? "");
+    const recipient = await resolveRecipientKey(
+      ctx.client,
+      this.config.dmRecipient ?? "",
+    );
     if (recipient === ctx.signer.agentId) {
       return recipient;
     }
@@ -787,7 +940,9 @@ export class SessionEnvelopePublisher {
       return recipient;
     }
     if (status.status === "blocked") {
-      throw new Error(`tiny.place contact blocked for ${recipient}; unblock before DM forwarding`);
+      throw new Error(
+        `tiny.place contact blocked for ${recipient}; unblock before DM forwarding`,
+      );
     }
     throw new Error(
       `tiny.place contact request pending for ${recipient}; approve it in OpenHuman before DM forwarding`,
@@ -796,9 +951,16 @@ export class SessionEnvelopePublisher {
 }
 
 function isNotAContactError(error: unknown): boolean {
-  const body = typeof error === "object" && error !== null ? (error as { body?: unknown }).body : undefined;
+  const body =
+    typeof error === "object" && error !== null
+      ? (error as { body?: unknown }).body
+      : undefined;
   const bodyText =
-    typeof body === "string" ? body : body !== undefined ? JSON.stringify(body) : "";
+    typeof body === "string"
+      ? body
+      : body !== undefined
+        ? JSON.stringify(body)
+        : "";
   const message = error instanceof Error ? error.message : String(error);
   return /not[_ ]a[_ ]contact/i.test(`${message} ${bodyText}`);
 }
@@ -858,7 +1020,10 @@ export class InboundMessageReceiver {
     }
     if (this.config.receiveFrom) {
       try {
-        this.ownerAddress = await resolveRecipientKey(ctx.client, this.config.receiveFrom);
+        this.ownerAddress = await resolveRecipientKey(
+          ctx.client,
+          this.config.receiveFrom,
+        );
         await this.ensureOwnerContact(ctx, this.ownerAddress);
       } catch (error) {
         this.stderr.write(
@@ -866,6 +1031,12 @@ export class InboundMessageReceiver {
         );
       }
     }
+    bridgeLog("receiver.start", {
+      agentId: ctx.signer.agentId,
+      ownerAddress: this.ownerAddress,
+      receiveFrom: this.config.receiveFrom,
+      pollMs: this.config.receivePollMs,
+    });
     this.timer = setInterval(() => void this.poll(), this.config.receivePollMs);
   }
 
@@ -916,16 +1087,33 @@ export class InboundMessageReceiver {
       if (!ctx.signer) {
         return;
       }
-      const messages = await readMessages(ctx.client, ctx.signer, { limit: 50 });
+      const messages = await readMessages(ctx.client, ctx.signer, {
+        limit: 50,
+      });
+      let injected = 0;
+      let dropped = 0;
       for (const message of messages) {
         const text = this.filterAndParse(message);
         if (text !== undefined && this.sink) {
+          injected += 1;
           // "\r" (carriage return) submits the prompt to the agent TUI.
           this.sink(`${text}\r`);
+        } else {
+          dropped += 1;
         }
       }
-    } catch {
+      if (messages.length > 0) {
+        bridgeLog("receiver.poll", {
+          read: messages.length,
+          injected,
+          dropped,
+        });
+      }
+    } catch (error) {
       // transient relay / decrypt hiccup — retry on the next tick
+      bridgeLog("receiver.poll.error", {
+        error: error instanceof Error ? error.message : String(error),
+      });
     } finally {
       this.draining = false;
     }
@@ -954,7 +1142,8 @@ export class InboundMessageReceiver {
     if (
       typeof parsed !== "object" ||
       parsed === null ||
-      (parsed as { envelope_version?: unknown }).envelope_version !== SESSION_ENVELOPE_VERSION_V1
+      (parsed as { envelope_version?: unknown }).envelope_version !==
+        SESSION_ENVELOPE_VERSION_V1
     ) {
       return raw;
     }
@@ -962,7 +1151,9 @@ export class InboundMessageReceiver {
     // loosely. Drop auto/echo turns so the bridge never ping-pongs.
     const obj = parsed as Record<string, unknown>;
     const tpAuto = (obj.tp as { auto?: unknown } | undefined)?.auto;
-    const messageObj = obj.message as { text?: unknown; tp?: { auto?: unknown } } | undefined;
+    const messageObj = obj.message as
+      | { text?: unknown; tp?: { auto?: unknown } }
+      | undefined;
     if (tpAuto || messageObj?.tp?.auto) {
       return undefined;
     }
@@ -1043,16 +1234,29 @@ class TerminalEnvelopeWriter {
     const bucketStart = new Date(envelope.bucket.start);
     const fileName = bucketFileName(bucketStart, this.config.bucket);
     if (this.config.scope === "session") {
-      return join(this.config.outDir, "sessions", safeSlug(this.config.wrapperSessionId), fileName);
+      return join(
+        this.config.outDir,
+        "sessions",
+        safeSlug(this.config.wrapperSessionId),
+        fileName,
+      );
     }
-    return join(this.config.outDir, "folders", safeSlug(this.scopeKey()), fileName);
+    return join(
+      this.config.outDir,
+      "folders",
+      safeSlug(this.scopeKey()),
+      fileName,
+    );
   }
 
   private scopeKey(): string {
     if (this.config.scope === "session") {
       return this.config.wrapperSessionId;
     }
-    const digest = createHash("sha256").update(this.cwd).digest("hex").slice(0, 12);
+    const digest = createHash("sha256")
+      .update(this.cwd)
+      .digest("hex")
+      .slice(0, 12);
     return `${basename(this.cwd) || "root"}-${digest}`;
   }
 }
@@ -1079,7 +1283,9 @@ function restoreInput(
   }
 }
 
-function childEnv(env: Record<string, string | undefined>): Record<string, string> {
+function childEnv(
+  env: Record<string, string | undefined>,
+): Record<string, string> {
   const merged: Record<string, string | undefined> = {
     ...process.env,
     ...env,
@@ -1100,7 +1306,8 @@ function terminalName(env: Record<string, string | undefined>): string {
 }
 
 function terminalColumns(stdout: Writable): number {
-  const columns = (stdout as { columns?: number }).columns ?? process.stdout.columns ?? 80;
+  const columns =
+    (stdout as { columns?: number }).columns ?? process.stdout.columns ?? 80;
   return Math.max(20, columns);
 }
 
@@ -1118,7 +1325,12 @@ function fixNodePtyHelperPermissions(): void {
   }
   for (const helperPath of [
     join(packageDir, "build", "Release", "spawn-helper"),
-    join(packageDir, "prebuilds", `${process.platform}-${process.arch}`, "spawn-helper"),
+    join(
+      packageDir,
+      "prebuilds",
+      `${process.platform}-${process.arch}`,
+      "spawn-helper",
+    ),
   ]) {
     if (!existsSync(helperPath)) {
       continue;
@@ -1141,7 +1353,8 @@ function listSessionFiles(config: HarnessWrapperConfig): Array<string> {
       } else if (
         entry.isFile() &&
         entry.name.endsWith(".jsonl") &&
-        (!profile.sessionFilePrefix || entry.name.startsWith(profile.sessionFilePrefix))
+        (!profile.sessionFilePrefix ||
+          entry.name.startsWith(profile.sessionFilePrefix))
       ) {
         out.push(path);
       }
@@ -1151,7 +1364,10 @@ function listSessionFiles(config: HarnessWrapperConfig): Array<string> {
   return out;
 }
 
-function readSessionMeta(provider: HarnessProvider, path: string): SessionMeta | undefined {
+function readSessionMeta(
+  provider: HarnessProvider,
+  path: string,
+): SessionMeta | undefined {
   for (const raw of readAllLines(path)) {
     const record = parseJsonObject(raw);
     if (!record) {
@@ -1162,7 +1378,8 @@ function readSessionMeta(provider: HarnessProvider, path: string): SessionMeta |
       if (!payload) {
         continue;
       }
-      const sessionId = asString(payload.id) ?? asString(payload.session_id) ?? basename(path);
+      const sessionId =
+        asString(payload.id) ?? asString(payload.session_id) ?? basename(path);
       return {
         ...(asString(payload.cwd) ? { cwd: asString(payload.cwd) } : {}),
         sessionId,
@@ -1179,7 +1396,10 @@ function readSessionMeta(provider: HarnessProvider, path: string): SessionMeta |
   return undefined;
 }
 
-function readNewLines(path: string, lineOffset: number): Array<{ line: number; raw: string }> {
+function readNewLines(
+  path: string,
+  lineOffset: number,
+): Array<{ line: number; raw: string }> {
   return readAllLines(path)
     .map((raw, index) => ({ line: index + 1, raw }))
     .filter((entry) => entry.line > lineOffset);
@@ -1187,7 +1407,9 @@ function readNewLines(path: string, lineOffset: number): Array<{ line: number; r
 
 function readAllLines(path: string): Array<string> {
   try {
-    return readFileSync(path, "utf8").split(/\r?\n/).filter((line) => line.length > 0);
+    return readFileSync(path, "utf8")
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0);
   } catch {
     return [];
   }
@@ -1203,7 +1425,10 @@ function semanticMessagesFromLine(
     : codexSemanticMessagesFromLine(raw, line);
 }
 
-function codexSemanticMessagesFromLine(raw: string, line: number): Array<SemanticMessage> {
+function codexSemanticMessagesFromLine(
+  raw: string,
+  line: number,
+): Array<SemanticMessage> {
   const record = parseJsonObject(raw);
   if (!record) {
     return [];
@@ -1230,8 +1455,15 @@ function codexSemanticMessagesFromLine(raw: string, line: number): Array<Semanti
     ];
   }
 
-  if (record.type === "response_item" && payload.type === "message" && payload.role === "assistant") {
-    const text = textFromContent(payload.content, new Set(["output_text", "text"]));
+  if (
+    record.type === "response_item" &&
+    payload.type === "message" &&
+    payload.role === "assistant"
+  ) {
+    const text = textFromContent(
+      payload.content,
+      new Set(["output_text", "text"]),
+    );
     if (!text) {
       return [];
     }
@@ -1251,7 +1483,10 @@ function codexSemanticMessagesFromLine(raw: string, line: number): Array<Semanti
   return [];
 }
 
-function claudeSemanticMessagesFromLine(raw: string, line: number): Array<SemanticMessage> {
+function claudeSemanticMessagesFromLine(
+  raw: string,
+  line: number,
+): Array<SemanticMessage> {
   const record = parseJsonObject(raw);
   if (!record) {
     return [];
@@ -1433,7 +1668,12 @@ function bucketFileName(value: Date, unit: HarnessBucketUnit): string {
   return `${year}-${month}-${day}.jsonl`;
 }
 
-function stableEventId(sessionId: string, stream: string, sequence: number, text: string): string {
+function stableEventId(
+  sessionId: string,
+  stream: string,
+  sequence: number,
+  text: string,
+): string {
   return createHash("sha256")
     .update(`${sessionId}\0${stream}\0${sequence}\0${text}`)
     .digest("hex");
@@ -1448,7 +1688,9 @@ function pad2(value: number): string {
 }
 
 function safeSlug(value: string): string {
-  return value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown";
+  return (
+    value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown"
+  );
 }
 
 function firstEnv(
