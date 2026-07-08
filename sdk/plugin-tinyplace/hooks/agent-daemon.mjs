@@ -19,11 +19,21 @@ import { FileSessionStore } from "@tinyhumansai/tinyplace/node";
 import { sendMessage, readMessages, publishKeys } from "@tinyhumansai/tinyplace/agent";
 
 import { buildEnvelope, decodeBody } from "../mcp/format.mjs";
-import { liveSessions, sessionUuidForConversation } from "../mcp/registry.mjs";
+import { liveSessions, resolveConversationUuid, sessionUuidForConversation } from "../mcp/registry.mjs";
+import {
+  DEFAULT_CAPABILITIES,
+  buildSessionInfoEnvelope,
+  gitInfo,
+  loadEmitted,
+  ownerAddress,
+  persistEmitted,
+  planSessionInfoEmit,
+  sessionTitle,
+} from "../mcp/session-info.mjs";
 import { enqueueRouted, redeliverUnrouted, reapClosedTargets } from "../mcp/routing.mjs";
 import { claimOutboxJobs, writeOutboxJob } from "../mcp/outbox.mjs";
 import { acquireLock, heartbeatLock, releaseLock } from "../mcp/daemon-lock.mjs";
-import { toCryptoId } from "../mcp/address.mjs";
+import { isCryptoId, toCryptoId } from "../mcp/address.mjs";
 import { harnessDataDir } from "../mcp/harness.mjs";
 import { foregroundInject } from "../mcp/foreground-inject.mjs";
 import { loadWallets } from "../mcp/wallets.mjs";
@@ -220,6 +230,141 @@ async function drainOutbound() {
   }
 }
 
+// ── session_info emit (contact-gated intro) ──────────────────────────────────
+// Announce each live session to the agent's owner (the OpenHuman "Master") the
+// moment it inits, so the owner registers + renders the session before it acts.
+// A single relationship (contacts are per-identity) covers ALL sessions, so this
+// sends ONE contact request per identity, then flushes one session_info per
+// pending session on accept. See mcp/session-info.mjs + spec §3. Feature is OFF
+// (pure no-op) unless TINYPLACE_OWNER_ADDRESS names the owner.
+const OWNER_RAW = ownerAddress();
+// Read once: plugin version (harness_version) + the agent's @handle (best-effort).
+let pluginVersion = "";
+try {
+  pluginVersion = JSON.parse(readFileSync(join(PLUGIN_ROOT, "package.json"), "utf8"))?.version ?? "";
+} catch { /* omit harness_version */ }
+let agentHandle = null; // "@name" or null; resolved lazily on first service tick
+let ownerCryptoId; // undefined = unresolved, null = unresolvable, else the cryptoId
+let ownerContactRequested = false; // one contact_add per identity (never per session)
+let prekeyBackoffUntil = 0; // contact-accepted ≠ messageable: back off until prekeys land
+let prekeyBackoffMs = 0;
+const sessionInfoSent = new Set(); // sessionUuids announced THIS daemon run
+const priorEmitted = loadEmitted(AGENT); // announced in a PRIOR run → re-emit resumed:true
+let sessionInfoBusy = false;
+
+// The owner has a usable prekey bundle (so a first DM can run X3DH). getBundle
+// 404s when none is provisioned yet — the resolve-then-404 gap — so a throw here
+// means "not messageable yet, back off". A resolved bundle means go.
+async function ownerMessageable(owner) {
+  try {
+    const bundle = await client.keys.getBundle(owner);
+    return !!(bundle && bundle.identityKey && bundle.signedPreKey);
+  } catch {
+    return false;
+  }
+}
+
+async function serviceSessionInfo() {
+  if (!OWNER_RAW || sessionInfoBusy) return;
+  const live = liveSessions(AGENT).filter((s) => s.sessionUuid);
+  if (live.length === 0) return; // nothing to announce yet
+  // Compute the pending set BEFORE any network call so steady-state (every live
+  // session already announced this run) is a pure no-op — no per-tick relay chatter.
+  const plans = planSessionInfoEmit({
+    liveSessionUuids: live.map((s) => s.sessionUuid),
+    priorEmitted,
+    sentThisRun: sessionInfoSent,
+  });
+  if (plans.length === 0) return;
+  sessionInfoBusy = true;
+  try {
+    if (ownerCryptoId === undefined) {
+      // toCryptoId returns the original @handle unchanged when a directory lookup
+      // fails (owner not registered yet / transient), so only CACHE a real base58
+      // id; otherwise leave it unresolved and retry next tick.
+      let resolved;
+      try { resolved = await toCryptoId(client, OWNER_RAW); } catch { return; }
+      if (!isCryptoId(resolved)) return; // not resolvable yet — retry next tick
+      ownerCryptoId = resolved;
+    }
+    const owner = ownerCryptoId;
+
+    // Contact gate: request once, then wait for the owner to accept.
+    let status;
+    try { status = (await client.contacts.status(owner))?.status; } catch { return; }
+    if (status !== "accepted") {
+      if (!ownerContactRequested) {
+        ownerContactRequested = true;
+        try { await client.contacts.request(owner); } catch { ownerContactRequested = false; }
+      }
+      return; // REQUESTED — flush deferred until accept
+    }
+
+    // Prekey presence (accepted ≠ messageable) with exponential backoff.
+    if (Date.now() < prekeyBackoffUntil) return;
+    if (!(await ownerMessageable(owner))) {
+      prekeyBackoffMs = Math.min(prekeyBackoffMs ? prekeyBackoffMs * 2 : POLL_INTERVAL_MS, 60_000);
+      prekeyBackoffUntil = Date.now() + prekeyBackoffMs;
+      return;
+    }
+    prekeyBackoffMs = 0;
+    prekeyBackoffUntil = 0;
+
+    // Resolve the agent's own @handle once (UI metadata; best-effort).
+    if (agentHandle === null) {
+      try {
+        const card = await client.directory.getAgent(AGENT);
+        if (card?.username) agentHandle = `@${card.username}`;
+      } catch { /* omit handle */ }
+    }
+
+    // FLUSH: one session_info per pending session (resumed:false fresh /
+    // resumed:true on reconnect). Mark sent only on a successful send so a
+    // transient failure retries next tick.
+    let sentAny = false;
+    for (const plan of plans) {
+      const session = live.find((s) => s.sessionUuid === plan.sessionUuid);
+      if (!session) continue;
+      const convUuid = resolveConversationUuid(plan.sessionUuid, owner);
+      const { repo, branch } = await gitInfo(session.cwd);
+      const body = buildSessionInfoEnvelope({
+        agentAddress: AGENT,
+        wrapperSessionId: convUuid,
+        harnessSessionId: session.harnessSessionId,
+        cwd: session.cwd,
+        label: session.label,
+        handle: agentHandle ?? undefined,
+        title: sessionTitle({ cwd: session.cwd, branch, repo, label: session.label }),
+        repo: repo ?? undefined,
+        branch: branch ?? undefined,
+        harnessVersion: pluginVersion || undefined,
+        capabilities: DEFAULT_CAPABILITIES,
+        resumed: plan.resumed,
+        seq: plan.seq,
+        startedAt: session.startedAt,
+      });
+      try {
+        await sendMessage(client, signer, owner, body);
+        sessionInfoSent.add(plan.sessionUuid);
+        priorEmitted.add(plan.sessionUuid);
+        sentAny = true;
+      } catch {
+        // 403 (contact race) / transient / resolve-then-404 — retry next tick.
+      }
+    }
+    // Persist once per flush (not per send). Prune to currently-live sessions so
+    // the record stays bounded — a dead session never needs a resumed re-emit
+    // (a resumed harness keeps its sessionUuid and is live again on restart).
+    if (sentAny) {
+      const liveSet = new Set(live.map((s) => s.sessionUuid));
+      for (const uuid of priorEmitted) if (!liveSet.has(uuid)) priorEmitted.delete(uuid);
+      persistEmitted(AGENT, priorEmitted);
+    }
+  } finally {
+    sessionInfoBusy = false;
+  }
+}
+
 // ── closed-session notices ───────────────────────────────────────────────────
 // A message addressed to a specific session (to_session) that never came (back)
 // live within the grace window is abandoned. Send the sender ONE auto-tagged
@@ -279,6 +424,7 @@ const pollTimer = setInterval(() => {
     await drainInbound();
     notifyClosedTargets(); // reap+notify mail bound to a session that stayed gone
     await drainOutbound(); // sends the notices just enqueued
+    await serviceSessionInfo(); // announce new/reconnected sessions to the owner
     if (checkIdle()) shutdown(0);
   })();
 }, POLL_INTERVAL_MS);
@@ -290,4 +436,4 @@ const heartbeatTimer = setInterval(() => {
 for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => shutdown(0));
 
 // Kick an immediate cycle so a just-started session sees prompt service.
-void (async () => { await drainOutbound(); await drainInbound(); })();
+void (async () => { await drainOutbound(); await drainInbound(); await serviceSessionInfo(); })();
