@@ -65,6 +65,7 @@ export type HarnessEventRole = "owner" | "agent";
 
 // axis 2 — kind (content discriminator; the field the orchestrator switches on).
 export type HarnessEventKind =
+  | "session_info"
   | "user_prompt"
   | "agent_message"
   | "agent_thinking"
@@ -96,6 +97,24 @@ export type HarnessSessionState =
   | "idle"
   | "stopped"
   | "errored";
+
+// `session_info` — the session intro/announce, emitted once a wrapped session is
+// initialized (and a contact relationship with the owner exists). Thin by design:
+// provider/cwd/session-ids ride on the envelope frame (scope/harness), so this
+// payload carries only what the frame lacks — identity confirmation, UI metadata,
+// advertised capabilities, and resume/idempotency signals.
+export interface SessionInfoPayload {
+  agent_address: string; // base58 wallet identity (confirms envelope.from)
+  handle?: string; // @handle, if registered
+  title?: string; // human-friendly session title for the UI header
+  repo?: string; // git remote/slug, if in a repo
+  branch?: string; // git branch
+  model?: string; // active model (may also ride on event.model)
+  harness_version?: string; // plugin/CLI version — compat gating
+  capabilities: Array<HarnessEventKind>; // event kinds this session will emit (feature-gate UI)
+  resumed: boolean; // false = fresh spawn, true = reconnect/resume (idempotency)
+  started_at: string; // ISO-8601 session start
+}
 
 export interface UserPromptPayload {
   text: string;
@@ -156,6 +175,7 @@ export interface UnknownPayload {
 // discriminated union: kind <-> payload, with the coarse role fixed per kind
 // (owner iff kind === "user_prompt", else agent).
 export type HarnessEvent =
+  | { kind: "session_info"; role: "agent"; payload: SessionInfoPayload }
   | { kind: "user_prompt"; role: "owner"; payload: UserPromptPayload }
   | { kind: "agent_message"; role: "agent"; payload: AgentMessagePayload }
   | { kind: "agent_thinking"; role: "agent"; payload: AgentThinkingPayload }

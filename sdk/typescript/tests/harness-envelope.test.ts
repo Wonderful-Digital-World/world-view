@@ -4,6 +4,7 @@ import {
 } from "../src/cli/harness-envelope.js";
 import type { EnvelopeContext } from "../src/cli/harness-envelope.js";
 import type { HarnessSemanticEvent } from "../src/cli/harness-events.js";
+import type { SessionInfoPayload } from "../src/index.js";
 
 const ctx: EnvelopeContext = {
   provider: "claude",
@@ -80,6 +81,41 @@ describe("buildEventEnvelopeV2", () => {
     expect(a).toBe(b);
     expect(a).not.toBe(c);
     expect(a).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("builds a session_info event through the generic v2 builder", () => {
+    const payload: SessionInfoPayload = {
+      agent_address: "ELQUJvq27tYx",
+      handle: "@alice",
+      title: "myrepo · feat/x",
+      repo: "org/myrepo",
+      branch: "feat/x",
+      model: "claude-opus-4-8",
+      harness_version: "1.4.2",
+      capabilities: ["agent_message", "tool_call", "tool_result"],
+      resumed: false,
+      started_at: "2026-07-07T10:34:12.000Z",
+    };
+    const sessionInfo: HarnessSemanticEvent = {
+      line: 0,
+      timestamp: new Date("2026-07-07T10:34:12.000Z"),
+      recordType: "hook:SessionStart",
+      event: { kind: "session_info", role: "agent", payload },
+    };
+    const env = buildEventEnvelopeV2(ctx, sessionInfo, 0);
+    expect(env.event).toMatchObject({
+      seq: 0,
+      kind: "session_info",
+      role: "agent",
+      payload: { agent_address: "ELQUJvq27tYx", resumed: false },
+    });
+    expect(env.source.record_type).toBe("hook:SessionStart");
+    // Idempotent id: a resend of the same session_info (same seq) reuses the id.
+    expect(buildEventEnvelopeV2(ctx, sessionInfo, 0).event.id).toBe(env.event.id);
+    // A resumed re-emit (distinct seq) gets a distinct id so the receiver can
+    // upsert rather than dedup it away.
+    const resumed = buildEventEnvelopeV2(ctx, sessionInfo, 1).event.id;
+    expect(resumed).not.toBe(env.event.id);
   });
 
   it("includes turn_id and model only when provided", () => {

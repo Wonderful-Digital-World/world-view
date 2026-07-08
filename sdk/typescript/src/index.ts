@@ -105,6 +105,7 @@ export type {
   SessionEnvelope,
   SessionEnvelopeV1,
   SessionEnvelopeV2,
+  SessionInfoPayload,
   StatusPayload,
   ToolCallPayload,
   ToolResultPayload,
