@@ -7,6 +7,13 @@ const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const CRYPTO_ID_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const B64KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
 
+// True if `value` is already a base58 cryptoId (the form the contacts/keys APIs
+// key on). Lets callers distinguish a real resolution from toCryptoId's fallback,
+// which returns the original @handle/string unchanged when a lookup fails.
+export function isCryptoId(value) {
+  return typeof value === "string" && CRYPTO_ID_RE.test(value);
+}
+
 export function bytesToBase58(bytes) {
   let n = 0n;
   for (const b of bytes) n = (n << 8n) + BigInt(b);

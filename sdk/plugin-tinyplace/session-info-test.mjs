@@ -90,7 +90,7 @@ expect("same (wrapper, seq) → same id (idempotent retry)", again.event.id === 
 
 // 4. Optional payload fields are OMITTED (not null) when empty — matches the SDK `?:`.
 const minimal = JSON.parse(buildSessionInfoEnvelope({ agentAddress: "Addr", wrapperSessionId: CONV, resumed: false, seq: 0 }));
-expect("minimal: no handle/title/repo/branch/model/harness_version keys", !("handle" in minimal.event.payload) && !("title" in minimal.event.payload) && !("repo" in minimal.event.payload) && !("model" in minimal.event.payload));
+expect("minimal: no handle/title/repo/branch/model/harness_version keys", !("handle" in minimal.event.payload) && !("title" in minimal.event.payload) && !("repo" in minimal.event.payload) && !("branch" in minimal.event.payload) && !("model" in minimal.event.payload) && !("harness_version" in minimal.event.payload));
 expect("minimal: no event.model when omitted", !("model" in minimal.event));
 expect("minimal: capabilities defaults to DEFAULT_CAPABILITIES", minimal.event.payload.capabilities.length === DEFAULT_CAPABILITIES.length);
 expect("minimal: required agent_address/resumed/started_at always present", minimal.event.payload.agent_address === "Addr" && minimal.event.payload.resumed === false && typeof minimal.event.payload.started_at === "string");
@@ -128,9 +128,10 @@ expect("title: label fallback, no branch", sessionTitle({ label: "mock:1" }) ===
 
 // 9. gitInfo: best-effort against THIS repo (a real git checkout) yields a branch;
 //    a non-repo path yields nulls without throwing.
-const here = gitInfo(process.cwd());
+const here = await gitInfo(process.cwd());
 expect("gitInfo: resolves a branch in a real repo", typeof here.branch === "string" && here.branch.length > 0);
-expect("gitInfo: non-repo path → nulls, no throw", (() => { const g = gitInfo("/"); return g.repo === null && g.branch === null; })());
+const nonRepo = await gitInfo("/");
+expect("gitInfo: non-repo path → nulls, no throw", nonRepo.repo === null && nonRepo.branch === null);
 
 rmSync(DATA_DIR, { recursive: true, force: true });
 const failed = checks.filter((c) => !c.ok);

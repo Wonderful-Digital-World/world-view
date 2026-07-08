@@ -12,10 +12,13 @@
 // the state-machine wiring. It emits a `SessionEnvelopeV2` (schema
 // `tinyplace.harness.session.v2`, see sdk/typescript/src/types/harness.ts) whose
 // `event.kind` is `session_info` — byte-compatible with the SDK's v2 emitter.
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 import { activeAdapter, harnessDataDir } from "./harness.mjs";
 
@@ -183,22 +186,22 @@ export function persistEmitted(agentAddress, sessionUuids) {
 // sensitive (spec §5.7) and OPTIONAL — only sent to the owner, never broadcast —
 // so any failure (not a repo, no git, detached HEAD) silently yields nulls. The
 // repo slug is derived from the origin remote url (`org/repo`); the branch is the
-// current symbolic ref. Short-timeout, no throw.
-export function gitInfo(cwd) {
-  const run = (args) => {
+// current symbolic ref. Async (non-blocking execFile) so it never stalls the
+// daemon's poll loop; short-timeout, no throw. The two git calls run in parallel.
+export async function gitInfo(cwd) {
+  const run = async (args) => {
     try {
-      return execFileSync("git", ["-C", cwd, ...args], {
-        encoding: "utf8",
-        timeout: 2000,
-        stdio: ["ignore", "pipe", "ignore"],
-      }).trim();
+      const { stdout } = await execFileAsync("git", ["-C", cwd, ...args], { timeout: 2000 });
+      return stdout.trim();
     } catch {
       return "";
     }
   };
   if (!cwd) return { repo: null, branch: null };
-  const branch = run(["rev-parse", "--abbrev-ref", "HEAD"]);
-  const remote = run(["remote", "get-url", "origin"]);
+  const [branch, remote] = await Promise.all([
+    run(["rev-parse", "--abbrev-ref", "HEAD"]),
+    run(["remote", "get-url", "origin"]),
+  ]);
   return {
     repo: remote ? repoSlugFromRemote(remote) : null,
     branch: branch && branch !== "HEAD" ? branch : null,

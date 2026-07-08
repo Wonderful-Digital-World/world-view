@@ -33,7 +33,7 @@ import {
 import { enqueueRouted, redeliverUnrouted, reapClosedTargets } from "../mcp/routing.mjs";
 import { claimOutboxJobs, writeOutboxJob } from "../mcp/outbox.mjs";
 import { acquireLock, heartbeatLock, releaseLock } from "../mcp/daemon-lock.mjs";
-import { toCryptoId } from "../mcp/address.mjs";
+import { isCryptoId, toCryptoId } from "../mcp/address.mjs";
 import { harnessDataDir } from "../mcp/harness.mjs";
 import { foregroundInject } from "../mcp/foreground-inject.mjs";
 import { loadWallets } from "../mcp/wallets.mjs";
@@ -279,10 +279,15 @@ async function serviceSessionInfo() {
   sessionInfoBusy = true;
   try {
     if (ownerCryptoId === undefined) {
-      try { ownerCryptoId = (await toCryptoId(client, OWNER_RAW)) || null; } catch { return; }
+      // toCryptoId returns the original @handle unchanged when a directory lookup
+      // fails (owner not registered yet / transient), so only CACHE a real base58
+      // id; otherwise leave it unresolved and retry next tick.
+      let resolved;
+      try { resolved = await toCryptoId(client, OWNER_RAW); } catch { return; }
+      if (!isCryptoId(resolved)) return; // not resolvable yet — retry next tick
+      ownerCryptoId = resolved;
     }
     const owner = ownerCryptoId;
-    if (!owner) return;
 
     // Contact gate: request once, then wait for the owner to accept.
     let status;
@@ -316,11 +321,12 @@ async function serviceSessionInfo() {
     // FLUSH: one session_info per pending session (resumed:false fresh /
     // resumed:true on reconnect). Mark sent only on a successful send so a
     // transient failure retries next tick.
+    let sentAny = false;
     for (const plan of plans) {
       const session = live.find((s) => s.sessionUuid === plan.sessionUuid);
       if (!session) continue;
       const convUuid = resolveConversationUuid(plan.sessionUuid, owner);
-      const { repo, branch } = gitInfo(session.cwd);
+      const { repo, branch } = await gitInfo(session.cwd);
       const body = buildSessionInfoEnvelope({
         agentAddress: AGENT,
         wrapperSessionId: convUuid,
@@ -341,10 +347,18 @@ async function serviceSessionInfo() {
         await sendMessage(client, signer, owner, body);
         sessionInfoSent.add(plan.sessionUuid);
         priorEmitted.add(plan.sessionUuid);
-        persistEmitted(AGENT, priorEmitted);
+        sentAny = true;
       } catch {
         // 403 (contact race) / transient / resolve-then-404 — retry next tick.
       }
+    }
+    // Persist once per flush (not per send). Prune to currently-live sessions so
+    // the record stays bounded — a dead session never needs a resumed re-emit
+    // (a resumed harness keeps its sessionUuid and is live again on restart).
+    if (sentAny) {
+      const liveSet = new Set(live.map((s) => s.sessionUuid));
+      for (const uuid of priorEmitted) if (!liveSet.has(uuid)) priorEmitted.delete(uuid);
+      persistEmitted(AGENT, priorEmitted);
     }
   } finally {
     sessionInfoBusy = false;
