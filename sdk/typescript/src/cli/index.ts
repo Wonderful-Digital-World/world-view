@@ -132,13 +132,15 @@ async function dispatchCli(
     };
   }
   if (
-    !parsed.command ||
     parsed.command === "help" ||
     parsed.command === "--help" ||
     boolFlag(parsed.flags, "help")
   ) {
     return { code: 0, stdout: HELP, stderr: "" };
   }
+  // Bare `tinyplace` (no subcommand) opens the HOME menu — a navigable picker
+  // for Codex / Claude / Connect OpenHuman — so developers don't have to recall
+  // subcommands. `tinyplace help` still prints the command reference above.
   if (parsed.command === "codex") {
     try {
       return await runCodexCommand(argv.slice(1), options);
@@ -176,6 +178,11 @@ async function dispatchCli(
 
   try {
     const ctx = await makeContext(options);
+    // Bare `tinyplace` opens the HOME menu (no agent pre-chosen); `tui <kind>`
+    // opens a fixed-agent TUI. Both go through this dispatch's error contract.
+    if (!parsed.command) {
+      return await runTinyPlaceTui(ctx, options);
+    }
     if (parsed.command === "tui") {
       return await runTinyPlaceTui(
         ctx,
