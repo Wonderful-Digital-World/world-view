@@ -191,7 +191,9 @@ export const HARNESS_CLI_COMMANDS: Array<TinyPlaceCliCommand> = [
   },
   {
     name: "claude",
-    capability: "workflow",
+    // Same capability as `codex` — the two are parity siblings, so they group
+    // together in help.
+    capability: "maintenance",
     description:
       "Launch the tiny.place TUI wrapping Claude Code: shows the active session + OpenHuman connection and runs the bidirectional bridge (publish keys, stream turns, inject inbound DMs). Use --raw for the headless transparent wrapper (no UI), or --agent to boot a first-class agent session via the unified plugin (own wallet + MCP tools, auto-reply off by default).",
     usage: "[--raw | --agent [--wallet <name>] [--autorespond]] [--tinyplace-dm-to <recipient>] [--tinyplace-out <dir>] [--tinyplace-scope folder|session] [--tinyplace-bucket minute|hour|day] [--] <claude-args...>",
