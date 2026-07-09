@@ -11,7 +11,7 @@ import {
   type CodexWrapperConfig,
 } from "./harness-wrapper.js";
 import { makeContext } from "./context.js";
-import { runTinyPlaceTui } from "./tui.js";
+import { runTinyPlaceTui, type TinyVerseAgentKind } from "./tui.js";
 import type { TinyPlaceCliOptions, TinyPlaceCliResult } from "./types.js";
 
 /** Prod endpoint the SDK falls back to (mirrors `context.ts`). */
@@ -38,21 +38,62 @@ export async function runCodexCommand(
   argv: Array<string>,
   options: TinyPlaceCliOptions = {},
 ): Promise<TinyPlaceCliResult> {
-  if (wantsAgentMode(argv)) {
-    return runCodexAgentTui(argv, options);
-  }
-  if (wantsRawMode(argv)) {
-    return runHarnessCommand("codex", stripFlag(argv, "--raw"), options);
-  }
-  const ctx = await makeContext(options);
-  return runTinyPlaceTui(ctx, options, "codex");
+  return runHarnessAgentCommand("codex", argv, options);
 }
 
+/**
+ * `tinyplace claude` mirrors `tinyplace codex` exactly — same three
+ * mutually-exclusive modes so both agents get the identical onboarding:
+ *
+ * - default: the **tiny.place TUI** — visible wrapper that surfaces the
+ *   OpenHuman connection ("[ Connect with OpenHuman ]"), prompts for the owner,
+ *   and runs the real bidirectional bridge while claude runs inside it.
+ * - `--raw`: the **transparent harness wrapper** (headless; used by
+ *   embedders/tests/smoke).
+ * - `--agent`: a first-class **agent** session via the plugin launcher
+ *   (`--harness claude`) with its own wallet + MCP tools.
+ *
+ * Previously bare `tinyplace claude` went straight to the headless wrapper, so
+ * claude never got the connect-to-OpenHuman step codex users saw. Routing it
+ * through the same dispatch closes that gap.
+ */
 export async function runClaudeCommand(
   argv: Array<string>,
   options: TinyPlaceCliOptions = {},
 ): Promise<TinyPlaceCliResult> {
-  return runHarnessCommand("claude", argv, options);
+  return runHarnessAgentCommand("claude", argv, options);
+}
+
+/**
+ * Shared codex/claude dispatch:
+ * - `--agent` → plugin launcher
+ * - `--raw` → transparent wrapper
+ * - **bare** (no args) → interactive TUI onboarding
+ * - **args present** → transparent wrapper
+ *
+ * The last rule matters: the TUI builds the command + OpenHuman owner from env
+ * only, so if the caller passed wrapper flags or a `-- <agent-args>` tail (e.g.
+ * `tinyplace claude --tinyplace-dm-to @owner -- --model opus`), opening the TUI
+ * would silently drop the requested recipient/model. Any explicit args mean the
+ * caller wants to wrap a specific session, so route to the wrapper and honor
+ * them; the TUI is reserved for the argument-free onboarding entry.
+ */
+async function runHarnessAgentCommand(
+  harness: TinyVerseAgentKind,
+  argv: Array<string>,
+  options: TinyPlaceCliOptions,
+): Promise<TinyPlaceCliResult> {
+  if (wantsAgentMode(argv)) {
+    return runAgentTui(harness, argv, options);
+  }
+  if (wantsRawMode(argv)) {
+    return runHarnessCommand(harness, stripFlag(argv, "--raw"), options);
+  }
+  if (argv.length > 0) {
+    return runHarnessCommand(harness, argv, options);
+  }
+  const ctx = await makeContext(options);
+  return runTinyPlaceTui(ctx, options, harness);
 }
 
 export function parseCodexWrapperArgs(
@@ -163,34 +204,41 @@ export function parseAgentArgs(argv: Array<string>): AgentInvocation {
   return { wallet, autorespond, passthrough, forwarded: post };
 }
 
-async function runCodexAgentTui(
+async function runAgentTui(
+  harness: TinyVerseAgentKind,
   argv: Array<string>,
   options: TinyPlaceCliOptions,
 ): Promise<TinyPlaceCliResult> {
   const launcher = resolveUnifiedLauncher();
   if (!launcher) {
     return failure(
-      `tinyplace codex --agent needs the unified plugin (${PLUGIN_PACKAGE}), which is not ` +
+      `tinyplace ${harness} --agent needs the unified plugin (${PLUGIN_PACKAGE}), which is not ` +
         "installed. Install it (npm i " +
         `${PLUGIN_PACKAGE}) and re-run, run from a tiny.place checkout, or launch the ` +
-        "plugin directly: node sdk/plugin-tinyplace/bin/tinyplace.mjs --harness codex",
+        `plugin directly: node sdk/plugin-tinyplace/bin/tinyplace.mjs --harness ${harness}`,
     );
   }
   // An installed dependency (resolved from node_modules) already has its deps;
   // only the in-repo checkout — a standalone package excluded from the workspace
   // — can be missing them, and would otherwise crash with ERR_MODULE_NOT_FOUND.
+  // An injected `options.spawn` (tests) never really launches node, so skip the
+  // real-launch precondition and let the dispatch/harness wiring be asserted.
   const isInstalledDependency = launcher.includes(`${sep}node_modules${sep}`);
   const pluginDir = dirname(dirname(launcher));
-  if (!isInstalledDependency && !existsSync(join(pluginDir, "node_modules"))) {
+  if (
+    options.spawn === undefined &&
+    !isInstalledDependency &&
+    !existsSync(join(pluginDir, "node_modules"))
+  ) {
     return failure(
       `The tiny.place plugin at ${pluginDir} has no node_modules — it is a standalone ` +
         "package excluded from the workspace. Install its deps first: " +
-        `(cd ${pluginDir} && pnpm install), then re-run tinyplace codex --agent.`,
+        `(cd ${pluginDir} && pnpm install), then re-run tinyplace ${harness} --agent.`,
     );
   }
 
   const { wallet, autorespond, passthrough, forwarded } = parseAgentArgs(argv);
-  const launcherArgs: Array<string> = [launcher, "--harness", "codex"];
+  const launcherArgs: Array<string> = [launcher, "--harness", harness];
   if (wallet) launcherArgs.push("--wallet", wallet);
   const forwardTail = [...passthrough, ...forwarded];
   if (forwardTail.length > 0) launcherArgs.push("--", ...forwardTail);
@@ -206,7 +254,7 @@ async function runCodexAgentTui(
     childEnv.TINYPLACE_AUTORESPOND = "off";
   }
 
-  const code = await spawnInteractive("node", launcherArgs, childEnv);
+  const code = await spawnInteractive("node", launcherArgs, childEnv, options.spawn);
   return { code, stdout: "", stderr: "" };
 }
 
@@ -214,14 +262,22 @@ function failure(message: string): TinyPlaceCliResult {
   return { code: 1, stdout: "", stderr: `${JSON.stringify({ error: message }, null, 2)}\n` };
 }
 
-/** Spawn the interactive launcher, inheriting the TTY; resolve its exit code. */
+/**
+ * Spawn the interactive launcher, inheriting the TTY; resolve its exit code. A
+ * caller-supplied `spawn` (tests) is used instead of the real child_process
+ * spawn — the injected form omits `stdio: "inherit"` (its type forbids it) since
+ * the test child never touches a real TTY.
+ */
 function spawnInteractive(
   command: string,
   args: Array<string>,
   env: NodeJS.ProcessEnv,
+  injectedSpawn?: TinyPlaceCliOptions["spawn"],
 ): Promise<number> {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { stdio: "inherit", env });
+    const child = injectedSpawn
+      ? injectedSpawn(command, args, { env })
+      : spawn(command, args, { stdio: "inherit", env });
     child.on("error", () => resolve(1));
     child.on("exit", (code) => resolve(code ?? 0));
   });

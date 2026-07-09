@@ -63,6 +63,78 @@ describe("tinyplace codex", () => {
     expect(result.stdout).toContain("welcome to tiny.place");
   });
 
+  it("routes bare `claude` to the TUI too, so it gets the same OpenHuman onboarding as codex", async () => {
+    const result = await runTinyPlaceCli(["claude"], {
+      env: { TINYPLACE_ENDPOINT: "https://relay.test" },
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("welcome to tiny.place");
+    // The claude profile drives the snapshot — not codex.
+    expect(result.stdout).toContain("claude: claude");
+  });
+
+  it("wraps `claude <args>` (no --raw) instead of dropping them in the TUI", async () => {
+    // Regression: bare `claude` opens the TUI, but any args (recipient/model/…)
+    // mean the caller wants to wrap a specific session — route to the wrapper
+    // and forward them rather than silently ignoring them.
+    let spawned: { args: Array<string>; command: string } | undefined;
+    const result = await runTinyPlaceCli(
+      ["claude", "--tinyplace-no-pty", "--tinyplace-no-session-tail", "--model", "opus"],
+      {
+        cwd: "/tmp/project",
+        env: { TINYPLACE_CLAUDE_BIN: "fake-claude" },
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        spawn: (command, args) => {
+          spawned = { args, command };
+          const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+          child.stdin = new PassThrough();
+          child.stdout = new PassThrough();
+          child.stderr = new PassThrough();
+          child.pid = 4321;
+          queueMicrotask(() => child.emit("exit", 0, null));
+          return child;
+        },
+      },
+    );
+    expect(result.code).toBe(0);
+    // The TUI never spawns via the injected `spawn`; the wrapper does — and the
+    // model flag survives (only tinyplace-* flags are consumed).
+    expect(spawned).toEqual({ command: "fake-claude", args: ["--model", "opus"] });
+  });
+
+  it("routes `claude --agent` to the plugin launcher with `--harness claude`", async () => {
+    // The core new behavior of the parity dispatch is harness-parameterizing the
+    // agent launcher. An injected spawn lets us assert it without a real plugin
+    // install (the launcher is workspace-excluded and has no node_modules in CI).
+    let spawned: { args: Array<string>; command: string } | undefined;
+    const result = await runTinyPlaceCli(["claude", "--agent"], {
+      env: { TINYPLACE_ENDPOINT: "https://relay.test" },
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      spawn: (command, args) => {
+        spawned = { args, command };
+        const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+        child.pid = 5555;
+        queueMicrotask(() => child.emit("exit", 0, null));
+        return child;
+      },
+    });
+    expect(result.code).toBe(0);
+    // Launches `node <launcher> --harness claude` — the claude adapter, not codex.
+    expect(spawned?.command).toBe("node");
+    expect(spawned?.args).toEqual(
+      expect.arrayContaining(["--harness", "claude"]),
+    );
+    const h = spawned?.args.indexOf("--harness") ?? -1;
+    expect(spawned?.args[h + 1]).toBe("claude");
+  });
+
   it("proxies terminal streams into envelope files without creating tinyplace context", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "tinyplace-codex-"));
     const stdin = new PassThrough();
@@ -608,6 +680,7 @@ describe("tinyplace codex", () => {
     const resultPromise = runTinyPlaceCli(
       [
         "claude",
+        "--raw",
         "--tinyplace-no-pty",
         "--tinyplace-out",
         tempDir,
