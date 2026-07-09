@@ -818,11 +818,26 @@ class BlessedTinyPlaceTui {
     }
   }
 
+  /**
+   * Whether to run the agent through the **native tmux relay** rather than the
+   * embedded Blessed `terminal` widget. Native relay is the default for BOTH
+   * agents: it tears Blessed down and hands the real terminal to the agent (with
+   * the tiny.place chrome as a tmux status line), so the terminal's own text
+   * selection / copy / scrollback keep working. The Blessed widget owns the
+   * screen (alternate buffer + term.js mouse handling) and disables all of that
+   * — the "whole pane is inaccessible" symptom. Opt back into it per agent with
+   * `TINYPLACE_<KIND>_TERMINAL_MODE=blessed`, or globally with
+   * `TINYPLACE_TERMINAL_MODE=blessed`. If tmux/node-pty is missing, the relay
+   * fails soft and falls back to the Blessed widget anyway.
+   */
   private usesNativeRelay(): boolean {
-    const mode =
-      this.ctx.env.TINYVERSE_CLAUDE_TERMINAL_MODE ??
-      this.ctx.env.TINYPLACE_CLAUDE_TERMINAL_MODE;
-    return this.profile.kind === "claude" && mode !== "blessed";
+    const kindMode =
+      this.profile.kind === "claude"
+        ? (this.ctx.env.TINYVERSE_CLAUDE_TERMINAL_MODE ??
+          this.ctx.env.TINYPLACE_CLAUDE_TERMINAL_MODE)
+        : this.ctx.env.TINYPLACE_CODEX_TERMINAL_MODE;
+    const mode = kindMode ?? this.ctx.env.TINYPLACE_TERMINAL_MODE;
+    return mode !== "blessed";
   }
 
   private updateNativeTerminalTitle(): void {
