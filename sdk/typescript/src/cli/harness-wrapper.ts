@@ -962,12 +962,43 @@ export class SessionEnvelopePublisher {
   private failures = 0;
   private pending = new Set<Promise<void>>();
   private queue: Promise<void> = Promise.resolve();
+  // Echo suppression: text injected FROM the owner (inbound) is recorded by the
+  // agent as a `user`-role session line, which the tailer would otherwise stream
+  // straight back — the owner then sees its own message twice AND may auto-reply
+  // to its own echo, feeding a ping-pong loop. Remember recent injections so
+  // `publish()` can drop the matching `user` echo. TTL-bounded so a genuine
+  // later user turn with identical text still forwards.
+  private injectedEchoes = new Map<string, number>();
+  private static readonly ECHO_TTL_MS = 60_000;
 
   public constructor(
     private readonly config: HarnessWrapperConfig,
     private readonly options: TinyPlaceCliOptions,
     private readonly stderr: Writable,
   ) {}
+
+  /** Record an owner→agent injection so its echoed-back `user` line is dropped. */
+  public markInjected(text: string): void {
+    const key = echoKey(text);
+    if (key.length === 0) {
+      return;
+    }
+    this.injectedEchoes.set(key, Date.now() + SessionEnvelopePublisher.ECHO_TTL_MS);
+  }
+
+  /** True (consuming the record) if this outbound is an echo of a fresh injection. */
+  private isInjectedEcho(envelope: AnySessionEnvelope): boolean {
+    if (envelopeRole(envelope) !== "user") {
+      return false;
+    }
+    const key = echoKey(envelopeText(envelope));
+    const expiry = this.injectedEchoes.get(key);
+    if (expiry === undefined) {
+      return false;
+    }
+    this.injectedEchoes.delete(key);
+    return expiry >= Date.now();
+  }
 
   public publish(envelope: AnySessionEnvelope): void {
     const id = envelopeId(envelope);
@@ -976,6 +1007,10 @@ export class SessionEnvelopePublisher {
         id,
         reason: !this.config.dmRecipient ? "no-dmRecipient" : "dryRun",
       });
+      return;
+    }
+    if (this.isInjectedEcho(envelope)) {
+      bridgeLog("publish.echoSkip", { id });
       return;
     }
     bridgeLog("publish.enqueue", {
@@ -1102,6 +1137,18 @@ function envelopeRole(envelope: AnySessionEnvelope): string {
   return envelope.envelope_version === SESSION_ENVELOPE_VERSION_V2
     ? envelope.event.role
     : envelope.message.role;
+}
+
+function envelopeText(envelope: AnySessionEnvelope): string {
+  return envelope.envelope_version === SESSION_ENVELOPE_VERSION_V2
+    ? ((envelope.event as { text?: string }).text ?? "")
+    : envelope.message.text;
+}
+
+/** Normalize a message body so an injected inbound and its echoed-back session
+ *  line compare equal (trim + collapse interior whitespace). */
+function echoKey(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
 }
 
 function isNotAContactError(error: unknown): boolean {
@@ -1250,6 +1297,10 @@ export class InboundMessageReceiver {
         const text = this.filterAndParse(message);
         if (text !== undefined && this.sink) {
           injected += 1;
+          // Record before injecting so the tailer's echoed-back `user` line
+          // (the agent logs the injected prompt as its own user turn) is dropped
+          // by the publisher instead of bouncing to the owner.
+          this.publisher.markInjected(text);
           // "\r" (carriage return) submits the prompt to the agent TUI.
           this.sink(`${text}\r`);
         } else {
