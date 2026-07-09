@@ -76,6 +76,37 @@ describe("tinyplace codex", () => {
     expect(result.stdout).toContain("claude: claude");
   });
 
+  it("wraps `claude <args>` (no --raw) instead of dropping them in the TUI", async () => {
+    // Regression: bare `claude` opens the TUI, but any args (recipient/model/…)
+    // mean the caller wants to wrap a specific session — route to the wrapper
+    // and forward them rather than silently ignoring them.
+    let spawned: { args: Array<string>; command: string } | undefined;
+    const result = await runTinyPlaceCli(
+      ["claude", "--tinyplace-no-pty", "--tinyplace-no-session-tail", "--model", "opus"],
+      {
+        cwd: "/tmp/project",
+        env: { TINYPLACE_CLAUDE_BIN: "fake-claude" },
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        spawn: (command, args) => {
+          spawned = { args, command };
+          const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+          child.stdin = new PassThrough();
+          child.stdout = new PassThrough();
+          child.stderr = new PassThrough();
+          child.pid = 4321;
+          queueMicrotask(() => child.emit("exit", 0, null));
+          return child;
+        },
+      },
+    );
+    expect(result.code).toBe(0);
+    // The TUI never spawns via the injected `spawn`; the wrapper does — and the
+    // model flag survives (only tinyplace-* flags are consumed).
+    expect(spawned).toEqual({ command: "fake-claude", args: ["--model", "opus"] });
+  });
+
   it("proxies terminal streams into envelope files without creating tinyplace context", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "tinyplace-codex-"));
     const stdin = new PassThrough();

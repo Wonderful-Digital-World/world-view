@@ -64,7 +64,20 @@ export async function runClaudeCommand(
   return runHarnessAgentCommand("claude", argv, options);
 }
 
-/** Shared codex/claude dispatch: `--agent` → plugin, `--raw` → wrapper, else TUI. */
+/**
+ * Shared codex/claude dispatch:
+ * - `--agent` → plugin launcher
+ * - `--raw` → transparent wrapper
+ * - **bare** (no args) → interactive TUI onboarding
+ * - **args present** → transparent wrapper
+ *
+ * The last rule matters: the TUI builds the command + OpenHuman owner from env
+ * only, so if the caller passed wrapper flags or a `-- <agent-args>` tail (e.g.
+ * `tinyplace claude --tinyplace-dm-to @owner -- --model opus`), opening the TUI
+ * would silently drop the requested recipient/model. Any explicit args mean the
+ * caller wants to wrap a specific session, so route to the wrapper and honor
+ * them; the TUI is reserved for the argument-free onboarding entry.
+ */
 async function runHarnessAgentCommand(
   harness: TinyVerseAgentKind,
   argv: Array<string>,
@@ -75,6 +88,9 @@ async function runHarnessAgentCommand(
   }
   if (wantsRawMode(argv)) {
     return runHarnessCommand(harness, stripFlag(argv, "--raw"), options);
+  }
+  if (argv.length > 0) {
+    return runHarnessCommand(harness, argv, options);
   }
   const ctx = await makeContext(options);
   return runTinyPlaceTui(ctx, options, harness);
