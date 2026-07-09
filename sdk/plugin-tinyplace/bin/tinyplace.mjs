@@ -122,9 +122,12 @@ async function seedFromCliConfig() {
   if (loadWallets().length) return;
   let secretKey;
   try {
-    secretKey = JSON.parse(
-      readFileSync(join(sharedDir(), "config.json"), "utf8"),
-    )?.secretKey;
+    // Resolve the CLI config the same way the SDK's configPathFor does — honor
+    // TINYPLACE_CONFIG so a non-default profile / embedder / test that moved the
+    // CLI identity is adopted, instead of silently reading the default file.
+    const configPath =
+      process.env.TINYPLACE_CONFIG ?? join(sharedDir(), "config.json");
+    secretKey = JSON.parse(readFileSync(configPath, "utf8"))?.secretKey;
   } catch {
     return; // no CLI config / unreadable
   }
