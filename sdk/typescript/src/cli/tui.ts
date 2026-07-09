@@ -202,9 +202,11 @@ class BlessedTinyPlaceTui {
     return this.actions()[this.state.selectedIndex] ?? "quit";
   }
 
-  /** Home mode: bind the chosen agent before entering the launch flow. */
+  /** Home mode: bind the chosen agent, then resolve the owner for THAT agent
+   *  (provider-specific recipients only take effect once the agent is known). */
   private setProfile(kind: TinyVerseAgentKind): void {
     this.profile = buildAgentProfile(this.ctx.env, kind);
+    this.adoptRememberedOwner();
   }
 
   private createBlessedLayout(): void {
@@ -256,9 +258,23 @@ class BlessedTinyPlaceTui {
 
   public start(): void {
     this.registerKeys();
-    // Auto-adopt a remembered OpenHuman owner (persisted config or env) so the
-    // footer shows "connected" and the bridge wires to it the moment the agent
-    // launches — no manual "Connect with OpenHuman" needed on repeat launches.
+    // Fixed-agent mode: auto-adopt a remembered owner so the footer shows
+    // "connected" and the bridge wires on launch — no manual Connect on repeat
+    // launches. HOME mode defers this until an agent is picked (setProfile),
+    // because the recipient can be provider-specific and the agent isn't chosen
+    // yet — adopting a Codex recipient before the user picks Claude would bridge
+    // to the wrong owner.
+    if (!this.homeMode) {
+      this.adoptRememberedOwner();
+    }
+    this.render();
+    this.scheduleAutoStart();
+  }
+
+  /** Adopt a remembered OpenHuman owner (persisted config or env) into state so
+   *  the footer reflects it and the bridge wires to it on launch. Resolved
+   *  against the *current* profile, so it must run after any home-mode pick. */
+  private adoptRememberedOwner(): void {
     const owner = this.resolveOwner();
     if (owner) {
       this.state = {
@@ -268,8 +284,6 @@ class BlessedTinyPlaceTui {
         openHumanSessionId: owner,
       };
     }
-    this.render();
-    this.scheduleAutoStart();
   }
 
   private registerKeys(): void {
@@ -406,7 +420,7 @@ class BlessedTinyPlaceTui {
   private resolveOwner(): string | undefined {
     return (
       this.state.openHumanOwner ??
-      bridgeOwner(this.ctx.env) ??
+      bridgeOwner(this.ctx.env, this.profile.kind) ??
       this.ctx.openHumanOwner
     );
   }
@@ -1632,7 +1646,7 @@ function splitShellWords(input: string): Array<string> {
 
 function renderStaticSnapshot(ctx: CliContext, profile: AgentProfile): string {
   const timeoutMs = autoStartMs(ctx.env);
-  const owner = bridgeOwner(ctx.env) ?? ctx.openHumanOwner;
+  const owner = bridgeOwner(ctx.env, profile.kind) ?? ctx.openHumanOwner;
   const lines = [
     "welcome to tiny.place",
     `${profile.displayName} runs inside this shell while tiny.place tracks the active ${profile.displayName} session.`,
@@ -1696,17 +1710,26 @@ function walletIdFor(ctx: CliContext): string {
 
 /** The configured OpenHuman owner (whom we bridge to), if any. Mirrors the
  *  wrapper's recipient resolution order. */
+/**
+ * The configured OpenHuman owner (whom we bridge to), mirroring the wrapper's
+ * provider-scoped recipient resolution. When the agent `kind` is known, only
+ * that agent's `TINYPLACE_<KIND>_DM_TO`/`_RECEIVE_FROM` is consulted (never the
+ * other agent's) so, e.g., a Claude session never picks up
+ * `TINYPLACE_CODEX_DM_TO`. When `kind` is undefined (home menu, before an agent
+ * is chosen) only the agent-agnostic vars are used — the per-agent recipient is
+ * resolved once the user picks Codex vs Claude.
+ */
 function bridgeOwner(
   env: Record<string, string | undefined>,
+  kind?: TinyVerseAgentKind,
 ): string | undefined {
+  const upper = kind?.toUpperCase();
   return firstEnv(env, [
-    "TINYPLACE_CODEX_DM_TO",
-    "TINYPLACE_CLAUDE_DM_TO",
+    ...(upper ? [`TINYPLACE_${upper}_DM_TO`] : []),
     "TINYPLACE_HARNESS_DM_TO",
     "TINYPLACE_OPENHUMAN_OWNER",
     "OPENHUMAN_OWNER_AGENT",
-    "TINYPLACE_CODEX_RECEIVE_FROM",
-    "TINYPLACE_CLAUDE_RECEIVE_FROM",
+    ...(upper ? [`TINYPLACE_${upper}_RECEIVE_FROM`] : []),
     "TINYPLACE_HARNESS_RECEIVE_FROM",
   ]);
 }

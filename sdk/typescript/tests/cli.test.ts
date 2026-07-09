@@ -915,6 +915,20 @@ describe("tinyplace CLI", () => {
     expect(home.stdout).not.toContain("tinyplace raw <command>");
   });
 
+  it("Home mode ignores a provider-specific recipient until an agent is picked", async () => {
+    // A Codex-only recipient must NOT be adopted before the user chooses Codex
+    // vs Claude — otherwise picking Claude would bridge to the Codex owner.
+    const home = await runTinyPlaceCli([], {
+      env: {
+        TINYPLACE_ENDPOINT: "https://example.test",
+        TINYPLACE_CODEX_DM_TO: "@codex-only-owner",
+      },
+    });
+    expect(home.code).toBe(0);
+    expect(home.stdout).toContain("OpenHuman: disconnected");
+    expect(home.stdout).not.toContain("@codex-only-owner");
+  });
+
   it("documents the full feed surface, including likes", () => {
     const feedCommands = HARNESS_CLI_COMMANDS.filter(
       (command) => command.capability === "feeds",
