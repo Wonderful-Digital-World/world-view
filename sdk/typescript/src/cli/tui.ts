@@ -189,6 +189,9 @@ class BlessedTinyPlaceTui {
   // (text still parks) until a human types, which resets the counter.
   private consecutiveAutoInjects = 0;
   private static readonly MAX_AUTO_INJECTS = 6;
+  // Serial queue for inbound injection so a batch of DMs typed in one receiver
+  // poll keeps its turn boundaries (each body+Enter finishes before the next).
+  private injectionQueue: Promise<void> = Promise.resolve();
 
   public constructor(
     private readonly ctx: CliContext,
@@ -596,52 +599,11 @@ class BlessedTinyPlaceTui {
       // inject the literal text and then a DISTINCT Enter keypress (separate
       // send-keys after a short debounce) so the turn actually submits.
       const body = text.endsWith("\r") ? text.slice(0, -1) : text;
-      // Auto-submit is ON by default: an inbound OpenHuman turn is injected AND
-      // submitted so claude replies without a human keypress. Because
-      // OpenHuman's master also auto-replies, the two can ping-pong; set
-      // TINYPLACE_<KIND>_AUTOSUBMIT=0 to fall back to a human gate (text parks
-      // in the prompt; you press Enter to send). A UI toggle in OpenHuman is the
-      // planned front-door for this same switch.
-      const envAutoSubmit =
-        this.ctx.env[`TINYPLACE_${this.profile.kind.toUpperCase()}_AUTOSUBMIT`] !==
-        "0";
-      // Loop guard: once too many auto-turns fire back-to-back with no human
-      // keystroke, stop auto-submitting so a master↔claude loop can't run away.
-      const guardTripped =
-        this.consecutiveAutoInjects >= BlessedTinyPlaceTui.MAX_AUTO_INJECTS;
-      const autoSubmit = envAutoSubmit && !guardTripped;
-      if (envAutoSubmit && guardTripped) {
-        bridgeLog("inbound.loopGuard", {
-          paused: true,
-          consecutive: this.consecutiveAutoInjects,
-        });
-      }
-      if (autoSubmit) {
-        this.consecutiveAutoInjects += 1;
-      }
-      if (this.tmuxSocket && this.tmuxSession) {
-        const socket = this.tmuxSocket;
-        const session = this.tmuxSession;
-        const cwd = this.options.cwd ?? process.cwd();
-        runTmuxCommand(
-          socket,
-          ["send-keys", "-t", session, "-l", body],
-          this.ctx.env,
-          cwd,
-        );
-        if (autoSubmit) {
-          setTimeout(() => {
-            runTmuxCommand(
-              socket,
-              ["send-keys", "-t", session, "Enter"],
-              this.ctx.env,
-              cwd,
-            );
-          }, 150);
-        }
-        return;
-      }
-      this.writeAgentInput(Buffer.from(autoSubmit ? `${body}\r` : body, "utf8"));
+      // The receiver can deliver several inbound messages in one poll, calling
+      // this sink synchronously per message. Serialize them: each body+Enter
+      // pair must complete before the next body types, or two messages land in
+      // one prompt and the trailing Enter submits an empty turn (lost boundary).
+      this.enqueueInjection(body, this.computeAutoSubmit());
     });
     this.bridgeTailer?.start(new Date());
     void this.bridgeReceiver?.start();
@@ -664,6 +626,69 @@ class BlessedTinyPlaceTui {
     this.bridgeTailer = undefined;
     this.bridgeReceiver = undefined;
     this.state = { ...this.state, bridgeLive: false };
+  }
+
+  /** Resolve whether this inbound turn should auto-submit, applying the env
+   *  switch and the runaway loop guard, and advancing the guard counter. */
+  private computeAutoSubmit(): boolean {
+    // Auto-submit is ON by default so claude replies to an inbound OpenHuman
+    // turn without a human keypress. Because OpenHuman's master also auto-
+    // replies, the two can ping-pong; TINYPLACE_<KIND>_AUTOSUBMIT=0 falls back
+    // to a human gate (text parks in the prompt; press Enter to send).
+    const envAutoSubmit =
+      this.ctx.env[
+        `TINYPLACE_${this.profile.kind.toUpperCase()}_AUTOSUBMIT`
+      ] !== "0";
+    const guardTripped =
+      this.consecutiveAutoInjects >= BlessedTinyPlaceTui.MAX_AUTO_INJECTS;
+    if (envAutoSubmit && guardTripped) {
+      bridgeLog("inbound.loopGuard", {
+        paused: true,
+        consecutive: this.consecutiveAutoInjects,
+      });
+    }
+    const autoSubmit = envAutoSubmit && !guardTripped;
+    if (autoSubmit) {
+      this.consecutiveAutoInjects += 1;
+    }
+    return autoSubmit;
+  }
+
+  /** Chain an injection onto the serial queue so batched inbound turns keep
+   *  their boundaries (body → Enter → next body), never interleaving. */
+  private enqueueInjection(body: string, autoSubmit: boolean): void {
+    this.injectionQueue = this.injectionQueue
+      .then(() => this.injectOne(body, autoSubmit))
+      .catch(() => {});
+  }
+
+  /** Type one inbound turn and, when auto-submitting, the distinct Enter after a
+   *  short debounce (so the agent TUI doesn't swallow the CR as a paste). */
+  private async injectOne(body: string, autoSubmit: boolean): Promise<void> {
+    if (this.tmuxSocket && this.tmuxSession) {
+      const socket = this.tmuxSocket;
+      const session = this.tmuxSession;
+      const cwd = this.options.cwd ?? process.cwd();
+      runTmuxCommand(
+        socket,
+        ["send-keys", "-t", session, "-l", body],
+        this.ctx.env,
+        cwd,
+      );
+      if (autoSubmit) {
+        await delay(150);
+        runTmuxCommand(
+          socket,
+          ["send-keys", "-t", session, "Enter"],
+          this.ctx.env,
+          cwd,
+        );
+      }
+      return;
+    }
+    this.writeAgentInput(
+      Buffer.from(autoSubmit ? `${body}\r` : body, "utf8"),
+    );
   }
 
   private async startAgent(): Promise<void> {
@@ -709,6 +734,11 @@ class BlessedTinyPlaceTui {
     this.terminal = blessed.terminal({
       cursor: "block",
       handler: (input) => {
+        // A genuine keystroke (Blessed-widget path, mirroring the native relay's
+        // nativeInputHandler) clears the loop-guard streak so auto-submit
+        // resumes after the person re-engages. writeAgentInput is also used by
+        // inbound injection, so the reset must live here, not inside it.
+        this.consecutiveAutoInjects = 0;
         this.writeAgentInput(input);
       },
       height: "100%",
@@ -1845,6 +1875,12 @@ function bridgeOwner(
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolveDelay) => {
+    setTimeout(resolveDelay, ms);
+  });
 }
 
 function autoStartMs(env: Record<string, string | undefined>): number {
