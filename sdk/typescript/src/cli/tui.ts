@@ -14,6 +14,7 @@ import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { IPty } from "node-pty";
 
 import { bridgeLog, createBridgeDiagSink } from "./bridge-debug.js";
+import { saveOpenHumanOwner } from "./context.js";
 import {
   HarnessSessionTailer,
   InboundMessageReceiver,
@@ -65,30 +66,61 @@ interface AgentSessionMeta {
   sessionId: string;
 }
 
-const CODEX_ACTION_INDEX = 0;
-const OPENHUMAN_ACTION_INDEX = 1;
-const SETTINGS_ACTION_INDEX = 2;
-const QUIT_ACTION_INDEX = 3;
+/**
+ * A selectable welcome-menu row. The list is computed per-render so one screen
+ * serves two entry shapes:
+ *  - fixed-agent (`tinyplace codex` / `claude` / `tui <kind>`): one launch row.
+ *  - home (`tinyplace` with no agent): a launch row PER agent, so a developer
+ *    navigates to a session instead of memorizing subcommands.
+ */
+type TuiAction =
+  | "launch"
+  | "launch-codex"
+  | "launch-claude"
+  | "connect"
+  | "settings"
+  | "quit";
+
+const FIXED_ACTIONS: ReadonlyArray<TuiAction> = [
+  "launch",
+  "connect",
+  "settings",
+  "quit",
+];
+const HOME_ACTIONS: ReadonlyArray<TuiAction> = [
+  "launch-codex",
+  "launch-claude",
+  "connect",
+  "settings",
+  "quit",
+];
 const requireForTui = createRequire(import.meta.url);
 
 export async function runTinyPlaceTui(
   ctx: CliContext,
   options: TinyPlaceCliOptions,
-  agentKind: TinyVerseAgentKind = "codex",
+  // `undefined` = HOME mode: no agent pre-chosen, so the welcome menu offers a
+  // launch row per agent. A concrete kind = fixed-agent mode (today's flow).
+  agentKind?: TinyVerseAgentKind,
 ): Promise<TinyPlaceCliResult> {
   const stdin = options.stdin ?? process.stdin;
   const stdout = options.stdout ?? process.stdout;
-  const profile = buildAgentProfile(ctx.env, agentKind);
+  const homeMode = agentKind === undefined;
+  // Home mode still needs a concrete profile for the shared render/agent code;
+  // it defaults to codex and is swapped to the picked agent on launch.
+  const profile = buildAgentProfile(ctx.env, agentKind ?? "codex");
 
   if (!isTty(stdin) || !isTty(stdout)) {
     return {
       code: 0,
       stderr: "",
-      stdout: renderStaticSnapshot(ctx, profile),
+      stdout: homeMode
+        ? renderHomeSnapshot(ctx)
+        : renderStaticSnapshot(ctx, profile),
     };
   }
 
-  await runInteractiveBlessedTui(ctx, options, profile);
+  await runInteractiveBlessedTui(ctx, options, profile, homeMode);
   return { code: 0, stderr: "", stdout: "" };
 }
 
@@ -110,9 +142,10 @@ function runInteractiveBlessedTui(
   ctx: CliContext,
   options: TinyPlaceCliOptions,
   profile: AgentProfile,
+  homeMode: boolean,
 ): Promise<void> {
   return new Promise((resolve) => {
-    const app = new BlessedTinyPlaceTui(ctx, options, profile, resolve);
+    const app = new BlessedTinyPlaceTui(ctx, options, profile, resolve, homeMode);
     app.start();
   });
 }
@@ -137,7 +170,7 @@ class BlessedTinyPlaceTui {
     activeSessionId: "none",
     autoStartAvailable: true,
     openHumanConnected: false,
-    selectedIndex: CODEX_ACTION_INDEX,
+    selectedIndex: 0,
     view: "welcome",
   };
   private terminal?: Widgets.TerminalElement;
@@ -151,10 +184,27 @@ class BlessedTinyPlaceTui {
   public constructor(
     private readonly ctx: CliContext,
     private readonly options: TinyPlaceCliOptions,
-    private readonly profile: AgentProfile,
+    // Mutable: home mode swaps this to the picked agent before launch.
+    private profile: AgentProfile,
     private readonly resolve: () => void,
+    private readonly homeMode: boolean = false,
   ) {
     this.createBlessedLayout();
+  }
+
+  /** Welcome-menu rows for the current entry shape (home = per-agent pickers). */
+  private actions(): ReadonlyArray<TuiAction> {
+    return this.homeMode ? HOME_ACTIONS : FIXED_ACTIONS;
+  }
+
+  /** The action the cursor is on right now. */
+  private selectedAction(): TuiAction {
+    return this.actions()[this.state.selectedIndex] ?? "quit";
+  }
+
+  /** Home mode: bind the chosen agent before entering the launch flow. */
+  private setProfile(kind: TinyVerseAgentKind): void {
+    this.profile = buildAgentProfile(this.ctx.env, kind);
   }
 
   private createBlessedLayout(): void {
@@ -206,6 +256,18 @@ class BlessedTinyPlaceTui {
 
   public start(): void {
     this.registerKeys();
+    // Auto-adopt a remembered OpenHuman owner (persisted config or env) so the
+    // footer shows "connected" and the bridge wires to it the moment the agent
+    // launches — no manual "Connect with OpenHuman" needed on repeat launches.
+    const owner = this.resolveOwner();
+    if (owner) {
+      this.state = {
+        ...this.state,
+        openHumanConnected: true,
+        openHumanOwner: owner,
+        openHumanSessionId: owner,
+      };
+    }
     this.render();
     this.scheduleAutoStart();
   }
@@ -280,7 +342,7 @@ class BlessedTinyPlaceTui {
       selectedIndex: clamp(
         this.state.selectedIndex + delta,
         0,
-        QUIT_ACTION_INDEX,
+        this.actions().length - 1,
       ),
     };
     this.render();
@@ -301,19 +363,28 @@ class BlessedTinyPlaceTui {
       this.render();
       return;
     }
-    if (this.state.selectedIndex === CODEX_ACTION_INDEX) {
-      void this.startAgent();
-      return;
+    switch (this.selectedAction()) {
+      case "launch":
+        void this.startAgent();
+        return;
+      case "launch-codex":
+        this.setProfile("codex");
+        void this.startAgent();
+        return;
+      case "launch-claude":
+        this.setProfile("claude");
+        void this.startAgent();
+        return;
+      case "connect":
+        this.connectOpenHuman();
+        return;
+      case "settings":
+        this.openSettings();
+        return;
+      case "quit":
+        this.close();
+        return;
     }
-    if (this.state.selectedIndex === OPENHUMAN_ACTION_INDEX) {
-      this.connectOpenHuman();
-      return;
-    }
-    if (this.state.selectedIndex === SETTINGS_ACTION_INDEX) {
-      this.openSettings();
-      return;
-    }
-    this.close();
   }
 
   private openSettings(): void {
@@ -326,9 +397,18 @@ class BlessedTinyPlaceTui {
     this.render();
   }
 
-  /** The owner we bridge to: entered in the TUI (overrides) else from env. */
+  /**
+   * The owner we bridge to. Priority: entered this session (overrides) → env
+   * (explicit per-run override) → persisted config (remembered from a previous
+   * "Connect with OpenHuman"). The persisted value makes the next launch
+   * auto-connect without re-asking.
+   */
   private resolveOwner(): string | undefined {
-    return this.state.openHumanOwner ?? bridgeOwner(this.ctx.env);
+    return (
+      this.state.openHumanOwner ??
+      bridgeOwner(this.ctx.env) ??
+      this.ctx.openHumanOwner
+    );
   }
 
   /** Prompt for the OpenHuman owner (@handle or address), store it, and — if the
@@ -401,6 +481,8 @@ class BlessedTinyPlaceTui {
           openHumanOwner: owner,
           openHumanSessionId: owner,
         };
+        // Remember it so the next launch auto-connects without re-asking.
+        void saveOpenHumanOwner(this.ctx.env, owner);
         // If a session is live, restart the bridge so the new owner takes effect.
         if (this.state.view === "agent") {
           this.stopBridge();
@@ -846,7 +928,13 @@ class BlessedTinyPlaceTui {
       this.body.setContent(renderSettingsContent(this.ctx, this.profile));
     } else {
       this.body.setContent(
-        renderWelcomeContent(this.ctx, this.profile, this.state),
+        renderWelcomeContent(
+          this.ctx,
+          this.profile,
+          this.state,
+          this.actions(),
+          this.homeMode,
+        ),
       );
     }
     this.renderFooter();
@@ -906,10 +994,12 @@ class BlessedTinyPlaceTui {
     if (this.autoStartUsed) {
       return;
     }
-    if (
-      this.state.view !== "welcome" ||
-      this.state.selectedIndex !== CODEX_ACTION_INDEX
-    ) {
+    // Home mode has no pre-chosen agent, so never auto-launch — the developer
+    // picks Codex or Claude explicitly.
+    if (this.homeMode) {
+      return;
+    }
+    if (this.state.view !== "welcome" || this.selectedAction() !== "launch") {
       return;
     }
     const timeoutMs = autoStartMs(this.ctx.env);
@@ -1011,6 +1101,8 @@ function renderWelcomeContent(
   ctx: CliContext,
   profile: AgentProfile,
   state: Readonly<TuiState>,
+  actions: ReadonlyArray<TuiAction>,
+  homeMode: boolean,
 ): string {
   const timeoutMs = autoStartMs(ctx.env);
   const launchLabel =
@@ -1019,13 +1111,16 @@ function renderWelcomeContent(
       : state.autoStartAvailable && timeoutMs > 0
         ? `[ Launch ${profile.displayName} automatically in ${formatDuration(timeoutMs)} ]`
         : `[ Launch ${profile.displayName} ]`;
-  const lines = [
-    "{bold}welcome to tiny.place{/bold}",
-    `{gray-fg}${profile.displayName} runs inside this shell while tiny.place tracks the active ${profile.displayName} session.{/gray-fg}`,
-    "",
+  const header = homeMode
+    ? "{gray-fg}Pick a session to start, or connect your OpenHuman. Arrows/j,k move · Enter selects · q quits.{/gray-fg}"
+    : `{gray-fg}${profile.displayName} runs inside this shell while tiny.place tracks the active ${profile.displayName} session.{/gray-fg}`;
+  const info = [
     renderKeyValue("tiny.place", ctx.baseUrl, "{cyan-fg}"),
     renderKeyValue("wallet", walletIdFor(ctx), "{yellow-fg}"),
-    renderKeyValue(profile.kind, profile.launch.label, "{green-fg}"),
+    // Fixed-agent mode names the one agent; home mode doesn't bind one yet.
+    ...(homeMode
+      ? []
+      : [renderKeyValue(profile.kind, profile.launch.label, "{green-fg}")]),
     renderKeyValue("sessions", profile.sessionsDir, "{cyan-fg}"),
     state.openHumanConnected
       ? renderKeyValue(
@@ -1034,35 +1129,51 @@ function renderWelcomeContent(
           "{green-fg}",
         )
       : renderKeyValue("OpenHuman", "disconnected", "{gray-fg}"),
+  ];
+  const rows = actions.map((action, index) => {
+    const [label, colorTag] = actionRow(action, launchLabel, state);
+    return renderActionRow(state.selectedIndex === index, label, colorTag);
+  });
+  const lines = [
+    "{bold}welcome to tiny.place{/bold}",
+    header,
     "",
-    renderActionRow(
-      state.selectedIndex === CODEX_ACTION_INDEX,
-      launchLabel,
-      "{green-fg}",
-    ),
-    renderActionRow(
-      state.selectedIndex === OPENHUMAN_ACTION_INDEX,
-      state.openHumanConnected
-        ? "[ Connect with OpenHuman ] connected"
-        : "[ Connect with OpenHuman ]",
-      state.openHumanConnected ? "{green-fg}" : "{cyan-fg}",
-    ),
-    renderActionRow(
-      state.selectedIndex === SETTINGS_ACTION_INDEX,
-      "[ Settings ]",
-      "{cyan-fg}",
-    ),
-    renderActionRow(
-      state.selectedIndex === QUIT_ACTION_INDEX,
-      "[ Quit ]",
-      "{gray-fg}",
-    ),
+    ...info,
+    "",
+    ...rows,
     "",
     state.notice
       ? `{yellow-fg}${state.notice}{/yellow-fg}`
       : "{gray-fg}Enter launches the selected action. Move selection to cancel auto-launch. q quits.{/gray-fg}",
   ];
   return `${lines.join("\n")}\n`;
+}
+
+/** Label + color for one welcome-menu action row. */
+function actionRow(
+  action: TuiAction,
+  launchLabel: string,
+  state: Readonly<TuiState>,
+): [string, string] {
+  switch (action) {
+    case "launch":
+      return [launchLabel, "{green-fg}"];
+    case "launch-codex":
+      return ["[ Start Codex session ]", "{green-fg}"];
+    case "launch-claude":
+      return ["[ Start Claude session ]", "{green-fg}"];
+    case "connect":
+      return [
+        state.openHumanConnected
+          ? "[ Connect with OpenHuman ] connected"
+          : "[ Connect with OpenHuman ]",
+        state.openHumanConnected ? "{green-fg}" : "{cyan-fg}",
+      ];
+    case "settings":
+      return ["[ Settings ]", "{cyan-fg}"];
+    case "quit":
+      return ["[ Quit ]", "{gray-fg}"];
+  }
 }
 
 function renderActionRow(
@@ -1521,6 +1632,7 @@ function splitShellWords(input: string): Array<string> {
 
 function renderStaticSnapshot(ctx: CliContext, profile: AgentProfile): string {
   const timeoutMs = autoStartMs(ctx.env);
+  const owner = bridgeOwner(ctx.env) ?? ctx.openHumanOwner;
   const lines = [
     "welcome to tiny.place",
     `${profile.displayName} runs inside this shell while tiny.place tracks the active ${profile.displayName} session.`,
@@ -1529,7 +1641,9 @@ function renderStaticSnapshot(ctx: CliContext, profile: AgentProfile): string {
     `wallet: ${walletIdFor(ctx)}`,
     `${profile.kind}: ${profile.launch.label}`,
     `sessions: ${profile.sessionsDir}`,
-    "OpenHuman: disconnected",
+    owner
+      ? `OpenHuman: ${owner} (auto-connect on launch)`
+      : "OpenHuman: disconnected",
     "",
     `> ${
       timeoutMs > 0
@@ -1541,6 +1655,36 @@ function renderStaticSnapshot(ctx: CliContext, profile: AgentProfile): string {
     "  [ Quit ]",
     "",
     "Enter launches the selected action. Move selection to cancel auto-launch. q quits.",
+    `${ctx.baseUrl ? "Connected to tiny.place" : "Disconnected"} - Chat id: none`,
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Non-TTY snapshot for bare `tinyplace` (home mode) — the agent picker. Mirrors
+ * the interactive home menu so scripts / `| cat` see the same options.
+ */
+function renderHomeSnapshot(ctx: CliContext): string {
+  const owner = bridgeOwner(ctx.env) ?? ctx.openHumanOwner;
+  const lines = [
+    "welcome to tiny.place",
+    "Pick a session to start, or connect your OpenHuman.",
+    "",
+    `tiny.place: ${ctx.baseUrl}`,
+    `wallet: ${walletIdFor(ctx)}`,
+    owner
+      ? `OpenHuman: ${owner} (auto-connect on launch)`
+      : "OpenHuman: disconnected",
+    "",
+    "> [ Start Codex session ]",
+    "  [ Start Claude session ]",
+    owner
+      ? "  [ Connect with OpenHuman ] connected"
+      : "  [ Connect with OpenHuman ]",
+    "  [ Settings ]",
+    "  [ Quit ]",
+    "",
+    "Arrows/j,k move · Enter selects · q quits.",
     `${ctx.baseUrl ? "Connected to tiny.place" : "Disconnected"} - Chat id: none`,
   ];
   return `${lines.join("\n")}\n`;

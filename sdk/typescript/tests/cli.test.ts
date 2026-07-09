@@ -890,16 +890,29 @@ describe("tinyplace CLI", () => {
     expect(graphql!.body).toMatch(/batched GraphQL gateway/);
     expect(graphql!.body).toMatch(/429/);
 
-    const help = await runTinyPlaceCli([], {});
+    const help = await runTinyPlaceCli(["help"], {});
     expect(help.stdout).toContain("graphql");
   });
 
   it("help separates workflows from raw commands", async () => {
-    const help = await runTinyPlaceCli([], {});
+    const help = await runTinyPlaceCli(["help"], {});
     expect(help.code).toBe(0);
     expect(help.stdout).toContain("Workflows");
     expect(help.stdout).toContain("tinyplace raw <command>");
     expect(help.stdout).toContain("status");
+  });
+
+  it("bare `tinyplace` opens the Home picker (both agents), not the help dump", async () => {
+    const home = await runTinyPlaceCli([], {
+      env: { TINYPLACE_ENDPOINT: "https://example.test" },
+    });
+    expect(home.code).toBe(0);
+    expect(home.stdout).toContain("welcome to tiny.place");
+    expect(home.stdout).toContain("[ Start Codex session ]");
+    expect(home.stdout).toContain("[ Start Claude session ]");
+    expect(home.stdout).toContain("[ Connect with OpenHuman ]");
+    // The command reference is NOT dumped for the bare entry anymore.
+    expect(home.stdout).not.toContain("tinyplace raw <command>");
   });
 
   it("documents the full feed surface, including likes", () => {

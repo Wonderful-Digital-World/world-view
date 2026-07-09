@@ -132,12 +132,30 @@ async function dispatchCli(
     };
   }
   if (
-    !parsed.command ||
     parsed.command === "help" ||
     parsed.command === "--help" ||
     boolFlag(parsed.flags, "help")
   ) {
     return { code: 0, stdout: HELP, stderr: "" };
+  }
+  // Bare `tinyplace` (no subcommand) opens the HOME menu — a navigable picker
+  // for Codex / Claude / Connect OpenHuman — so developers don't have to recall
+  // subcommands. `tinyplace help` still prints the command reference above.
+  if (!parsed.command) {
+    try {
+      const ctx = await makeContext(options);
+      return await runTinyPlaceTui(ctx, options);
+    } catch (error) {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: `${JSON.stringify(
+          { error: error instanceof Error ? error.message : String(error) },
+          null,
+          2,
+        )}\n`,
+      };
+    }
   }
   if (parsed.command === "codex") {
     try {
