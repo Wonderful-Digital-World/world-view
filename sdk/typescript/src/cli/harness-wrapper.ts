@@ -1522,6 +1522,12 @@ function readSessionMeta(
   provider: HarnessProvider,
   path: string,
 ): SessionMeta | undefined {
+  // A claude session can open with a cwd-less record (e.g. `type:"last-prompt"`
+  // on a resumed session). Returning on that first line would yield a meta with
+  // no `cwd`, which `locateSession` rejects (`meta.cwd === this.cwd`) — silently
+  // orphaning the whole (correct) session so the tailer never streams. Remember
+  // the id from such lines but keep scanning for one that records the cwd.
+  let claudeFallbackId: string | undefined;
   for (const raw of readAllLines(path)) {
     const record = parseJsonObject(raw);
     if (!record) {
@@ -1540,12 +1546,19 @@ function readSessionMeta(
       };
     }
     if (provider === "claude") {
-      const sessionId = asString(record.sessionId) ?? basename(path, ".jsonl");
-      return {
-        ...(asString(record.cwd) ? { cwd: asString(record.cwd) } : {}),
-        sessionId,
-      };
+      const cwd = asString(record.cwd);
+      const sessionId = asString(record.sessionId);
+      if (!cwd) {
+        claudeFallbackId ??= sessionId;
+        continue;
+      }
+      return { cwd, sessionId: sessionId ?? basename(path, ".jsonl") };
     }
+  }
+  // No cwd-bearing line found. Surface any id we saw so a directly-specified
+  // session file still resolves (locate-by-cwd simply won't match this one).
+  if (claudeFallbackId) {
+    return { sessionId: claudeFallbackId };
   }
   return undefined;
 }
