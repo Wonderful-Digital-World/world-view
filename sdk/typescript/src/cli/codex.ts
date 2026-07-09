@@ -221,9 +221,15 @@ async function runAgentTui(
   // An installed dependency (resolved from node_modules) already has its deps;
   // only the in-repo checkout — a standalone package excluded from the workspace
   // — can be missing them, and would otherwise crash with ERR_MODULE_NOT_FOUND.
+  // An injected `options.spawn` (tests) never really launches node, so skip the
+  // real-launch precondition and let the dispatch/harness wiring be asserted.
   const isInstalledDependency = launcher.includes(`${sep}node_modules${sep}`);
   const pluginDir = dirname(dirname(launcher));
-  if (!isInstalledDependency && !existsSync(join(pluginDir, "node_modules"))) {
+  if (
+    options.spawn === undefined &&
+    !isInstalledDependency &&
+    !existsSync(join(pluginDir, "node_modules"))
+  ) {
     return failure(
       `The tiny.place plugin at ${pluginDir} has no node_modules — it is a standalone ` +
         "package excluded from the workspace. Install its deps first: " +
@@ -248,7 +254,7 @@ async function runAgentTui(
     childEnv.TINYPLACE_AUTORESPOND = "off";
   }
 
-  const code = await spawnInteractive("node", launcherArgs, childEnv);
+  const code = await spawnInteractive("node", launcherArgs, childEnv, options.spawn);
   return { code, stdout: "", stderr: "" };
 }
 
@@ -256,14 +262,22 @@ function failure(message: string): TinyPlaceCliResult {
   return { code: 1, stdout: "", stderr: `${JSON.stringify({ error: message }, null, 2)}\n` };
 }
 
-/** Spawn the interactive launcher, inheriting the TTY; resolve its exit code. */
+/**
+ * Spawn the interactive launcher, inheriting the TTY; resolve its exit code. A
+ * caller-supplied `spawn` (tests) is used instead of the real child_process
+ * spawn — the injected form omits `stdio: "inherit"` (its type forbids it) since
+ * the test child never touches a real TTY.
+ */
 function spawnInteractive(
   command: string,
   args: Array<string>,
   env: NodeJS.ProcessEnv,
+  injectedSpawn?: TinyPlaceCliOptions["spawn"],
 ): Promise<number> {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { stdio: "inherit", env });
+    const child = injectedSpawn
+      ? injectedSpawn(command, args, { env })
+      : spawn(command, args, { stdio: "inherit", env });
     child.on("error", () => resolve(1));
     child.on("exit", (code) => resolve(code ?? 0));
   });
