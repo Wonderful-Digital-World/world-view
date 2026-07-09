@@ -183,6 +183,12 @@ class BlessedTinyPlaceTui {
   // inbound receiver, reused from the harness wrapper.
   private bridgeTailer?: HarnessSessionTailer;
   private bridgeReceiver?: InboundMessageReceiver;
+  // Loop guard: count consecutive auto-submitted inbound turns with no human
+  // keystroke in between. OpenHuman's master auto-replies, so unbounded
+  // auto-submit ping-pongs forever; after MAX_AUTO_INJECTS we stop submitting
+  // (text still parks) until a human types, which resets the counter.
+  private consecutiveAutoInjects = 0;
+  private static readonly MAX_AUTO_INJECTS = 6;
 
   public constructor(
     private readonly ctx: CliContext,
@@ -584,7 +590,58 @@ class BlessedTinyPlaceTui {
       : undefined;
     this.bridgeReceiver?.setSink((text) => {
       bridgeLog("inbound.inject", { chars: text.length });
-      this.writeAgentInput(Buffer.from(text, "utf8"));
+      // The receiver appends a CR to submit. Writing "text\r" straight to the
+      // PTY makes claude's TUI treat the burst as a bracketed paste and swallow
+      // the CR, so the prompt parks unsubmitted. In the native tmux relay,
+      // inject the literal text and then a DISTINCT Enter keypress (separate
+      // send-keys after a short debounce) so the turn actually submits.
+      const body = text.endsWith("\r") ? text.slice(0, -1) : text;
+      // Auto-submit is ON by default: an inbound OpenHuman turn is injected AND
+      // submitted so claude replies without a human keypress. Because
+      // OpenHuman's master also auto-replies, the two can ping-pong; set
+      // TINYPLACE_<KIND>_AUTOSUBMIT=0 to fall back to a human gate (text parks
+      // in the prompt; you press Enter to send). A UI toggle in OpenHuman is the
+      // planned front-door for this same switch.
+      const envAutoSubmit =
+        this.ctx.env[`TINYPLACE_${this.profile.kind.toUpperCase()}_AUTOSUBMIT`] !==
+        "0";
+      // Loop guard: once too many auto-turns fire back-to-back with no human
+      // keystroke, stop auto-submitting so a master↔claude loop can't run away.
+      const guardTripped =
+        this.consecutiveAutoInjects >= BlessedTinyPlaceTui.MAX_AUTO_INJECTS;
+      const autoSubmit = envAutoSubmit && !guardTripped;
+      if (envAutoSubmit && guardTripped) {
+        bridgeLog("inbound.loopGuard", {
+          paused: true,
+          consecutive: this.consecutiveAutoInjects,
+        });
+      }
+      if (autoSubmit) {
+        this.consecutiveAutoInjects += 1;
+      }
+      if (this.tmuxSocket && this.tmuxSession) {
+        const socket = this.tmuxSocket;
+        const session = this.tmuxSession;
+        const cwd = this.options.cwd ?? process.cwd();
+        runTmuxCommand(
+          socket,
+          ["send-keys", "-t", session, "-l", body],
+          this.ctx.env,
+          cwd,
+        );
+        if (autoSubmit) {
+          setTimeout(() => {
+            runTmuxCommand(
+              socket,
+              ["send-keys", "-t", session, "Enter"],
+              this.ctx.env,
+              cwd,
+            );
+          }, 150);
+        }
+        return;
+      }
+      this.writeAgentInput(Buffer.from(autoSubmit ? `${body}\r` : body, "utf8"));
     });
     this.bridgeTailer?.start(new Date());
     void this.bridgeReceiver?.start();
@@ -784,6 +841,9 @@ class BlessedTinyPlaceTui {
       this.pty = pty;
       this.nativeRelayActive = true;
       this.nativeInputHandler = (chunk) => {
+        // A real human keystroke clears the loop-guard streak so auto-submit
+        // resumes after the person re-engages.
+        this.consecutiveAutoInjects = 0;
         pty.write(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk);
       };
       const stdin = this.options.stdin ?? process.stdin;
