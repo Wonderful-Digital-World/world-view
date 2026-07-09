@@ -496,7 +496,9 @@ class BlessedTinyPlaceTui {
           openHumanSessionId: owner,
         };
         // Remember it so the next launch auto-connects without re-asking.
-        void saveOpenHumanOwner(this.ctx.env, owner);
+        // Best-effort: a corrupt/unreadable config must not crash the TUI with an
+        // unhandled rejection — swallow and keep the in-memory owner for this run.
+        void saveOpenHumanOwner(this.ctx.env, owner).catch(() => {});
         // If a session is live, restart the bridge so the new owner takes effect.
         if (this.state.view === "agent") {
           this.stopBridge();
