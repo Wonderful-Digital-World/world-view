@@ -984,12 +984,25 @@ export class SessionEnvelopePublisher {
     if (key.length === 0) {
       return;
     }
-    this.injectedEchoes.set(key, Date.now() + SessionEnvelopePublisher.ECHO_TTL_MS);
+    const now = Date.now();
+    // Prune expired keys on every write so the map stays bounded even when the
+    // echo never comes back (e.g. captureSession off → no tailer → publish()
+    // never consumes entries). Without this it grows one entry per inbound.
+    for (const [existingKey, expiry] of this.injectedEchoes) {
+      if (expiry < now) {
+        this.injectedEchoes.delete(existingKey);
+      }
+    }
+    this.injectedEchoes.set(key, now + SessionEnvelopePublisher.ECHO_TTL_MS);
   }
 
   /** True (consuming the record) if this outbound is an echo of a fresh injection. */
   private isInjectedEcho(envelope: AnySessionEnvelope): boolean {
-    if (envelopeRole(envelope) !== "user") {
+    // The echoed injection is a `user` turn in v1 and an `owner` `user_prompt`
+    // in v2 — accept both, or v2 sessions (TINYPLACE_*_V2=1) leak the echo and
+    // re-enter the auto-reply loop this suppression exists to stop.
+    const role = envelopeRole(envelope);
+    if (role !== "user" && role !== "owner") {
       return false;
     }
     const key = echoKey(envelopeText(envelope));
@@ -1134,16 +1147,23 @@ function envelopeId(envelope: AnySessionEnvelope): string {
     : envelope.message.id;
 }
 
-function envelopeRole(envelope: AnySessionEnvelope): string {
+export function envelopeRole(envelope: AnySessionEnvelope): string {
   return envelope.envelope_version === SESSION_ENVELOPE_VERSION_V2
     ? envelope.event.role
     : envelope.message.role;
 }
 
-function envelopeText(envelope: AnySessionEnvelope): string {
-  return envelope.envelope_version === SESSION_ENVELOPE_VERSION_V2
-    ? ((envelope.event as { text?: string }).text ?? "")
-    : envelope.message.text;
+export function envelopeText(envelope: AnySessionEnvelope): string {
+  if (envelope.envelope_version === SESSION_ENVELOPE_VERSION_V2) {
+    // v2 typed events carry their body under event.payload.text (user_prompt,
+    // agent_message, …); older/other shapes may put it at event.text.
+    const event = envelope.event as {
+      text?: string;
+      payload?: { text?: string };
+    };
+    return event.payload?.text ?? event.text ?? "";
+  }
+  return envelope.message.text;
 }
 
 /** Normalize a message body so an injected inbound and its echoed-back session
