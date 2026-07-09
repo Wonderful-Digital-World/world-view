@@ -37,6 +37,9 @@ interface TuiState {
   autoStartRemainingMs?: number;
   notice?: string;
   openHumanConnected: boolean;
+  // True once the real bridge (tailer/receiver) is running — as opposed to an
+  // owner that is merely remembered/adopted but not yet bridged (pre-launch).
+  bridgeLive?: boolean;
   // Owner entered in the TUI (overrides env); the address/@handle we bridge to.
   openHumanOwner?: string;
   openHumanSessionId?: string;
@@ -317,7 +320,9 @@ class BlessedTinyPlaceTui {
       this.moveSelection(1);
     });
     this.screen.key(["c", "n"], () => {
-      if (this.state.view === "agent") {
+      // Home mode has no single default agent — force the picker (arrows/Enter)
+      // so `c`/`n`/`x` can't silently launch Codex when the user wanted Claude.
+      if (this.homeMode || this.state.view === "agent") {
         return;
       }
       void this.startAgent();
@@ -335,7 +340,7 @@ class BlessedTinyPlaceTui {
       this.connectOpenHuman();
     });
     this.screen.key(["x"], () => {
-      if (this.state.view !== "welcome") {
+      if (this.homeMode || this.state.view !== "welcome") {
         return;
       }
       void this.startAgent();
@@ -483,14 +488,14 @@ class BlessedTinyPlaceTui {
       }
       settled = true;
       modal.destroy();
+      const inAgent = this.state.view === "agent";
       const owner = value?.trim();
       if (owner) {
         this.state = {
           ...this.state,
-          notice:
-            this.state.view === "agent"
-              ? `OpenHuman owner set to ${owner}; reconnecting bridge.`
-              : `OpenHuman owner set to ${owner}. Launch ${this.profile.displayName} to connect.`,
+          notice: inAgent
+            ? `OpenHuman owner set to ${owner}; reconnecting bridge.`
+            : `OpenHuman owner set to ${owner}. Launch ${this.profile.displayName} to connect.`,
           openHumanConnected: true,
           openHumanOwner: owner,
           openHumanSessionId: owner,
@@ -500,9 +505,26 @@ class BlessedTinyPlaceTui {
         // unhandled rejection — swallow and keep the in-memory owner for this run.
         void saveOpenHumanOwner(this.ctx.env, owner).catch(() => {});
         // If a session is live, restart the bridge so the new owner takes effect.
-        if (this.state.view === "agent") {
+        if (inAgent) {
           this.stopBridge();
           this.startBridge();
+        }
+      } else if (value !== undefined) {
+        // Empty SUBMIT (not cancel): forget the remembered owner so it stops
+        // auto-connecting. `undefined` here means Esc/cancel — leave it alone.
+        void saveOpenHumanOwner(this.ctx.env, undefined).catch(() => {});
+        // Also drop the in-context persisted value so resolveOwner() doesn't
+        // resurrect it later this session (env overrides are intentionally kept).
+        this.ctx.openHumanOwner = undefined;
+        this.state = {
+          ...this.state,
+          notice: "OpenHuman owner cleared.",
+          openHumanConnected: false,
+          openHumanOwner: undefined,
+          openHumanSessionId: undefined,
+        };
+        if (inAgent) {
+          this.stopBridge();
         }
       } else {
         this.state = { ...this.state, notice: "OpenHuman owner unchanged." };
@@ -570,6 +592,8 @@ class BlessedTinyPlaceTui {
       ...this.state,
       openHumanConnected: true,
       openHumanSessionId: owner,
+      // The bridge is actually up now — distinct from a merely *remembered* owner.
+      bridgeLive: true,
     };
     if (!this.nativeRelayActive) {
       this.renderFooter();
@@ -582,6 +606,7 @@ class BlessedTinyPlaceTui {
     void this.bridgeReceiver?.stop();
     this.bridgeTailer = undefined;
     this.bridgeReceiver = undefined;
+    this.state = { ...this.state, bridgeLive: false };
   }
 
   private async startAgent(): Promise<void> {
@@ -963,9 +988,12 @@ class BlessedTinyPlaceTui {
     const status = connected
       ? "{green-fg}Connected to tiny.place{/green-fg}"
       : "{red-fg}Disconnected{/red-fg}";
-    const openHuman = this.state.openHumanConnected
-      ? `{green-fg}OpenHuman ${blessed.escape(this.state.openHumanSessionId ?? "")}{/green-fg}`
-      : "{gray-fg}OpenHuman off{/gray-fg}";
+    const ownerLabel = blessed.escape(this.state.openHumanSessionId ?? "");
+    const openHuman = this.state.bridgeLive
+      ? `{green-fg}OpenHuman ${ownerLabel}{/green-fg}`
+      : this.state.openHumanConnected
+        ? `{yellow-fg}OpenHuman ${ownerLabel} (remembered){/yellow-fg}`
+        : "{gray-fg}OpenHuman off{/gray-fg}";
     this.footer.setContent(
       ` ${status} {gray-fg}-{/gray-fg} ${openHuman} {gray-fg}- Chat id:{/gray-fg} {yellow-fg}${blessed.escape(activeSession)}{/yellow-fg}`,
     );
@@ -1138,13 +1166,19 @@ function renderWelcomeContent(
       ? []
       : [renderKeyValue(profile.kind, profile.launch.label, "{green-fg}")]),
     renderKeyValue("sessions", profile.sessionsDir, "{cyan-fg}"),
-    state.openHumanConnected
+    state.bridgeLive
       ? renderKeyValue(
           "OpenHuman",
           `connected to ${state.openHumanSessionId ?? "openhuman:mock"}`,
           "{green-fg}",
         )
-      : renderKeyValue("OpenHuman", "disconnected", "{gray-fg}"),
+      : state.openHumanConnected
+        ? renderKeyValue(
+            "OpenHuman",
+            `remembered ${state.openHumanSessionId ?? ""} (connects on launch)`,
+            "{yellow-fg}",
+          )
+        : renderKeyValue("OpenHuman", "disconnected", "{gray-fg}"),
   ];
   const rows = actions.map((action, index) => {
     const [label, colorTag] = actionRow(action, launchLabel, state);
@@ -1710,8 +1744,6 @@ function walletIdFor(ctx: CliContext): string {
   return ctx.signer?.agentId ?? "mock-wallet-8Hf3Qp2N";
 }
 
-/** The configured OpenHuman owner (whom we bridge to), if any. Mirrors the
- *  wrapper's recipient resolution order. */
 /**
  * The configured OpenHuman owner (whom we bridge to), mirroring the wrapper's
  * provider-scoped recipient resolution. When the agent `kind` is known, only
