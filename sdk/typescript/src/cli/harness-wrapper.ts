@@ -21,6 +21,7 @@ import {
   sendMessage,
   type ReadMessage,
 } from "../agent/messaging.js";
+import { publishCard } from "../agent/identity.js";
 import {
   SESSION_ENVELOPE_VERSION_V1,
   SESSION_ENVELOPE_VERSION_V2,
@@ -1217,6 +1218,21 @@ export class InboundMessageReceiver {
     } catch (error) {
       this.stderr.write(
         `tinyplace ${this.config.provider}: failed to publish Signal keys: ${describeError(error)}\n`,
+      );
+    }
+    // Also register a directory card. publishKeys makes us *messageable* (prekey
+    // bundle) but not *discoverable*: a peer that resolves us by lookup —
+    // OpenHuman's `signal send` hits /directory/agents/<id> — 404s without a
+    // card, so first contact from the owner fails. Best-effort; a card failure
+    // must not stop the inbound poll from starting.
+    try {
+      await publishCard(ctx.client, ctx.signer, {
+        name: `tinyplace ${this.config.provider}`,
+        description: `coding-agent bridge (${this.config.provider}) → OpenHuman`,
+      });
+    } catch (error) {
+      this.stderr.write(
+        `tinyplace ${this.config.provider}: failed to publish directory card: ${describeError(error)}\n`,
       );
     }
     if (this.config.receiveFrom) {
