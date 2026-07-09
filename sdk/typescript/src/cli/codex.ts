@@ -11,7 +11,7 @@ import {
   type CodexWrapperConfig,
 } from "./harness-wrapper.js";
 import { makeContext } from "./context.js";
-import { runTinyPlaceTui } from "./tui.js";
+import { runTinyPlaceTui, type TinyVerseAgentKind } from "./tui.js";
 import type { TinyPlaceCliOptions, TinyPlaceCliResult } from "./types.js";
 
 /** Prod endpoint the SDK falls back to (mirrors `context.ts`). */
@@ -38,21 +38,46 @@ export async function runCodexCommand(
   argv: Array<string>,
   options: TinyPlaceCliOptions = {},
 ): Promise<TinyPlaceCliResult> {
-  if (wantsAgentMode(argv)) {
-    return runCodexAgentTui(argv, options);
-  }
-  if (wantsRawMode(argv)) {
-    return runHarnessCommand("codex", stripFlag(argv, "--raw"), options);
-  }
-  const ctx = await makeContext(options);
-  return runTinyPlaceTui(ctx, options, "codex");
+  return runHarnessAgentCommand("codex", argv, options);
 }
 
+/**
+ * `tinyplace claude` mirrors `tinyplace codex` exactly — same three
+ * mutually-exclusive modes so both agents get the identical onboarding:
+ *
+ * - default: the **tiny.place TUI** — visible wrapper that surfaces the
+ *   OpenHuman connection ("[ Connect with OpenHuman ]"), prompts for the owner,
+ *   and runs the real bidirectional bridge while claude runs inside it.
+ * - `--raw`: the **transparent harness wrapper** (headless; used by
+ *   embedders/tests/smoke).
+ * - `--agent`: a first-class **agent** session via the plugin launcher
+ *   (`--harness claude`) with its own wallet + MCP tools.
+ *
+ * Previously bare `tinyplace claude` went straight to the headless wrapper, so
+ * claude never got the connect-to-OpenHuman step codex users saw. Routing it
+ * through the same dispatch closes that gap.
+ */
 export async function runClaudeCommand(
   argv: Array<string>,
   options: TinyPlaceCliOptions = {},
 ): Promise<TinyPlaceCliResult> {
-  return runHarnessCommand("claude", argv, options);
+  return runHarnessAgentCommand("claude", argv, options);
+}
+
+/** Shared codex/claude dispatch: `--agent` → plugin, `--raw` → wrapper, else TUI. */
+async function runHarnessAgentCommand(
+  harness: TinyVerseAgentKind,
+  argv: Array<string>,
+  options: TinyPlaceCliOptions,
+): Promise<TinyPlaceCliResult> {
+  if (wantsAgentMode(argv)) {
+    return runAgentTui(harness, argv, options);
+  }
+  if (wantsRawMode(argv)) {
+    return runHarnessCommand(harness, stripFlag(argv, "--raw"), options);
+  }
+  const ctx = await makeContext(options);
+  return runTinyPlaceTui(ctx, options, harness);
 }
 
 export function parseCodexWrapperArgs(
@@ -163,17 +188,18 @@ export function parseAgentArgs(argv: Array<string>): AgentInvocation {
   return { wallet, autorespond, passthrough, forwarded: post };
 }
 
-async function runCodexAgentTui(
+async function runAgentTui(
+  harness: TinyVerseAgentKind,
   argv: Array<string>,
   options: TinyPlaceCliOptions,
 ): Promise<TinyPlaceCliResult> {
   const launcher = resolveUnifiedLauncher();
   if (!launcher) {
     return failure(
-      `tinyplace codex --agent needs the unified plugin (${PLUGIN_PACKAGE}), which is not ` +
+      `tinyplace ${harness} --agent needs the unified plugin (${PLUGIN_PACKAGE}), which is not ` +
         "installed. Install it (npm i " +
         `${PLUGIN_PACKAGE}) and re-run, run from a tiny.place checkout, or launch the ` +
-        "plugin directly: node sdk/plugin-tinyplace/bin/tinyplace.mjs --harness codex",
+        `plugin directly: node sdk/plugin-tinyplace/bin/tinyplace.mjs --harness ${harness}`,
     );
   }
   // An installed dependency (resolved from node_modules) already has its deps;
@@ -185,12 +211,12 @@ async function runCodexAgentTui(
     return failure(
       `The tiny.place plugin at ${pluginDir} has no node_modules — it is a standalone ` +
         "package excluded from the workspace. Install its deps first: " +
-        `(cd ${pluginDir} && pnpm install), then re-run tinyplace codex --agent.`,
+        `(cd ${pluginDir} && pnpm install), then re-run tinyplace ${harness} --agent.`,
     );
   }
 
   const { wallet, autorespond, passthrough, forwarded } = parseAgentArgs(argv);
-  const launcherArgs: Array<string> = [launcher, "--harness", "codex"];
+  const launcherArgs: Array<string> = [launcher, "--harness", harness];
   if (wallet) launcherArgs.push("--wallet", wallet);
   const forwardTail = [...passthrough, ...forwarded];
   if (forwardTail.length > 0) launcherArgs.push("--", ...forwardTail);

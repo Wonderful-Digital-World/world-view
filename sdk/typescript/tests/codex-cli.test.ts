@@ -63,6 +63,19 @@ describe("tinyplace codex", () => {
     expect(result.stdout).toContain("welcome to tiny.place");
   });
 
+  it("routes bare `claude` to the TUI too, so it gets the same OpenHuman onboarding as codex", async () => {
+    const result = await runTinyPlaceCli(["claude"], {
+      env: { TINYPLACE_ENDPOINT: "https://relay.test" },
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("welcome to tiny.place");
+    // The claude profile drives the snapshot — not codex.
+    expect(result.stdout).toContain("claude: claude");
+  });
+
   it("proxies terminal streams into envelope files without creating tinyplace context", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "tinyplace-codex-"));
     const stdin = new PassThrough();
@@ -608,6 +621,7 @@ describe("tinyplace codex", () => {
     const resultPromise = runTinyPlaceCli(
       [
         "claude",
+        "--raw",
         "--tinyplace-no-pty",
         "--tinyplace-out",
         tempDir,
