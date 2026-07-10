@@ -1176,11 +1176,15 @@ function renderWelcomeContent(
   const info = [
     renderKeyValue("tiny.place", ctx.baseUrl, "{cyan-fg}"),
     renderKeyValue("wallet", walletIdFor(ctx), "{yellow-fg}"),
-    // Fixed-agent mode names the one agent; home mode doesn't bind one yet.
+    // Fixed-agent mode names the one agent + its sessions dir; home mode hasn't
+    // bound one yet, so showing a codex-specific `sessions:` path there is
+    // misleading — omit both until the user picks an agent.
     ...(homeMode
       ? []
-      : [renderKeyValue(profile.kind, profile.launch.label, "{green-fg}")]),
-    renderKeyValue("sessions", profile.sessionsDir, "{cyan-fg}"),
+      : [
+          renderKeyValue(profile.kind, profile.launch.label, "{green-fg}"),
+          renderKeyValue("sessions", profile.sessionsDir, "{cyan-fg}"),
+        ]),
     state.bridgeLive
       ? renderKeyValue(
           "OpenHuman",
