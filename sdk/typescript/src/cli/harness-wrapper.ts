@@ -6,6 +6,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -87,6 +88,12 @@ export interface HarnessWrapperConfig {
   receiveFrom?: string;
   receivePollMs: number;
   sessionFile?: string;
+  // A resumed session appends to a file that already existed when the tailer
+  // started, so it lands in `ignoredSessionFiles` and would never be tailed.
+  // Setting this un-ignores that one file so the resumed turns still stream
+  // (without pinning — a resume that instead spawns a fresh file is still
+  // located normally). See tui.ts resume flow.
+  resumeSessionFile?: string;
   sessionPollMs: number;
   sessionsDir: string;
   sessionTailGraceMs: number;
@@ -648,6 +655,12 @@ function buildAgentLaunch(config: HarnessWrapperConfig): AgentLaunch {
 export class HarnessSessionTailer {
   private ignoredSessionFiles = new Set<string>();
   private lineOffset = 0;
+  // Lines already present in a resumed file when the tailer started — the offset
+  // to begin at so the pre-existing transcript isn't replayed to OpenHuman.
+  private resumeStartOffset = 0;
+  // Canonicalized (symlink/relative-resolved) path of the resumed file, so the
+  // ignore-set removal and the located-path match key off one stable identity.
+  private resumeSessionPath: string | undefined;
   private startedAt: Date | undefined;
   private sessionFile: string | undefined;
   private sessionMeta: SessionMeta | undefined;
@@ -667,6 +680,25 @@ export class HarnessSessionTailer {
   public start(startedAt: Date): void {
     this.startedAt = startedAt;
     this.ignoredSessionFiles = new Set(listSessionFiles(this.config));
+    // Resume: the file the resumed session appends to already existed, so it was
+    // just swept into the ignore set. Drop it back out so its new turns tail.
+    if (this.config.resumeSessionFile) {
+      // Canonicalize once: the resume path comes from a different origin (session
+      // discovery) than listSessionFiles, so a symlinked / relative / absolute
+      // alias of the same file would otherwise stay ignored or fall through to a
+      // newer fresh file and replay history. Match on the resolved identity.
+      this.resumeSessionPath = canonicalPath(this.config.resumeSessionFile);
+      for (const ignored of this.ignoredSessionFiles) {
+        if (canonicalPath(ignored) === this.resumeSessionPath) {
+          this.ignoredSessionFiles.delete(ignored);
+        }
+      }
+      // Skip the transcript that already exists — only turns appended after the
+      // resume should stream, or OpenHuman would re-receive the whole history.
+      this.resumeStartOffset = readAllLines(
+        this.config.resumeSessionFile,
+      ).length;
+    }
     bridgeLog("tailer.start", {
       startedAt: startedAt.toISOString(),
       cwd: this.cwd,
@@ -703,7 +735,14 @@ export class HarnessSessionTailer {
       }
       this.sessionFile = located.path;
       this.sessionMeta = located.meta;
-      this.lineOffset = 0;
+      // A resumed file starts past its existing transcript; any other located
+      // file is new, so start at 0. Compare on the canonical identity so a
+      // path alias of the resumed file still seeds past its history.
+      this.lineOffset =
+        this.resumeSessionPath !== undefined &&
+        canonicalPath(located.path) === this.resumeSessionPath
+          ? this.resumeStartOffset
+          : 0;
       bridgeLog("tailer.located", {
         path: located.path,
         sessionId: located.meta?.sessionId,
@@ -1676,6 +1715,19 @@ function readNewLines(
   return readAllLines(path)
     .map((raw, index) => ({ line: index + 1, raw }))
     .filter((entry) => entry.line > lineOffset);
+}
+
+/**
+ * Resolve a path to a stable identity for equality checks: symlinks + relative
+ * segments collapsed. Falls back to `resolve()` (absolute, no symlink walk) when
+ * the file doesn't exist yet, so callers still get a normalized comparison key.
+ */
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
 }
 
 function readAllLines(path: string): Array<string> {
