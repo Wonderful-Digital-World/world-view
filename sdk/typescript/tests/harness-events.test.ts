@@ -3,8 +3,10 @@ import {
   claudeEventsFromLine,
   codexEventsFromLine,
   createHarnessLineMapper,
+  createOpenCodeBusMapper,
   harnessEventsFromLine,
   normalizeToolKind,
+  opencodeEventsFromBusEvent,
   toolDisplay,
 } from "../src/cli/harness-events.js";
 import type { HarnessSemanticEvent } from "../src/cli/harness-events.js";
@@ -473,5 +475,251 @@ describe("toolDisplay", () => {
   });
   it("takes only the first line and bounds length", () => {
     expect(toolDisplay("Bash", { command: "line1\nline2" })).toBe("line1");
+  });
+});
+
+// ── opencode SSE bus mapper ───────────────────────────────────────────────────
+
+function busFrame(record: unknown): string {
+  return JSON.stringify(record);
+}
+
+function partUpdated(part: unknown, sessionID = "ses_1"): string {
+  return busFrame({
+    type: "message.part.updated",
+    properties: { sessionID, part, time: 1_700_000_000_000 },
+  });
+}
+
+describe("opencodeEventsFromBusEvent (stateless routing)", () => {
+  it("returns routing keys for a session.created frame with no events", () => {
+    const mapping = opencodeEventsFromBusEvent(
+      busFrame({
+        type: "session.created",
+        properties: { info: { id: "ses_9", directory: "/work/proj" } },
+      }),
+      1,
+    );
+    expect(mapping.sessionID).toBe("ses_9");
+    expect(mapping.directory).toBe("/work/proj");
+    expect(mapping.events).toHaveLength(0);
+  });
+
+  it("maps a session.error frame to an error event", () => {
+    const mapping = opencodeEventsFromBusEvent(
+      busFrame({
+        type: "session.error",
+        properties: {
+          sessionID: "ses_1",
+          error: { name: "ProviderError", data: { message: "no credentials" } },
+        },
+      }),
+      1,
+    );
+    expect(kinds(mapping.events)).toEqual(["error"]);
+    expect(mapping.events[0].event).toMatchObject({
+      kind: "error",
+      role: "agent",
+      payload: { fatal: false },
+    });
+  });
+
+  it("tags a message.part.updated with its sessionID (source filters)", () => {
+    const mapping = opencodeEventsFromBusEvent(
+      partUpdated(
+        {
+          type: "text",
+          id: "prt_1",
+          messageID: "msg_1",
+          text: "hi",
+          time: { start: 1, end: 2 },
+        },
+        "ses_other",
+      ),
+      1,
+    );
+    expect(mapping.sessionID).toBe("ses_other");
+    expect(kinds(mapping.events)).toEqual(["agent_message"]);
+  });
+
+  it("ignores unknown/next.* frames", () => {
+    const mapping = opencodeEventsFromBusEvent(
+      busFrame({ type: "session.next.tool.progress", properties: {} }),
+      1,
+    );
+    expect(mapping.events).toHaveLength(0);
+  });
+});
+
+describe("createOpenCodeBusMapper (stateful dedup)", () => {
+  it("emits exactly one tool_call and one tool_result across snapshots", () => {
+    const map = createOpenCodeBusMapper();
+    const pending = map.next(
+      partUpdated({
+        type: "tool",
+        id: "p1",
+        callID: "c1",
+        tool: "bash",
+        state: { status: "pending" },
+      }),
+      1,
+    );
+    const running = map.next(
+      partUpdated({
+        type: "tool",
+        id: "p1",
+        callID: "c1",
+        tool: "bash",
+        state: { status: "running", input: { command: "ls" } },
+      }),
+      2,
+    );
+    const completed = map.next(
+      partUpdated({
+        type: "tool",
+        id: "p1",
+        callID: "c1",
+        tool: "bash",
+        state: {
+          status: "completed",
+          input: { command: "ls" },
+          output: "a\nb",
+        },
+      }),
+      3,
+    );
+    const extra = map.next(
+      partUpdated({
+        type: "tool",
+        id: "p1",
+        callID: "c1",
+        tool: "bash",
+        state: { status: "completed", output: "a\nb" },
+      }),
+      4,
+    );
+    expect(kinds(pending.events)).toEqual(["tool_call"]);
+    expect(kinds(running.events)).toEqual([]);
+    expect(kinds(completed.events)).toEqual(["tool_result"]);
+    expect(kinds(extra.events)).toEqual([]);
+    expect(completed.events[0].event).toMatchObject({
+      kind: "tool_result",
+      payload: { call_id: "c1", ok: true, is_error: false },
+    });
+  });
+
+  it("synthesizes a tool_call when the first snapshot is already terminal", () => {
+    const map = createOpenCodeBusMapper();
+    const done = map.next(
+      partUpdated({
+        type: "tool",
+        id: "p2",
+        callID: "c2",
+        tool: "read",
+        state: { status: "error", output: "boom" },
+      }),
+      1,
+    );
+    expect(kinds(done.events)).toEqual(["tool_call", "tool_result"]);
+    expect(done.events[1].event).toMatchObject({
+      kind: "tool_result",
+      payload: { ok: false, is_error: true },
+    });
+  });
+
+  it("emits a text part once, on its terminal (time.end) snapshot", () => {
+    const map = createOpenCodeBusMapper();
+    const partial = map.next(
+      partUpdated({
+        type: "text",
+        id: "t1",
+        messageID: "m1",
+        text: "hel",
+        time: { start: 1 },
+      }),
+      1,
+    );
+    const done = map.next(
+      partUpdated({
+        type: "text",
+        id: "t1",
+        messageID: "m1",
+        text: "hello",
+        time: { start: 1, end: 2 },
+      }),
+      2,
+    );
+    expect(kinds(partial.events)).toEqual([]);
+    expect(kinds(done.events)).toEqual(["agent_message"]);
+    expect(done.events[0].event).toMatchObject({
+      kind: "agent_message",
+      payload: { text: "hello" },
+    });
+  });
+
+  it("surfaces a user-role text part as an owner prompt", () => {
+    const map = createOpenCodeBusMapper();
+    map.next(
+      busFrame({
+        type: "message.updated",
+        properties: { sessionID: "ses_1", info: { id: "mu", role: "user" } },
+      }),
+      1,
+    );
+    const done = map.next(
+      partUpdated({
+        type: "text",
+        id: "tu",
+        messageID: "mu",
+        text: "do the thing",
+        time: { start: 1, end: 2 },
+      }),
+      2,
+    );
+    expect(done.events[0].event).toMatchObject({
+      kind: "user_prompt",
+      role: "owner",
+      payload: { text: "do the thing", source: "human" },
+    });
+  });
+
+  it("flushes a still-buffered text part via message.updated then flush()", () => {
+    const viaMessage = createOpenCodeBusMapper();
+    viaMessage.next(
+      partUpdated({
+        type: "text",
+        id: "t2",
+        messageID: "m2",
+        text: "buffered",
+        time: { start: 1 },
+      }),
+      1,
+    );
+    const flushed = viaMessage.next(
+      busFrame({
+        type: "message.updated",
+        properties: {
+          sessionID: "ses_1",
+          info: { id: "m2", role: "assistant" },
+        },
+      }),
+      2,
+    );
+    expect(kinds(flushed.events)).toEqual(["agent_message"]);
+
+    const viaFlush = createOpenCodeBusMapper();
+    viaFlush.next(
+      partUpdated({
+        type: "text",
+        id: "t3",
+        messageID: "m3",
+        text: "tail",
+        time: { start: 1 },
+      }),
+      1,
+    );
+    const drained = viaFlush.flush(9);
+    expect(kinds(drained)).toEqual(["agent_message"]);
+    expect(drained[0].event).toMatchObject({ payload: { text: "tail" } });
   });
 });

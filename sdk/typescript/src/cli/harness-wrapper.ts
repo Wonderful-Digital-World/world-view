@@ -51,6 +51,12 @@ import {
   type SessionStatusState,
 } from "./harness-status.js";
 import { makeContext } from "./context.js";
+import { makePathLookup } from "./daemon/providers.js";
+import {
+  OpenCodeEventSource,
+  startOpenCodeServer,
+  type OpenCodeServerHandle,
+} from "./opencode-source.js";
 import type { TinyPlaceCliOptions, TinyPlaceCliResult } from "./types.js";
 import type { Writable } from "node:stream";
 
@@ -162,7 +168,7 @@ interface SessionMeta {
   sessionId: string;
 }
 
-interface SemanticMessage {
+export interface SemanticMessage {
   line: number;
   phase?: string;
   recordType: string;
@@ -229,15 +235,67 @@ export async function runHarnessCommand(
   };
   const writer = new TerminalEnvelopeWriter(config, cwd, stdio.stderr);
   const publisher = new SessionEnvelopePublisher(config, options, stdio.stderr);
-  const sessionTailer = config.captureSession
-    ? new HarnessSessionTailer(config, cwd, stdio.stderr, publisher)
-    : undefined;
   const receiver = config.receiveEnabled
     ? new InboundMessageReceiver(config, publisher, stdio.stderr)
     : undefined;
-  const launch = buildAgentLaunch(config);
 
   const usePty = config.usePty && options.spawn === undefined;
+  // opencode has no per-session transcript files — it is observed over its
+  // HTTP server's SSE bus instead of the file tailer, and only when a real TTY
+  // is present (its bridge attaches to an interactive `opencode attach` TUI).
+  const opencodeBridge =
+    provider === "opencode" && config.captureSession && usePty;
+
+  const sessionTailer =
+    config.captureSession && provider !== "opencode"
+      ? new HarnessSessionTailer(config, cwd, stdio.stderr, publisher)
+      : undefined;
+
+  let opencodeServer: OpenCodeServerHandle | undefined;
+  let opencodeSource: OpenCodeEventSource | undefined;
+  let launch = buildAgentLaunch(config);
+
+  if (opencodeBridge) {
+    if (!makePathLookup(env)(config.agentBin)) {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: `${JSON.stringify(
+          {
+            error:
+              `opencode not found on PATH as \`${config.agentBin}\`. Install it ` +
+              "(https://opencode.ai) or set TINYPLACE_OPENCODE_BIN to its path.",
+          },
+          null,
+          2,
+        )}\n`,
+      };
+    }
+    opencodeServer = await startOpenCodeServer({
+      bin: config.agentBin,
+      cwd,
+      env,
+    });
+    opencodeSource = new OpenCodeEventSource(
+      config,
+      cwd,
+      stdio.stderr,
+      publisher,
+    );
+    opencodeSource.start(`${opencodeServer.url}/event`);
+    // Attach the interactive TUI to the server we observe, so the human's
+    // session and our SSE bridge share one process.
+    launch = {
+      command: config.agentBin,
+      args: ["attach", opencodeServer.url, ...config.agentArgs],
+    };
+  } else if (provider === "opencode" && config.captureSession && !usePty) {
+    stdio.stderr.write(
+      "[tinyplace] opencode's session bridge needs a TTY (it attaches to the " +
+        "interactive TUI); running opencode without the OpenHuman bridge.\n",
+    );
+  }
+
   writer.pty = usePty;
   writer.write(
     "lifecycle",
@@ -254,22 +312,33 @@ export async function runHarnessCommand(
   const onInputSink = receiver
     ? (write: (text: string) => void): void => receiver.setSink(write)
     : undefined;
-  const exitCode = usePty
-    ? await runPtyAgent(launch, config, cwd, env, writer, stdio, onInputSink)
-    : await runPipeAgent(
-        launch,
-        config,
-        cwd,
-        env,
-        writer,
-        stdio,
-        spawnFn,
-        onInputSink,
-      );
 
-  const dmFailures = (await sessionTailer?.stop()) ?? 0;
-  if (receiver) {
-    await receiver.stop();
+  let exitCode = 1;
+  let dmFailures = 0;
+  try {
+    exitCode = usePty
+      ? await runPtyAgent(launch, config, cwd, env, writer, stdio, onInputSink)
+      : await runPipeAgent(
+          launch,
+          config,
+          cwd,
+          env,
+          writer,
+          stdio,
+          spawnFn,
+          onInputSink,
+        );
+  } finally {
+    // Teardown order: stop the session observer (flushes the publisher) → stop
+    // inbound → kill the opencode server. In a `finally` so a spawn failure
+    // still tears the server down instead of leaking a `serve` process.
+    dmFailures = opencodeSource
+      ? await opencodeSource.stop().catch(() => 0)
+      : ((await sessionTailer?.stop()) ?? 0);
+    if (receiver) {
+      await receiver.stop();
+    }
+    await opencodeServer?.stop().catch(() => undefined);
   }
 
   return {
@@ -655,6 +724,214 @@ function buildAgentLaunch(config: HarnessWrapperConfig): AgentLaunch {
   return { command: config.agentBin, args: config.agentArgs };
 }
 
+/**
+ * The session identity a set of envelopes is framed against. The file tailer
+ * derives it from a located transcript file (`sessionMeta.sessionId` + path);
+ * the opencode SSE source derives it from a `session.created` bus event +
+ * a synthetic `opencode-sse://…` path. Threaded per-emit so one emitter can
+ * serve either source without baking in a file identity.
+ */
+export interface EmitIdentity {
+  sessionId: string;
+  sourcePath: string;
+}
+
+/**
+ * The shared v1-message + v2-typed-event + status emit machinery, factored out
+ * of `HarnessSessionTailer` so a non-file session source (opencode's SSE bus)
+ * can reuse the exact envelope framing, output-file writing, dedup-free publish,
+ * and status derivation. Owns only the emit-side stream state (status, v2 seq,
+ * heartbeat) — the source owns discovery/identity and hands an `EmitIdentity`
+ * to every call. Behavior is byte-identical to the pre-extraction tailer.
+ */
+export class SessionEnvelopeEmitter {
+  private status: SessionStatusState = initialStatus();
+  private v2Seq = 0;
+  private lastHeartbeatMs = 0;
+  // Highest source line seen — used as the `line` on derived status events.
+  private lastLine = 0;
+
+  public constructor(
+    private readonly config: HarnessWrapperConfig,
+    private readonly cwd: string,
+    private readonly dryRunOutput: Writable,
+    private readonly publisher: SessionEnvelopePublisher,
+  ) {}
+
+  /** Emit one v1 session-message envelope. */
+  public emitV1Message(message: SemanticMessage, id: EmitIdentity): void {
+    this.lastLine = Math.max(this.lastLine, message.line);
+    const bucketStart = floorTimestamp(message.timestamp, this.config.bucket);
+    const bucketEnd = addBucket(bucketStart, this.config.bucket);
+    const envelope: SessionEnvelope = {
+      envelope_version: SESSION_ENVELOPE_VERSION_V1,
+      version: 1,
+      bucket: {
+        unit: this.config.bucket,
+        start: formatTimestamp(bucketStart),
+        end: formatTimestamp(bucketEnd),
+      },
+      scope: {
+        type: this.config.scope,
+        key: this.scopeKey(),
+        cwd: this.cwd,
+        wrapper_session_id: this.config.wrapperSessionId,
+        harness_session_id: id.sessionId,
+      },
+      harness: {
+        provider: this.config.provider,
+        command: this.config.agentBin,
+        argv: this.config.agentArgs,
+      },
+      message: {
+        id: stableEventId(
+          id.sessionId,
+          message.role,
+          message.line,
+          message.text,
+        ),
+        line: message.line,
+        ...(message.phase ? { phase: message.phase } : {}),
+        role: message.role,
+        text: message.text,
+        timestamp: formatTimestamp(message.timestamp),
+      },
+      source: {
+        path: id.sourcePath,
+        record_type: message.recordType,
+        ...(message.sourceRole ? { source_role: message.sourceRole } : {}),
+      },
+    };
+    bridgeLog("emit.message", {
+      id: envelope.message.id,
+      role: message.role,
+      line: message.line,
+      recordType: message.recordType,
+      textPreview: message.text,
+    });
+    this.writeEnvelope(envelope);
+    this.publisher.publish(envelope);
+  }
+
+  /** Emit one typed v2 event, then the status transition it implies. */
+  public emitV2Event(semantic: HarnessSemanticEvent, id: EmitIdentity): void {
+    this.lastLine = Math.max(this.lastLine, semantic.line);
+    const ctx = this.v2Context(id);
+    const envelope = buildEventEnvelopeV2(ctx, semantic, this.nextV2Seq());
+    bridgeLog("emit.v2.event", {
+      id: envelope.event.id,
+      seq: envelope.event.seq,
+      kind: envelope.event.kind,
+      line: semantic.line,
+    });
+    this.writeEnvelope(envelope);
+    this.publisher.publish(envelope);
+
+    const step = reduceStatus(this.status, semantic);
+    this.status = step.next;
+    if (step.emit) {
+      this.publishStatus(step.emit, Date.now(), id);
+    }
+  }
+
+  /** Age a silent session toward idle and emit a periodic heartbeat status. */
+  public tick(id: EmitIdentity): void {
+    const now = Date.now();
+    const heartbeat =
+      now - this.lastHeartbeatMs >= this.config.statusHeartbeatMs;
+    const step = tickStatus(this.status, now, {
+      idleAfterMs: this.config.statusIdleMs,
+      heartbeat,
+    });
+    this.status = step.next;
+    if (step.emit) {
+      this.lastHeartbeatMs = now;
+      this.publishStatus(step.emit, now, id);
+    }
+  }
+
+  private publishStatus(
+    payload: StatusPayload,
+    nowMs: number,
+    id: EmitIdentity,
+  ): void {
+    const semantic: HarnessSemanticEvent = {
+      line: this.lastLine,
+      timestamp: new Date(nowMs),
+      recordType: "derived:status",
+      event: { kind: "status", role: "agent", payload },
+    };
+    const ctx = this.v2Context(id);
+    const envelope = buildEventEnvelopeV2(ctx, semantic, this.nextV2Seq());
+    this.writeEnvelope(envelope);
+    this.publisher.publish(envelope);
+  }
+
+  private v2Context(id: EmitIdentity): EnvelopeContext {
+    return {
+      provider: this.config.provider,
+      command: this.config.agentBin,
+      argv: this.config.agentArgs,
+      scopeType: this.config.scope,
+      scopeKey: this.scopeKey(),
+      cwd: this.cwd,
+      wrapperSessionId: this.config.wrapperSessionId,
+      harnessSessionId: id.sessionId,
+      bucketUnit: this.config.bucket,
+      sourcePath: id.sourcePath,
+    };
+  }
+
+  private nextV2Seq(): number {
+    const seq = this.v2Seq;
+    this.v2Seq += 1;
+    return seq;
+  }
+
+  private writeEnvelope(envelope: AnySessionEnvelope): void {
+    const encoded = `${JSON.stringify(envelope)}\n`;
+    if (this.config.dryRun) {
+      this.dryRunOutput.write(encoded);
+      return;
+    }
+    const target = this.outputPath(envelope);
+    mkdirSync(resolve(target, ".."), { recursive: true });
+    writeFileSync(target, encoded, { encoding: "utf8", flag: "a" });
+  }
+
+  private outputPath(envelope: AnySessionEnvelope): string {
+    const bucketStart = new Date(envelope.bucket.start);
+    const fileName = bucketFileName(bucketStart, this.config.bucket);
+    if (this.config.scope === "session") {
+      return join(
+        this.config.outDir,
+        "messages",
+        "sessions",
+        safeSlug(this.config.wrapperSessionId),
+        fileName,
+      );
+    }
+    return join(
+      this.config.outDir,
+      "messages",
+      "folders",
+      safeSlug(this.scopeKey()),
+      fileName,
+    );
+  }
+
+  private scopeKey(): string {
+    if (this.config.scope === "session") {
+      return this.config.wrapperSessionId;
+    }
+    const digest = createHash("sha256")
+      .update(this.cwd)
+      .digest("hex")
+      .slice(0, 12);
+    return `${basename(this.cwd) || "root"}-${digest}`;
+  }
+}
+
 export class HarnessSessionTailer {
   private ignoredSessionFiles = new Set<string>();
   private lineOffset = 0;
@@ -668,10 +945,8 @@ export class HarnessSessionTailer {
   private sessionFile: string | undefined;
   private sessionMeta: SessionMeta | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
-  // v2 typed-event stream state (only used when config.emitV2 is on).
-  private status: SessionStatusState = initialStatus();
-  private v2Seq = 0;
-  private lastHeartbeatMs = 0;
+  // Shared v1/v2/status emit machinery (envelope framing + publish + output).
+  private readonly emitter: SessionEnvelopeEmitter;
   // Stateful per-stream mapper: dedupes codex's double-recorded assistant
   // message (event_msg + response_item for the same turn).
   private readonly mapEventsFromLine: HarnessLineMapper;
@@ -683,6 +958,23 @@ export class HarnessSessionTailer {
     private readonly publisher: SessionEnvelopePublisher,
   ) {
     this.mapEventsFromLine = createHarnessLineMapper(config.provider);
+    this.emitter = new SessionEnvelopeEmitter(
+      config,
+      cwd,
+      dryRunOutput,
+      publisher,
+    );
+  }
+
+  /** The located file's identity, for handing to the shared emitter. */
+  private identity(): EmitIdentity | undefined {
+    if (!this.sessionFile || !this.sessionMeta) {
+      return undefined;
+    }
+    return {
+      sessionId: this.sessionMeta.sessionId,
+      sourcePath: this.sessionFile,
+    };
   }
 
   public start(startedAt: Date): void {
@@ -758,6 +1050,10 @@ export class HarnessSessionTailer {
       });
     }
 
+    const id = this.identity();
+    if (!id) {
+      return;
+    }
     const lines = readNewLines(this.sessionFile, this.lineOffset);
     this.lineOffset += lines.length;
     if (lines.length > 0) {
@@ -769,11 +1065,11 @@ export class HarnessSessionTailer {
           line,
         )) {
           semanticCount += 1;
-          this.write(message);
+          this.emitter.emitV1Message(message, id);
         }
         if (this.config.emitV2) {
           for (const event of this.mapEventsFromLine(raw, line)) {
-            this.writeV2(event);
+            this.emitter.emitV2Event(event, id);
           }
         }
       }
@@ -785,7 +1081,7 @@ export class HarnessSessionTailer {
     }
     // Even with no new lines, age a silent session toward idle and heartbeat.
     if (this.config.emitV2) {
-      this.tickV2Status();
+      this.emitter.tick(id);
     }
   }
 
@@ -838,184 +1134,6 @@ export class HarnessSessionTailer {
       });
     }
     return candidates[0];
-  }
-
-  private write(message: SemanticMessage): void {
-    if (!this.sessionFile || !this.sessionMeta) {
-      return;
-    }
-    const bucketStart = floorTimestamp(message.timestamp, this.config.bucket);
-    const bucketEnd = addBucket(bucketStart, this.config.bucket);
-    const envelope: SessionEnvelope = {
-      envelope_version: SESSION_ENVELOPE_VERSION_V1,
-      version: 1,
-      bucket: {
-        unit: this.config.bucket,
-        start: formatTimestamp(bucketStart),
-        end: formatTimestamp(bucketEnd),
-      },
-      scope: {
-        type: this.config.scope,
-        key: this.scopeKey(),
-        cwd: this.cwd,
-        wrapper_session_id: this.config.wrapperSessionId,
-        harness_session_id: this.sessionMeta.sessionId,
-      },
-      harness: {
-        provider: this.config.provider,
-        command: this.config.agentBin,
-        argv: this.config.agentArgs,
-      },
-      message: {
-        id: stableEventId(
-          this.sessionMeta.sessionId,
-          message.role,
-          message.line,
-          message.text,
-        ),
-        line: message.line,
-        ...(message.phase ? { phase: message.phase } : {}),
-        role: message.role,
-        text: message.text,
-        timestamp: formatTimestamp(message.timestamp),
-      },
-      source: {
-        path: this.sessionFile,
-        record_type: message.recordType,
-        ...(message.sourceRole ? { source_role: message.sourceRole } : {}),
-      },
-    };
-    bridgeLog("tailer.message", {
-      id: envelope.message.id,
-      role: message.role,
-      line: message.line,
-      recordType: message.recordType,
-      textPreview: message.text,
-    });
-    this.writeEnvelope(envelope);
-    this.publisher.publish(envelope);
-  }
-
-  /** Emit one typed v2 event, then the status transition it implies. */
-  private writeV2(semantic: HarnessSemanticEvent): void {
-    if (!this.sessionFile || !this.sessionMeta) {
-      return;
-    }
-    const ctx = this.v2Context(this.sessionFile, this.sessionMeta);
-    const envelope = buildEventEnvelopeV2(ctx, semantic, this.nextV2Seq());
-    bridgeLog("tailer.v2.event", {
-      id: envelope.event.id,
-      seq: envelope.event.seq,
-      kind: envelope.event.kind,
-      line: semantic.line,
-    });
-    this.writeEnvelope(envelope);
-    this.publisher.publish(envelope);
-
-    const step = reduceStatus(this.status, semantic);
-    this.status = step.next;
-    if (step.emit) {
-      this.publishStatus(step.emit, Date.now());
-    }
-  }
-
-  /** Age a silent session toward idle and emit a periodic heartbeat status. */
-  private tickV2Status(): void {
-    if (!this.sessionFile || !this.sessionMeta) {
-      return;
-    }
-    const now = Date.now();
-    const heartbeat =
-      now - this.lastHeartbeatMs >= this.config.statusHeartbeatMs;
-    const step = tickStatus(this.status, now, {
-      idleAfterMs: this.config.statusIdleMs,
-      heartbeat,
-    });
-    this.status = step.next;
-    if (step.emit) {
-      this.lastHeartbeatMs = now;
-      this.publishStatus(step.emit, now);
-    }
-  }
-
-  private publishStatus(payload: StatusPayload, nowMs: number): void {
-    if (!this.sessionFile || !this.sessionMeta) {
-      return;
-    }
-    const semantic: HarnessSemanticEvent = {
-      line: this.lineOffset,
-      timestamp: new Date(nowMs),
-      recordType: "derived:status",
-      event: { kind: "status", role: "agent", payload },
-    };
-    const ctx = this.v2Context(this.sessionFile, this.sessionMeta);
-    const envelope = buildEventEnvelopeV2(ctx, semantic, this.nextV2Seq());
-    this.writeEnvelope(envelope);
-    this.publisher.publish(envelope);
-  }
-
-  private v2Context(sessionFile: string, meta: SessionMeta): EnvelopeContext {
-    return {
-      provider: this.config.provider,
-      command: this.config.agentBin,
-      argv: this.config.agentArgs,
-      scopeType: this.config.scope,
-      scopeKey: this.scopeKey(),
-      cwd: this.cwd,
-      wrapperSessionId: this.config.wrapperSessionId,
-      harnessSessionId: meta.sessionId,
-      bucketUnit: this.config.bucket,
-      sourcePath: sessionFile,
-    };
-  }
-
-  private nextV2Seq(): number {
-    const seq = this.v2Seq;
-    this.v2Seq += 1;
-    return seq;
-  }
-
-  private writeEnvelope(envelope: AnySessionEnvelope): void {
-    const encoded = `${JSON.stringify(envelope)}\n`;
-    if (this.config.dryRun) {
-      this.dryRunOutput.write(encoded);
-      return;
-    }
-    const target = this.outputPath(envelope);
-    mkdirSync(resolve(target, ".."), { recursive: true });
-    writeFileSync(target, encoded, { encoding: "utf8", flag: "a" });
-  }
-
-  private outputPath(envelope: AnySessionEnvelope): string {
-    const bucketStart = new Date(envelope.bucket.start);
-    const fileName = bucketFileName(bucketStart, this.config.bucket);
-    if (this.config.scope === "session") {
-      return join(
-        this.config.outDir,
-        "messages",
-        "sessions",
-        safeSlug(this.config.wrapperSessionId),
-        fileName,
-      );
-    }
-    return join(
-      this.config.outDir,
-      "messages",
-      "folders",
-      safeSlug(this.scopeKey()),
-      fileName,
-    );
-  }
-
-  private scopeKey(): string {
-    if (this.config.scope === "session") {
-      return this.config.wrapperSessionId;
-    }
-    const digest = createHash("sha256")
-      .update(this.cwd)
-      .digest("hex")
-      .slice(0, 12);
-    return `${basename(this.cwd) || "root"}-${digest}`;
   }
 }
 
