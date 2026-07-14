@@ -25,6 +25,7 @@ import {
   createLock,
   createMailbox,
 } from "./daemon/mailbox.js";
+import { readGitFacts } from "./daemon/capabilities.js";
 import { DaemonRuntime } from "./daemon/runtime.js";
 import type { CliContext } from "./types.js";
 import type { Flags } from "./types.js";
@@ -153,11 +154,18 @@ export async function runDaemon(
     const skills = Array.from(
       new Set(["coding-agent", ...providers, ...extraSkills]),
     );
+    // Cheap facts only. The full capability picture (tools, MCP servers) needs an
+    // LLM probe, and startup must not pay for one — peers ask for it on demand
+    // with a `capabilities` frame. The card just says where this daemon lives.
+    const { project } = await readGitFacts(workspace);
+    const bio = `Headless coding-agent daemon serving ${providers.join(", ")} over tiny.place.${
+      project ? ` project:${project}` : ""
+    } cwd:${workspace}`;
     const result = await lock(() =>
       agent.onboard({
         ...(handle ? { handle } : {}),
         displayName: displayName ?? handle ?? `coding-agent daemon`,
-        bio: `Headless coding-agent daemon serving ${providers.join(", ")} over tiny.place.`,
+        bio,
         skills,
       }),
     );
