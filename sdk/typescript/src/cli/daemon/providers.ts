@@ -118,6 +118,8 @@ export interface RunTaskOptions {
   agent?: string;
   /** Extra args appended before the prompt (advanced / permissions). */
   extraArgs?: ReadonlyArray<string>;
+  /** Opt-in bypass of claude's permission prompts. OFF by default. */
+  skipPermissions?: boolean;
   signal?: AbortSignal;
   /** Fired for each parsed semantic event — drives periodic status frames. */
   onEvent?: (event: HarnessSemanticEvent) => void;
@@ -141,6 +143,11 @@ export function buildRunArgs(options: {
   model?: string;
   agent?: string;
   extraArgs?: ReadonlyArray<string>;
+  /** Opt-in: bypass the claude permission prompts (`--dangerously-skip-
+   *  permissions`). OFF by default — a daemon auto-accepts contacts and runs
+   *  remote DM task text, so skipping approval must be an explicit operator
+   *  choice, never the default. */
+  skipPermissions?: boolean;
 }): Array<string> {
   const extra = options.extraArgs ?? [];
   // A prompt beginning with "-" would be parsed as a CLI flag by the provider
@@ -158,6 +165,7 @@ export function buildRunArgs(options: {
         "--output-format",
         "stream-json",
         "--verbose",
+        ...(options.skipPermissions ? ["--dangerously-skip-permissions"] : []),
         ...extra,
         prompt,
       ];
@@ -252,6 +260,7 @@ function runProviderAttempt(options: RunTaskOptions): Promise<RunTaskResult> {
     ...(options.model ? { model: options.model } : {}),
     ...(options.agent ? { agent: options.agent } : {}),
     ...(options.extraArgs ? { extraArgs: options.extraArgs } : {}),
+    ...(options.skipPermissions ? { skipPermissions: true } : {}),
   });
   const bin = providerBin(options.provider, options.env);
   const child = spawn(bin, args, { cwd: options.cwd, env: options.env });
@@ -278,14 +287,25 @@ function runProviderAttempt(options: RunTaskOptions): Promise<RunTaskResult> {
       });
     }
 
-    const timer = setTimeout(() => {
-      finishError(
-        new Error(
-          `${options.provider} task timed out after ${options.timeoutMs}ms`,
-        ),
-      );
-      child.kill("SIGKILL");
-    }, options.timeoutMs);
+    // Idle watchdog, not a hard cap: kill the child only after `timeoutMs` with NO
+    // new event. `armIdle` re-arms on every parsed event (see consumeLine), so a
+    // long-but-active task (streaming tool calls / output) keeps running while a
+    // genuinely wedged one is reaped. Armed once at start to cover a child that
+    // never emits anything.
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    function armIdle(): void {
+      if (settled) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        finishError(
+          new Error(
+            `${options.provider} task idle for ${options.timeoutMs}ms (no events)`,
+          ),
+        );
+        child.kill("SIGKILL");
+      }, options.timeoutMs);
+    }
+    armIdle();
 
     const onAbort = (): void => {
       child.kill("SIGTERM");
@@ -293,7 +313,7 @@ function runProviderAttempt(options: RunTaskOptions): Promise<RunTaskResult> {
     options.signal?.addEventListener("abort", onAbort, { once: true });
 
     function cleanup(): void {
-      clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
       options.signal?.removeEventListener("abort", onAbort);
     }
 
@@ -316,6 +336,7 @@ function runProviderAttempt(options: RunTaskOptions): Promise<RunTaskResult> {
       }
       for (const event of mapEventsFromLine(raw, line)) {
         events += 1;
+        armIdle(); // progress — the task is alive; push the no-event deadline out.
         options.onEvent?.(event);
         if (event.event.kind === "agent_message") {
           messages.push(event.event.payload.text);

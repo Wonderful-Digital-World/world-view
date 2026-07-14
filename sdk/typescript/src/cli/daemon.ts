@@ -31,6 +31,9 @@ import type { Flags } from "./types.js";
 import type { HarnessProvider } from "../types/harness.js";
 
 const DEFAULT_CONCURRENCY = 2;
+// Idle (no-event) watchdog, not a hard cap: a task is killed only after this many
+// ms with NO new event from the provider CLI; each event re-arms it. A long-but-
+// active run survives, a wedged one is reaped ~10 min after it goes silent.
 const DEFAULT_TASK_TIMEOUT_MS = 600_000;
 const DEFAULT_POLL_MS = 2_000;
 
@@ -132,6 +135,10 @@ export async function runDaemon(
     );
   }
   const model = stringFlag(flags, "model");
+  // Opt-in: run claude workers with --dangerously-skip-permissions. OFF unless the
+  // operator passes the flag, because the daemon auto-accepts contacts and executes
+  // remote task text — unattended approval bypass must be an explicit choice.
+  const skipPermissions = boolFlag(flags, "dangerously-skip-permissions");
   const opencodeAgent = stringFlag(flags, "opencode-agent");
   const handle = stringFlag(flags, "handle");
   const displayName = stringFlag(flags, "name");
@@ -172,8 +179,23 @@ export async function runDaemon(
     maxPending,
     ...(statusThrottleMs !== undefined ? { statusThrottleMs } : {}),
     ...(model ? { model } : {}),
+    ...(skipPermissions ? { skipPermissions: true } : {}),
     ...(opencodeAgent ? { agent: opencodeAgent } : {}),
-    send: (to, body) => lock(() => agent.sendMessage(to, body)).then(() => {}),
+    send: (to, body) =>
+      lock(async () => {
+        try {
+          await agent.sendMessage(to, body);
+        } catch (error) {
+          if (!isSessionError(error)) throw error;
+          // Poisoned/desynced Signal ratchet — the relay rejects the ciphertext.
+          // Drop the session so the retry re-runs X3DH from a fresh pre-key bundle.
+          // Do NOT swallow a reset failure: retrying over an uncleared ratchet just
+          // fails again and masks the cause, so let it propagate.
+          log(`session error sending to ${to}, resetting: ${describe(error)}`);
+          await agent.resetSession(to);
+          await agent.sendMessage(to, body);
+        }
+      }),
     log,
   });
 
@@ -263,4 +285,17 @@ async function accepterTick(
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * A send failure that dropping the Signal session can actually fix: an explicit
+ * stale-ratchet / decrypt / prekey / session fault. Deliberately NOT matched:
+ * a not-yet-contact rejection (resetting won't accept the contact, and the retry
+ * would leave an undelivered X3DH session that makes the next send undecryptable)
+ * or a bare HTTP status, which says nothing about the ratchet.
+ */
+function isSessionError(error: unknown): boolean {
+  const e = error as { code?: string; message?: string };
+  const text = `${e?.code ?? ""} ${e?.message ?? ""}`.toLowerCase();
+  return /ratchet|decrypt|prekey|pre-key|signal session|no session/.test(text);
 }
