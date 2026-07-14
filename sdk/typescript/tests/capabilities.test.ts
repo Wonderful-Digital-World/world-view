@@ -169,6 +169,12 @@ describe("repoNameFromRemote", () => {
     expect(repoNameFromRemote("https://github.com/org/repo.git\n")).toBe("repo");
     expect(repoNameFromRemote("/srv/git/repo/")).toBe("repo");
   });
+
+  it("drops a query string / fragment so tokens never leak into the name", () => {
+    expect(repoNameFromRemote("https://github.com/org/repo.git?token=secret")).toBe("repo");
+    expect(repoNameFromRemote("https://github.com/org/repo.git#frag")).toBe("repo");
+    expect(repoNameFromRemote("https://user:pass@github.com/org/repo.git?ref=x")).toBe("repo");
+  });
 });
 
 // ── the capabilities frame end-to-end ────────────────────────────────────────
@@ -277,6 +283,38 @@ describe("DaemonRuntime capabilities frame", () => {
     expect(sent[0]?.frame?.kind).toBe("capabilities_result");
     expect(caps.tools).toEqual([]);
     expect(caps.providers).toEqual(["claude"]);
+  });
+
+  it("aborts the in-flight probe on shutdown (bounded lifecycle)", async () => {
+    const { sent, send } = collector();
+    let sawAbort = false;
+    let probeStarted = false;
+    // A probe run that only settles when its signal aborts — so the daemon must
+    // pass a signal through and cancel it on shutdown, or this hangs forever.
+    const runTask: RunTaskFn = (options) =>
+      new Promise((resolve) => {
+        probeStarted = true;
+        const onAbort = (): void => {
+          sawAbort = true;
+          resolve({ provider: options.provider, reply: "", events: 0 });
+        };
+        if (options.signal?.aborted) onAbort();
+        else options.signal?.addEventListener("abort", onAbort);
+      });
+    const runtime = new DaemonRuntime({ ...baseDeps, send, runTask });
+
+    runtime.handleMessage("peerA", { text: "" }, capabilitiesFrame("q1"));
+    // Wait until the probe has actually reached runTask (past the git-facts step),
+    // so the shutdown abort lands on a listening signal rather than racing it.
+    await vi.waitFor(() => expect(probeStarted).toBe(true));
+    runtime.shutdown();
+    await runtime.idle();
+
+    expect(sawAbort).toBe(true);
+    // An aborted probe degrades to the cheap facts, so the query is still answered.
+    const caps = JSON.parse(sent[0]?.frame?.text ?? "{}") as AgentCapabilities;
+    expect(sent[0]?.frame?.kind).toBe("capabilities_result");
+    expect(caps.tools).toEqual([]);
   });
 
   it("ignores a capabilities_result reply (no re-answer, no probe)", async () => {

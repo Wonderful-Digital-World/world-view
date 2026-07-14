@@ -4,9 +4,10 @@
  * medulla's orchestrator delegates work to remote coding agents over Signal
  * E2E DMs using this small JSON frame. The daemon speaks the peer side: it
  * accepts `task`/`input` frames and answers with `ack`/`status`/`reply`/`error`.
- * A `capabilities` frame is both a question and its answer: inbound it asks the
- * daemon what it can do here, outbound it carries the `AgentCapabilities` JSON as
- * `text` (see `capabilities.ts`).
+ * A `capabilities` frame is the REQUEST — it asks the daemon what it can do here
+ * — and the daemon answers with a distinct `capabilities_result` frame carrying
+ * the `AgentCapabilities` JSON as `text` (see `capabilities.ts`). The kinds are
+ * separate so a result is never mistaken for a new request.
  * Frames are correlated by `taskId` (cycle-scoped) and, when present, an opaque
  * `correlationId` (globally unique per dispatch) — the daemon echoes both back
  * verbatim so late replies can never cross-talk between cycles. Every response

@@ -64,6 +64,9 @@ export interface ProbeCapabilitiesOptions {
   model?: string;
   agent?: string;
   skipPermissions?: boolean;
+  /** Cancels the probe run (the daemon aborts it on shutdown). An aborted probe
+   *  throws inside runTask and degrades to the cheap facts like any other fault. */
+  signal?: AbortSignal;
 }
 
 /** The git-derived facts the daemon establishes without asking the model. */
@@ -102,6 +105,7 @@ export async function probeCapabilities(
       ...(options.model ? { model: options.model } : {}),
       ...(options.agent ? { agent: options.agent } : {}),
       ...(options.skipPermissions ? { skipPermissions: true } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     reply = result.reply;
   } catch {
@@ -225,9 +229,15 @@ export async function readGitFacts(cwd: string): Promise<GitFacts> {
   };
 }
 
-/** `git@host:org/repo.git`, `https://host/org/repo.git`, `/path/to/repo` → `repo`. */
+/** `git@host:org/repo.git`, `https://host/org/repo.git`, `/path/to/repo` → `repo`.
+ *  Any `?query`/`#fragment` (and thus embedded tokens) is dropped before the
+ *  `.git` suffix and final segment are taken, so a name is never polluted. */
 export function repoNameFromRemote(remote: string): string | undefined {
-  const trimmed = remote.trim().replace(/\/+$/, "").replace(/\.git$/i, "");
+  const trimmed = remote
+    .trim()
+    .replace(/[?#].*$/, "")
+    .replace(/\/+$/, "")
+    .replace(/\.git$/i, "");
   const last = trimmed.split(/[/:]/).pop();
   return last && last.trim() ? last.trim() : undefined;
 }
