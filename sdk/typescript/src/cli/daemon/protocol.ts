@@ -26,7 +26,11 @@ export type TaskFrameKind =
   | "reply"
   | "error"
   | "ack"
-  | "capabilities";
+  // `capabilities` is the REQUEST ("what can you do?"); the daemon answers with a
+  // distinct `capabilities_result` so a reply is never mistaken for a new request
+  // (two daemons would otherwise ping-pong capability JSON forever).
+  | "capabilities"
+  | "capabilities_result";
 
 /**
  * A decoded protocol frame. `taskId` is the cycle-scoped correlation key;
@@ -78,6 +82,7 @@ const FRAME_KINDS: ReadonlySet<string> = new Set<TaskFrameKind>([
   "error",
   "ack",
   "capabilities",
+  "capabilities_result",
 ]);
 
 const PROVIDERS: ReadonlySet<string> = new Set<HarnessProvider>([

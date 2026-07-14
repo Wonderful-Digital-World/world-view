@@ -227,7 +227,7 @@ describe("DaemonRuntime capabilities frame", () => {
 
     expect(sent).toHaveLength(1);
     const frame = sent[0]?.frame;
-    expect(frame?.kind).toBe("capabilities");
+    expect(frame?.kind).toBe("capabilities_result");
     expect(frame?.taskId).toBe("q1");
     expect(frame?.correlationId).toBe("cyc-1/q1/n");
     expect(frame?.harness).toBe("claude");
@@ -257,7 +257,7 @@ describe("DaemonRuntime capabilities frame", () => {
     expect(runTask).toHaveBeenCalledTimes(1);
     expect(sent).toHaveLength(3);
     for (const entry of sent) {
-      expect(entry.frame?.kind).toBe("capabilities");
+      expect(entry.frame?.kind).toBe("capabilities_result");
       const caps = JSON.parse(entry.frame?.text ?? "{}") as AgentCapabilities;
       expect(caps.tools).toEqual(["Bash", "Read", "Edit"]);
     }
@@ -274,8 +274,52 @@ describe("DaemonRuntime capabilities frame", () => {
     await runtime.idle();
 
     const caps = JSON.parse(sent[0]?.frame?.text ?? "{}") as AgentCapabilities;
-    expect(sent[0]?.frame?.kind).toBe("capabilities");
+    expect(sent[0]?.frame?.kind).toBe("capabilities_result");
     expect(caps.tools).toEqual([]);
     expect(caps.providers).toEqual(["claude"]);
+  });
+
+  it("ignores a capabilities_result reply (no re-answer, no probe)", async () => {
+    const { sent, send } = collector();
+    const runTask = vi.fn<RunTaskFn>(async (options) => ({
+      provider: options.provider,
+      reply: CAPABILITY_JSON,
+      events: 1,
+    }));
+    const runtime = new DaemonRuntime({ ...baseDeps, send, runTask });
+
+    // A response frame (what another daemon emits) must not re-trigger a probe or
+    // a reply — else two daemons ping-pong capability JSON forever.
+    runtime.handleMessage("peerA", { text: CAPABILITY_JSON }, {
+      ...capabilitiesFrame("q1"),
+      kind: "capabilities_result",
+    });
+    await runtime.idle();
+
+    expect(sent).toHaveLength(0);
+    expect(runTask).not.toHaveBeenCalled();
+  });
+
+  it("probes on the daemon's configured runner options", async () => {
+    const { sent, send } = collector();
+    let seen: RunTaskOptions | undefined;
+    const runTask = vi.fn<RunTaskFn>(async (options) => {
+      seen = options;
+      return { provider: options.provider, reply: CAPABILITY_JSON, events: 1 };
+    });
+    const runtime = new DaemonRuntime({
+      ...baseDeps,
+      send,
+      runTask,
+      model: "claude-sonnet-5",
+      skipPermissions: true,
+    });
+
+    runtime.handleMessage("peerA", { text: "" }, capabilitiesFrame("q1"));
+    await runtime.idle();
+
+    expect(seen?.model).toBe("claude-sonnet-5");
+    expect(seen?.skipPermissions).toBe(true);
+    expect(sent).toHaveLength(1);
   });
 });

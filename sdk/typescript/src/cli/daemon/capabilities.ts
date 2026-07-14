@@ -58,6 +58,12 @@ export interface ProbeCapabilitiesOptions {
   env: Record<string, string | undefined>;
   providers: ReadonlyArray<HarnessProvider>;
   timeoutMs?: number;
+  // Same runner settings the daemon forwards to real tasks — so the probe runs on
+  // the SAME agent that will handle delegated work (not the default model/agent or
+  // a permission-blocked run), or the reported capabilities are wrong.
+  model?: string;
+  agent?: string;
+  skipPermissions?: boolean;
 }
 
 /** The git-derived facts the daemon establishes without asking the model. */
@@ -93,6 +99,9 @@ export async function probeCapabilities(
       cwd,
       env: options.env,
       timeoutMs: options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.agent ? { agent: options.agent } : {}),
+      ...(options.skipPermissions ? { skipPermissions: true } : {}),
     });
     reply = result.reply;
   } catch {
