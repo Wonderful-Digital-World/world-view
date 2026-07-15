@@ -28,6 +28,7 @@ import {
 } from "../src/cli/daemon/runtime.js";
 import { opencodeEventsFromLine } from "../src/cli/harness-events.js";
 import type { TaskFrame } from "../src/cli/daemon/protocol.js";
+import { TinyPlaceError } from "../src/index.js";
 
 // ── protocol ─────────────────────────────────────────────────────────────────
 
@@ -337,6 +338,34 @@ describe("DaemonRuntime task protocol", () => {
     }
     expect(reply?.frame?.text).toBe("final output");
     expect(statusCount).toBe(1);
+  });
+
+  it("logs the relay's rejection reason when a send fails", async () => {
+    const logs: Array<string> = [];
+    const runtime = new DaemonRuntime({
+      ...baseDeps,
+      send: async () => {
+        throw new TinyPlaceError(
+          400,
+          { error: "body must be encrypted ciphertext" },
+          "HTTP 400: /messages",
+        );
+      },
+      runTask: async () => ({ provider: "claude", reply: "out", events: 0 }),
+      log: (line) => logs.push(line),
+      statusThrottleMs: 0,
+    });
+    runtime.handleMessage(
+      "peerC",
+      { text: "" },
+      { proto: TINYPLACE_PROTO, kind: "task", taskId: "t9", text: "go", ts: "now" },
+    );
+    await vi.waitFor(() =>
+      expect(logs.some((l) => l.startsWith("send to peerC failed"))).toBe(true),
+    );
+    expect(logs.find((l) => l.startsWith("send to peerC failed"))).toBe(
+      "send to peerC failed: HTTP 400: /messages — body must be encrypted ciphertext",
+    );
   });
 
   it("errors when the requested provider is unavailable", async () => {
