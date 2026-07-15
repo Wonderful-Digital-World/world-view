@@ -162,4 +162,16 @@ describe("sendMessage / readMessages round-trip", () => {
     // Consumed on read.
     expect(await readMessages(bob.client, bob.signer)).toHaveLength(0);
   });
+
+  it("refuses to send when the client has no encryption configured", async () => {
+    // A client built without `encryption: { store }` would relay the body as
+    // plaintext, which the backend rejects with `400: body must be encrypted
+    // ciphertext`. The facade must fail fast at the misconfiguration instead.
+    const signer = await LocalSigner.generate();
+    const plain = new TinyPlaceClient({ baseUrl: "https://relay.test", signer });
+    expect(plain.encryptionEnabled).toBe(false);
+    await expect(
+      sendMessage(plain, signer, signer.agentId, "hi"),
+    ).rejects.toThrow(/requires encryption/);
+  });
 });
