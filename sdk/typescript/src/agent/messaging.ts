@@ -89,17 +89,26 @@ export interface SendMessageResult {
 }
 
 /**
- * Sends a message to `recipient` (a @handle, cryptoId, or base64 key). The body
- * is Signal-encrypted by the client before it leaves the process.
- *
- * This is the E2E facade: it REQUIRES the client to have encryption configured
- * (`encryption: { store }` + a signer). A client without encryption would send
- * the body as plaintext, which the relay rejects — a plaintext JSON body trips
- * its `looksLikeJSON` guard with `HTTP 400: body must be encrypted ciphertext`,
- * surfacing far from the misconfiguration (a client built without a signer/store,
- * e.g. an under-provisioned daemon). Fail fast here with a clear cause instead of
- * leaking plaintext and getting a cryptic relay rejection. Callers that genuinely
- * want plain relay transport use `client.messages.send` directly.
+ * The E2E facade REQUIRES a client with encryption configured (`encryption: { store }`
+ * + a signer). A client without it would relay the body as plaintext, which the backend
+ * rejects — a plaintext JSON body trips its `looksLikeJSON` guard with `HTTP 400: body
+ * must be encrypted ciphertext`, surfacing far from the misconfiguration (a client built
+ * without a signer/store, e.g. an under-provisioned daemon). Fail fast with a clear cause
+ * instead of leaking plaintext. Callers that want plain transport use `client.messages.send`.
+ */
+function assertEncryptionEnabled(client: TinyPlaceClient): void {
+  if (client.encryptionEnabled) return;
+  throw new Error(
+    "agent messaging requires encryption: construct the client with " +
+      "`encryption: { store }` and a signer. Sending a plaintext body over the " +
+      'E2E channel is rejected by the relay ("body must be encrypted ciphertext").',
+  );
+}
+
+/**
+ * Sends a message to `recipient` (a @handle, cryptoId, or base64 key). The body is
+ * Signal-encrypted by the client before it leaves the process; encryption must be
+ * configured (see {@link assertEncryptionEnabled}).
  */
 export async function sendMessage(
   client: TinyPlaceClient,
@@ -107,13 +116,7 @@ export async function sendMessage(
   recipient: string,
   text: string,
 ): Promise<SendMessageResult> {
-  if (!client.encryptionEnabled) {
-    throw new Error(
-      "agent messaging requires encryption: construct the client with " +
-        "`encryption: { store }` and a signer. Sending a plaintext body over the " +
-        'E2E channel is rejected by the relay ("body must be encrypted ciphertext").',
-    );
-  }
+  assertEncryptionEnabled(client);
   const to = await resolveRecipientKey(client, recipient);
   const envelope: MessageEnvelope = {
     id: messageId(),
