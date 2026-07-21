@@ -38,10 +38,11 @@ impl Default for MaintainPolicy {
 /// What [`maintain_keys`] did on a call.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct KeyMaintenance {
-    /// The store already held a signed pre-key and the relay's one-time pool was
-    /// healthy, so nothing was published — the common restart path.
+    /// Nothing needed publishing: the store backed the signed pre-key the relay
+    /// advertises and its one-time pool was healthy — the common restart path.
     pub was_healthy: bool,
-    /// A fresh signed pre-key was generated and rotated on the relay.
+    /// A fresh signed pre-key was generated and rotated on the relay, because the
+    /// store could not answer the id the relay was advertising.
     pub rotated_signed: bool,
     /// How many one-time pre-keys were generated and uploaded.
     pub uploaded_one_time: usize,
@@ -49,16 +50,22 @@ pub struct KeyMaintenance {
 
 /// Idempotently reconcile `agent_id`'s published key bundle with the relay.
 ///
-/// Safe to call on every boot and periodically — it publishes only when the
-/// relay actually needs it:
+/// Safe to call on every boot and periodically — it publishes only what the
+/// relay actually needs. The two halves are maintained **independently**:
 ///
-/// - **No-op** when the store already holds a signed pre-key AND the relay
-///   reports a non-empty, not-low one-time pool. *Not* republishing here is what
-///   prevents orphaning.
-/// - **(Re)publish** on first boot, a store that lost its keys, or a low/empty
-///   relay pool: generate a signed pre-key plus `policy.one_time_batch` one-time
-///   pre-keys, store the private halves locally, then rotate + upload the public
-///   parts.
+/// - **Signed pre-key** — rotated only when the store cannot answer the id the
+///   relay advertises (`KeyHealth::signed_pre_key_key_id`). An inbound
+///   `PREKEY_BUNDLE` names that exact id, so a relay serving a key we no longer
+///   hold breaks first contact; a still-backed signed key is left untouched.
+/// - **One-time pre-keys** — topped up only when the relay reports the pool low
+///   or empty, without disturbing a healthy signed pre-key.
+///
+/// So a merely-depleted one-time pool refills without needless signed-key
+/// churn, and a stale/unbacked signed key is repaired even while the pool is
+/// full. When both are satisfied the call is a **no-op**
+/// ([`KeyMaintenance::was_healthy`]) — not republishing is what prevents
+/// orphaning. If the health check itself fails, both halves are (re)published
+/// rather than risk leaving the agent unpublished.
 ///
 /// `identity_key_base64` is the agent's base64 Ed25519 identity key; the relay
 /// verifies each published key's signature against it.
@@ -77,57 +84,69 @@ pub async fn maintain_keys(
     identity_key_base64: &str,
     policy: &MaintainPolicy,
 ) -> Result<KeyMaintenance> {
-    // A signed pre-key in the store means we've published before and can back
-    // what the relay serves. If the relay's one-time pool is also healthy, there
-    // is nothing to do — and NOT republishing is precisely what avoids orphaning.
-    if store.active_signed_pre_key().await.is_ok() {
-        if let Ok(health) = keys.health(agent_id).await {
-            if !health.low_one_time_pre_keys && health.one_time_pre_key_count > 0 {
-                return Ok(KeyMaintenance {
-                    was_healthy: true,
-                    ..Default::default()
-                });
-            }
-        }
-    }
+    // What is the relay actually serving right now? If we cannot reach it we
+    // cannot confirm anything is healthy, so both halves are (re)published
+    // rather than risk leaving the agent unpublished.
+    let health = keys.health(agent_id).await.ok();
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let mut report = KeyMaintenance::default();
 
-    // Signed pre-key: (re)generate, store the private half, then rotate on the
-    // relay so peers pick up the new public half.
-    let spk = generate_signed_pre_key(signer, &format!("spk_{now_secs}")).await?;
-    store.store_signed_pre_key(spk.clone()).await?;
-    keys.rotate_signed_pre_key(
-        agent_id,
-        &SignedPreKeyRequest {
-            identity_key: Some(identity_key_base64.to_string()),
-            signed_pre_key: serialize_pre_key(&spk),
-        },
-    )
-    .await?;
-
-    // One-time pre-keys: generate a batch, store the private halves BEFORE upload
-    // so the relay never advertises a key the store cannot back, then upload the
-    // public parts.
-    let one_time = generate_pre_keys(signer, now_secs, policy.one_time_batch).await?;
-    for key in &one_time {
-        store.store_pre_key(key.clone()).await?;
+    // --- Signed pre-key -----------------------------------------------------
+    // Rotate ONLY when the store cannot answer the signed pre-key the relay
+    // advertises. An inbound `PREKEY_BUNDLE` names that exact id, so a relay
+    // serving an id we no longer hold makes first contact fail; conversely a
+    // still-backed signed key is left alone even when the one-time pool needs a
+    // refill (the two halves are maintained independently).
+    let signed_pre_key_backed = match health
+        .as_ref()
+        .and_then(|h| h.signed_pre_key_key_id.as_deref())
+    {
+        Some(key_id) => store.signed_pre_key(key_id).await.ok().flatten().is_some(),
+        // No health, or the relay advertises no signed pre-key at all.
+        None => false,
+    };
+    if !signed_pre_key_backed {
+        let spk = generate_signed_pre_key(signer, &format!("spk_{now_secs}")).await?;
+        store.store_signed_pre_key(spk.clone()).await?;
+        keys.rotate_signed_pre_key(
+            agent_id,
+            &SignedPreKeyRequest {
+                identity_key: Some(identity_key_base64.to_string()),
+                signed_pre_key: serialize_pre_key(&spk),
+            },
+        )
+        .await?;
+        report.rotated_signed = true;
     }
-    keys.upload_pre_keys(
-        agent_id,
-        &PreKeysRequest {
-            identity_key: Some(identity_key_base64.to_string()),
-            pre_keys: one_time.iter().map(serialize_pre_key).collect(),
-        },
-    )
-    .await?;
 
-    Ok(KeyMaintenance {
-        was_healthy: false,
-        rotated_signed: true,
-        uploaded_one_time: one_time.len(),
-    })
+    // --- One-time pre-keys --------------------------------------------------
+    // Topped up independently, driven only by the relay's own pool report. The
+    // private halves are stored BEFORE upload so the relay never advertises a
+    // key the store cannot back.
+    let one_time_depleted = match health.as_ref() {
+        Some(h) => h.low_one_time_pre_keys || h.one_time_pre_key_count <= 0,
+        None => true,
+    };
+    if one_time_depleted {
+        let one_time = generate_pre_keys(signer, now_secs, policy.one_time_batch).await?;
+        for key in &one_time {
+            store.store_pre_key(key.clone()).await?;
+        }
+        keys.upload_pre_keys(
+            agent_id,
+            &PreKeysRequest {
+                identity_key: Some(identity_key_base64.to_string()),
+                pre_keys: one_time.iter().map(serialize_pre_key).collect(),
+            },
+        )
+        .await?;
+        report.uploaded_one_time = one_time.len();
+    }
+
+    report.was_healthy = !report.rotated_signed && report.uploaded_one_time == 0;
+    Ok(report)
 }

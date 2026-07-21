@@ -1,29 +1,35 @@
 //! Coverage for idempotent key-bundle maintenance
-//! ([`tinyplace::signal::maintain::maintain_keys`]): it (re)publishes on first
-//! boot / a depleted pool, and is a no-op when the store already backs a healthy
-//! published set — the anti-orphan invariant.
+//! ([`tinyplace::signal::maintain::maintain_keys`]).
+//!
+//! The signed pre-key and the one-time pool are maintained **independently**, so
+//! each test pins one half healthy and the other degraded to prove neither
+//! drags the other into a needless republish.
 
 mod common;
 
 use common::{all_requests, client_for, test_signer};
-use serde_json::json;
+use serde_json::{json, Value};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use tinyplace::signal::crypto::generate_x25519_keypair;
+use tinyplace::signal::keys::generate_signed_pre_key;
 use tinyplace::signal::maintain::{maintain_keys, MaintainPolicy};
 use tinyplace::signal::memory_store::MemorySessionStore;
-use tinyplace::Signer;
+use tinyplace::signal::store::SessionStore;
+use tinyplace::{LocalSigner, Signer};
 
-/// A relay mock whose `GET /health` reports `one_time_count` one-time pre-keys,
-/// and whose `PUT`s (rotate signed pre-key / upload one-time) return `null`.
-async fn relay_with_health(one_time_count: i64) -> MockServer {
+/// A relay mock whose `GET /health` reports `one_time_count` one-time pre-keys
+/// and advertises `signed_id` as its signed pre-key, and whose `PUT`s (rotate /
+/// upload) return `null`.
+async fn relay(one_time_count: i64, signed_id: Value) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "agentId": "x",
             "oneTimePreKeyCount": one_time_count,
             "lowOneTimePreKeys": one_time_count < 5,
+            "signedPreKeyKeyId": signed_id,
         })))
         .mount(&server)
         .await;
@@ -34,87 +40,132 @@ async fn relay_with_health(one_time_count: i64) -> MockServer {
     server
 }
 
-#[tokio::test]
-async fn maintain_keys_publishes_once_then_no_ops_when_healthy() {
-    let server = relay_with_health(20).await;
-    let client = client_for(&server);
-    let signer = test_signer();
+/// A store already backing a signed pre-key under `key_id`.
+async fn store_backing(signer: &LocalSigner, key_id: &str) -> MemorySessionStore {
     let store = MemorySessionStore::new(generate_x25519_keypair());
-    let agent_id = signer.agent_id();
-    let policy = MaintainPolicy::default();
+    let spk = generate_signed_pre_key(signer, key_id).await.unwrap();
+    store.store_signed_pre_key(spk).await.unwrap();
+    store
+}
 
-    // First call: empty store → (re)publish a full bundle.
-    let first = maintain_keys(
-        &client.keys,
-        &store,
-        signer.as_ref(),
-        &agent_id,
-        "identity-key",
-        &policy,
-    )
-    .await
-    .unwrap();
-    assert!(!first.was_healthy);
-    assert!(first.rotated_signed);
-    assert_eq!(first.uploaded_one_time, 20);
-
-    // Second call: the store now holds a signed pre-key AND the relay pool is
-    // healthy → NO-OP. Not republishing is what avoids orphaning served keys.
-    let second = maintain_keys(
-        &client.keys,
-        &store,
-        signer.as_ref(),
-        &agent_id,
-        "identity-key",
-        &policy,
-    )
-    .await
-    .unwrap();
-    assert!(second.was_healthy);
-    assert_eq!(second.uploaded_one_time, 0);
-
-    // On the wire: exactly ONE one-time upload across both calls.
-    let uploads = all_requests(&server)
-        .await
-        .into_iter()
-        .filter(|r| r.method.as_str() == "PUT" && r.url.path().ends_with("/prekeys"))
-        .count();
-    assert_eq!(uploads, 1, "idempotent maintain uploads only once");
+/// Count the `PUT`s that hit each key route.
+async fn puts(server: &MockServer) -> (usize, usize) {
+    let requests = all_requests(server).await;
+    let count = |suffix: &str| {
+        requests
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT" && r.url.path().ends_with(suffix))
+            .count()
+    };
+    (count("/signed-prekey"), count("/prekeys"))
 }
 
 #[tokio::test]
-async fn maintain_keys_refills_a_depleted_pool() {
-    // The relay reports an empty pool (every one-time key consumed by peers).
-    let server = relay_with_health(0).await;
-    let client = client_for(&server);
+async fn no_ops_when_the_advertised_signed_key_is_backed_and_the_pool_is_healthy() {
     let signer = test_signer();
+    let server = relay(20, json!("spk_known")).await;
+    let client = client_for(&server);
+    let store = store_backing(&signer, "spk_known").await;
+
+    let report = maintain_keys(
+        &client.keys,
+        &store,
+        signer.as_ref(),
+        &signer.agent_id(),
+        "identity-key",
+        &MaintainPolicy::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(report.was_healthy);
+    assert!(!report.rotated_signed);
+    assert_eq!(report.uploaded_one_time, 0);
+    assert_eq!(
+        puts(&server).await,
+        (0, 0),
+        "a healthy agent publishes nothing"
+    );
+}
+
+#[tokio::test]
+async fn rotates_only_the_signed_key_when_the_relay_advertises_one_we_cannot_back() {
+    // The relay serves `spk_missing`, which the store does not hold — an inbound
+    // PREKEY_BUNDLE naming it would fail to decrypt, so maintenance must repair
+    // it. The one-time pool is healthy and must be left alone.
+    let signer = test_signer();
+    let server = relay(20, json!("spk_missing")).await;
+    let client = client_for(&server);
+    let store = store_backing(&signer, "spk_other").await;
+
+    let report = maintain_keys(
+        &client.keys,
+        &store,
+        signer.as_ref(),
+        &signer.agent_id(),
+        "identity-key",
+        &MaintainPolicy::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(!report.was_healthy);
+    assert!(report.rotated_signed);
+    assert_eq!(
+        report.uploaded_one_time, 0,
+        "a healthy pool is not disturbed"
+    );
+    assert_eq!(puts(&server).await, (1, 0));
+}
+
+#[tokio::test]
+async fn tops_up_only_the_pool_when_depleted_leaving_a_good_signed_key_alone() {
+    // Every one-time key was consumed by peers, but the signed pre-key the relay
+    // advertises is still backed — refill without needless signed-key churn.
+    let signer = test_signer();
+    let server = relay(0, json!("spk_known")).await;
+    let client = client_for(&server);
+    let store = store_backing(&signer, "spk_known").await;
+
+    let report = maintain_keys(
+        &client.keys,
+        &store,
+        signer.as_ref(),
+        &signer.agent_id(),
+        "identity-key",
+        &MaintainPolicy::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(!report.was_healthy);
+    assert!(!report.rotated_signed, "signed key must not be rotated");
+    assert_eq!(report.uploaded_one_time, 20);
+    assert_eq!(puts(&server).await, (0, 1));
+}
+
+#[tokio::test]
+async fn publishes_both_halves_on_first_boot() {
+    // Nothing published yet: the relay advertises no signed pre-key and an empty
+    // pool, and the store is empty.
+    let signer = test_signer();
+    let server = relay(0, json!(null)).await;
+    let client = client_for(&server);
     let store = MemorySessionStore::new(generate_x25519_keypair());
-    let agent_id = signer.agent_id();
-    let policy = MaintainPolicy::default();
 
-    maintain_keys(
+    let report = maintain_keys(
         &client.keys,
         &store,
         signer.as_ref(),
-        &agent_id,
+        &signer.agent_id(),
         "identity-key",
-        &policy,
+        &MaintainPolicy::default(),
     )
     .await
     .unwrap();
 
-    // Store now holds a signed pre-key, but the relay pool is empty → republish
-    // rather than no-op, so new peers can still complete a full X3DH.
-    let again = maintain_keys(
-        &client.keys,
-        &store,
-        signer.as_ref(),
-        &agent_id,
-        "identity-key",
-        &policy,
-    )
-    .await
-    .unwrap();
-    assert!(!again.was_healthy);
-    assert_eq!(again.uploaded_one_time, 20);
+    assert!(!report.was_healthy);
+    assert!(report.rotated_signed);
+    assert_eq!(report.uploaded_one_time, 20);
+    assert_eq!(puts(&server).await, (1, 1));
 }
