@@ -9,7 +9,7 @@ mod common;
 
 use common::{all_requests, client_for, test_signer};
 use serde_json::{json, Value};
-use wiremock::matchers::method;
+use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use tinyplace::signal::crypto::generate_x25519_keypair;
@@ -24,7 +24,10 @@ use tinyplace::{LocalSigner, Signer};
 /// upload) return `null`.
 async fn relay(one_time_count: i64, signed_id: Value) -> MockServer {
     let server = MockServer::start().await;
+    // Pinned to the real health route (the id segment is the agent's base58 key),
+    // so a wrong path would fail the scenario instead of silently matching.
     Mock::given(method("GET"))
+        .and(path_regex(r"^/keys/[^/]+/health$"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "agentId": "x",
             "oneTimePreKeyCount": one_time_count,
@@ -119,11 +122,14 @@ async fn rotates_only_the_signed_key_when_the_relay_advertises_one_we_cannot_bac
 }
 
 #[tokio::test]
-async fn tops_up_only_the_pool_when_depleted_leaving_a_good_signed_key_alone() {
-    // Every one-time key was consumed by peers, but the signed pre-key the relay
-    // advertises is still backed — refill without needless signed-key churn.
+async fn tops_up_only_the_pool_when_low_leaving_a_good_signed_key_alone() {
+    // Peers have drawn the pool DOWN but not to zero: the relay still reports a
+    // positive count and only raises `lowOneTimePreKeys`. This pins the low-flag
+    // branch specifically (the empty-pool `count <= 0` branch is covered by the
+    // first-boot case), while the advertised signed pre-key is still backed — so
+    // refill must happen without any signed-key churn.
     let signer = test_signer();
-    let server = relay(0, json!("spk_known")).await;
+    let server = relay(4, json!("spk_known")).await;
     let client = client_for(&server);
     let store = store_backing(&signer, "spk_known").await;
 
