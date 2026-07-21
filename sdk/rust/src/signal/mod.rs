@@ -7,6 +7,7 @@
 
 pub mod crypto;
 pub mod keys;
+pub mod maintain;
 pub mod memory_store;
 pub mod ratchet;
 pub mod sender_key;
