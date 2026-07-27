@@ -10,7 +10,13 @@
 //! cargo test --test e2e_docker -- --ignored --nocapture   # from sdk/rust/
 //! ```
 //!
-//! Override the target with `TINYPLACE_E2E_URL` (default `http://localhost:8080`).
+//! Override the target with `TINYPLACE_E2E_URL` (default `http://localhost:8080`),
+//! e.g. to run the same suite against staging:
+//!
+//! ```sh
+//! TINYPLACE_E2E_URL=https://staging-api.tiny.place \
+//!   cargo test --test e2e_docker -- --ignored --nocapture
+//! ```
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +30,19 @@ fn base_url() -> String {
 fn anon_client() -> TinyPlaceClient {
     TinyPlaceClient::new(TinyPlaceClientOptions {
         base_url: base_url(),
+        ..Default::default()
+    })
+}
+
+/// A client signing as a fresh, unregistered identity. `siws` picks the scheme
+/// the upgrade header carries: a reusable `siws:` proof (the `LocalSigner`
+/// default) or the per-request freshness-bound `v1:` token.
+fn signed_client(siws: bool) -> TinyPlaceClient {
+    let signer = LocalSigner::generate();
+    let signer = if siws { signer } else { signer.without_siws() };
+    TinyPlaceClient::new(TinyPlaceClientOptions {
+        base_url: base_url(),
+        signer: Some(Arc::new(signer) as Arc<dyn Signer>),
         ..Default::default()
     })
 }
@@ -121,11 +140,64 @@ async fn authenticated_inbox_stream_upgrades_with_signed_headers() {
     // upgrading) when they are missing or stale. A fresh key simply has an empty
     // inbox, so reaching the snapshot frame at all proves the handshake
     // authenticated.
-    let signer = LocalSigner::generate();
-    let client = TinyPlaceClient::new(TinyPlaceClientOptions {
-        base_url: base_url(),
-        signer: Some(Arc::new(signer) as Arc<dyn Signer>),
-        ..Default::default()
-    });
-    assert_stream_pushes_a_typed_frame(client.inbox.stream(), "inbox.stream").await;
+    assert_stream_pushes_a_typed_frame(signed_client(true).inbox.stream(), "inbox.stream[siws]")
+        .await;
+}
+
+#[tokio::test]
+#[ignore = "requires the docker-compose stack on :8080"]
+async fn authenticated_stream_accepts_the_fresh_signature_scheme() {
+    // The same upgrade, signed with the per-request `v1:<ts>:<nonce>:<sig>`
+    // token instead of a reusable SIWS proof. Both schemes must authenticate.
+    assert_stream_pushes_a_typed_frame(signed_client(false).inbox.stream(), "inbox.stream[v1]")
+        .await;
+}
+
+#[tokio::test]
+#[ignore = "requires the docker-compose stack on :8080"]
+async fn authenticated_stream_rejects_an_unsigned_upgrade() {
+    // The negative control for the two tests above: without a signer the SDK
+    // sends no credential, and the backend must refuse to upgrade. Without this,
+    // a permanently-public endpoint would make the signed cases pass for the
+    // wrong reason.
+    let error = anon_client()
+        .inbox
+        .stream()
+        .connect()
+        .await
+        .err()
+        .expect("an unsigned upgrade must not connect");
+    println!("unsigned inbox.stream rejected: {error}");
+    assert!(
+        error.to_string().contains("401"),
+        "expected a 401 on the upgrade, got: {error}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the docker-compose stack on :8080"]
+async fn directory_auth_stream_authenticates_the_upgrade() {
+    // `/a2a/:id/stream` takes the directory-auth path and is owner-gated. A
+    // fresh identity owns no directory card, so the backend may answer 403/404 —
+    // but it must not answer 401, which would mean the credential itself never
+    // authenticated.
+    let client = signed_client(true);
+    let agent_id = client
+        .http()
+        .signer()
+        .expect("signed client has a signer")
+        .agent_id();
+    match client.a2a.stream(&agent_id).connect().await {
+        Ok(conn) => {
+            println!("a2a.stream connected as {agent_id}");
+            let _ = conn.close().await;
+        }
+        Err(error) => {
+            println!("a2a.stream not readable for a fresh identity: {error}");
+            assert!(
+                !error.to_string().contains("401"),
+                "the signed upgrade was not authenticated: {error}"
+            );
+        }
+    }
 }
