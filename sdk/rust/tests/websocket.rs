@@ -303,6 +303,7 @@ fn fast_reconnect(max_attempts: u32) -> tinyplace::ReconnectPolicy {
         enabled: true,
         interval: Duration::from_millis(5),
         max_attempts,
+        connect_timeout: Duration::from_secs(5),
     }
 }
 
@@ -314,6 +315,104 @@ async fn ws_reconnect_defaults_match_the_typescript_sdk() {
     assert_eq!(policy.interval, Duration::from_millis(3_000));
     assert_eq!(policy.max_attempts, 10);
     assert!(!tinyplace::ReconnectPolicy::disabled().enabled);
+}
+
+#[tokio::test]
+async fn ws_keepalive_traffic_resets_the_retry_budget() {
+    // A quiet stream — an inbox with no new items — carries nothing but the
+    // server's keepalive pings. If only data frames reset the budget, outages
+    // separated by healthy-but-silent connections accumulate until
+    // `max_attempts` is spent and the stream ends for good.
+    //
+    // With `max_attempts: 1`, surviving to the third connection is only
+    // possible if the pings on connections one and two reset the budget.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for round in 1..=3 {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            if round == 3 {
+                ws.send(Message::Text("{\"n\":3}".to_string()))
+                    .await
+                    .unwrap();
+            } else {
+                ws.send(Message::Ping(Vec::new())).await.unwrap();
+            }
+            let _ = ws.close(None).await;
+        }
+    });
+
+    let client = client(&format!("http://{addr}"), false);
+    let mut conn = client
+        .inbox
+        .stream()
+        .with_reconnect(fast_reconnect(1))
+        .connect()
+        .await
+        .unwrap();
+
+    let frame = tokio::time::timeout(Duration::from_secs(5), conn.recv())
+        .await
+        .expect("recv must not hang")
+        .expect("the keepalives should have kept the budget alive")
+        .expect("valid json");
+    assert_eq!(frame["n"], 3);
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn ws_reconnect_bounds_a_stalled_handshake() {
+    // `connect_async` has no timeout of its own, so a server that accepts the
+    // TCP connection but never completes the upgrade would hang `recv` forever
+    // and leave `max_attempts` bounding nothing.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        ws.send(Message::Text("{\"n\":1}".to_string()))
+            .await
+            .unwrap();
+        let _ = ws.close(None).await;
+        // Accept, then stall: never answer the upgrade, and hold the socket
+        // open so the dial cannot fail fast on a closed connection either.
+        let mut stalled = Vec::new();
+        loop {
+            if let Ok((tcp, _)) = listener.accept().await {
+                stalled.push(tcp);
+            }
+        }
+    });
+
+    let client = client(&format!("http://{addr}"), false);
+    let mut conn = client
+        .inbox
+        .stream()
+        .with_reconnect(tinyplace::ReconnectPolicy {
+            enabled: true,
+            interval: Duration::from_millis(5),
+            max_attempts: 2,
+            connect_timeout: Duration::from_millis(50),
+        })
+        .connect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        conn.recv().await.expect("first frame").expect("valid json")["n"],
+        1
+    );
+
+    // Two attempts, each capped at 50ms — comfortably inside this bound. Without
+    // the per-attempt timeout this hangs until the test harness gives up.
+    let ended = tokio::time::timeout(Duration::from_secs(5), conn.recv())
+        .await
+        .expect("a stalled handshake must not hang recv");
+    assert!(ended.is_none(), "expected the stream to end, got {ended:?}");
+
+    server.abort();
 }
 
 #[tokio::test]

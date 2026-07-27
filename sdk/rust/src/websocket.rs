@@ -60,10 +60,18 @@ pub struct ReconnectPolicy {
     pub interval: Duration,
     /// How many consecutive attempts to make before giving up.
     ///
-    /// The counter resets once the re-established stream delivers a message, so
-    /// this bounds a run of *consecutive* failures rather than the lifetime
-    /// total.
+    /// The counter resets as soon as a re-established stream carries *any*
+    /// frame — a keepalive ping counts — so this bounds a run of consecutive
+    /// failures rather than the lifetime total. A quiet stream still resets it;
+    /// only a socket that produces nothing at all before dropping again does
+    /// not.
     pub max_attempts: u32,
+    /// How long a single re-dial may take before it counts as a failed attempt.
+    ///
+    /// `connect_async` has no timeout of its own, so a black-holed TCP connect
+    /// or a handshake the server never answers would otherwise hang `recv`
+    /// indefinitely and leave `max_attempts` bounding nothing.
+    pub connect_timeout: Duration,
 }
 
 impl Default for ReconnectPolicy {
@@ -72,6 +80,7 @@ impl Default for ReconnectPolicy {
             enabled: true,
             interval: Duration::from_millis(3_000),
             max_attempts: 10,
+            connect_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -186,6 +195,7 @@ impl TinyPlaceWebSocket {
             inner: stream,
             dialer: self.clone(),
             attempts: 0,
+            last_dial_error: None,
         })
     }
 
@@ -220,8 +230,11 @@ pub struct WebSocketConnection {
     inner: WebSocketStream<MaybeTlsStream<TcpStream>>,
     /// The handle this was opened from, kept so a drop can be re-dialled.
     dialer: TinyPlaceWebSocket,
-    /// Consecutive reconnect attempts since the last delivered message.
+    /// Consecutive reconnect attempts since the stream last carried a frame.
     attempts: u32,
+    /// Why the most recent re-dial failed, reported in preference to the older
+    /// error that started the reconnect run.
+    last_dial_error: Option<Error>,
 }
 
 impl WebSocketConnection {
@@ -241,15 +254,11 @@ impl WebSocketConnection {
         loop {
             match self.inner.next().await {
                 Some(Ok(Message::Text(text))) => {
-                    // A delivered message proves the stream is healthy, so the
-                    // budget for the *next* outage starts over. The TS SDK
-                    // instead resets on open, which lets a server that accepts
-                    // and immediately drops be retried forever.
-                    self.attempts = 0;
+                    self.mark_healthy();
                     return Some(serde_json::from_str(&text).map_err(Error::from));
                 }
                 Some(Ok(Message::Binary(bytes))) => {
-                    self.attempts = 0;
+                    self.mark_healthy();
                     return Some(serde_json::from_slice(&bytes).map_err(Error::from));
                 }
                 Some(Ok(Message::Close(_))) | None => {
@@ -258,21 +267,49 @@ impl WebSocketConnection {
                     }
                     return None;
                 }
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {
+                    // A control frame is not handed to the caller, but it is
+                    // still proof the replacement socket works — and on a quiet
+                    // stream (an inbox with no new items) the server's keepalive
+                    // pings are the *only* traffic. Resetting solely on data
+                    // would let unrelated outages, days apart, accumulate until
+                    // `max_attempts` was spent and the stream ended for good.
+                    self.mark_healthy();
+                    continue;
+                }
                 Some(Err(error)) => {
                     if self.reconnect().await {
                         continue;
                     }
-                    return Some(Err(Error::WebSocket(error.to_string())));
+                    // Prefer why the last re-dial failed over the older error
+                    // that started the run: by now it describes the current
+                    // state of the world, which is what a caller can act on.
+                    return Some(Err(self
+                        .last_dial_error
+                        .take()
+                        .unwrap_or_else(|| Error::WebSocket(error.to_string()))));
                 }
             }
         }
     }
 
+    /// Record that the socket is carrying traffic: the retry budget for the
+    /// *next* outage starts over.
+    ///
+    /// Deliberately not "reset on open", which is what the TS SDK does: a server
+    /// that accepts a connection and immediately drops it would then be retried
+    /// forever. Requiring at least one frame keeps `max_attempts` a real bound
+    /// on a genuinely broken endpoint.
+    fn mark_healthy(&mut self) {
+        self.attempts = 0;
+        self.last_dial_error = None;
+    }
+
     /// Re-dial the stream, reporting whether a fresh one was established.
     ///
     /// Pauses `interval` *before* each attempt so a server that drops
-    /// connections instantly cannot be hammered.
+    /// connections instantly cannot be hammered, and bounds each attempt by
+    /// `connect_timeout` so a stalled handshake cannot hang `recv` forever.
     async fn reconnect(&mut self) -> bool {
         let policy = self.dialer.reconnect;
         if !policy.enabled {
@@ -281,9 +318,19 @@ impl WebSocketConnection {
         while self.attempts < policy.max_attempts {
             self.attempts += 1;
             tokio::time::sleep(policy.interval).await;
-            if let Ok(stream) = self.dialer.dial().await {
-                self.inner = stream;
-                return true;
+            match tokio::time::timeout(policy.connect_timeout, self.dialer.dial()).await {
+                Ok(Ok(stream)) => {
+                    self.inner = stream;
+                    self.last_dial_error = None;
+                    return true;
+                }
+                Ok(Err(error)) => self.last_dial_error = Some(error),
+                Err(_) => {
+                    self.last_dial_error = Some(Error::WebSocket(format!(
+                        "reconnect timed out after {:?}",
+                        policy.connect_timeout
+                    )))
+                }
             }
         }
         false
