@@ -1,11 +1,17 @@
-//! WebSocket streaming tests: signed-URL construction (public API) and a live
+//! WebSocket streaming tests: signed-URL construction, the signed upgrade
+//! headers the backend authenticates the handshake with (public API), and a live
 //! connect/recv/send/close round-trip against a local `tokio-tungstenite` server.
 
+use std::collections::HashMap;
+use std::sync::mpsc;
 use std::sync::Arc;
 
+use base64::Engine as _;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use futures_util::{SinkExt as _, StreamExt as _};
-use tinyplace::{LocalSigner, TinyPlaceClient, TinyPlaceClientOptions};
+use tinyplace::{LocalSigner, Signer as _, TinyPlaceClient, TinyPlaceClientOptions};
 use tokio::net::TcpListener;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
 fn client(base_url: &str, with_signer: bool) -> TinyPlaceClient {
@@ -17,6 +23,25 @@ fn client(base_url: &str, with_signer: bool) -> TinyPlaceClient {
         signer,
         ..Default::default()
     })
+}
+
+/// A client whose signer opts out of SIWS, so authenticated requests carry the
+/// per-request freshness-bound `v1:` token instead of a reusable proof.
+fn client_without_siws(base_url: &str) -> (TinyPlaceClient, LocalSigner) {
+    let signer = LocalSigner::from_seed(&[3u8; 32]).unwrap().without_siws();
+    let client = TinyPlaceClient::new(TinyPlaceClientOptions {
+        base_url: base_url.to_string(),
+        signer: Some(Arc::new(signer.clone()) as Arc<dyn tinyplace::Signer>),
+        ..Default::default()
+    });
+    (client, signer)
+}
+
+fn header_map(headers: Vec<(String, String)>) -> HashMap<String, String> {
+    headers
+        .into_iter()
+        .map(|(name, value)| (name.to_lowercase(), value))
+        .collect()
 }
 
 #[tokio::test]
@@ -69,6 +94,151 @@ async fn ws_stream_query_params_are_included() {
         .unwrap();
     assert!(url.starts_with("wss://api.example.com/channels/c1/stream?"));
     assert!(url.contains("limit=50"), "got: {url}");
+}
+
+#[tokio::test]
+async fn ws_upgrade_headers_carry_the_signed_credential() {
+    let client = client("https://api.example.com", true);
+    let headers = header_map(
+        client
+            .inbox
+            .stream()
+            .upgrade_headers()
+            .await
+            .expect("upgrade headers"),
+    );
+
+    // The backend authenticates the handshake on X-TinyPlace-Signature, keyed to
+    // the public key presented alongside it.
+    let signature = headers
+        .get("x-tinyplace-signature")
+        .expect("signature header");
+    assert!(signature.starts_with("siws:"), "got: {signature}");
+    assert_eq!(
+        headers.get("x-tinyplace-public-key").map(String::as_str),
+        Some(
+            LocalSigner::from_seed(&[1u8; 32])
+                .unwrap()
+                .public_key_base64()
+        )
+        .as_deref()
+    );
+    assert_eq!(
+        headers.get("x-tinyplace-crypto-id").map(String::as_str),
+        Some(LocalSigner::from_seed(&[1u8; 32]).unwrap().agent_id()).as_deref()
+    );
+    assert_eq!(
+        headers.get("x-tinyplace-sdk").map(String::as_str),
+        Some(tinyplace::SDK_CLIENT)
+    );
+}
+
+#[tokio::test]
+async fn ws_upgrade_signature_signs_the_empty_canonical_payload() {
+    let (client, signer) = client_without_siws("https://api.example.com");
+    let headers = header_map(
+        client
+            .a2a
+            .stream("@alice")
+            .upgrade_headers()
+            .await
+            .expect("upgrade headers"),
+    );
+
+    // v1:<b64url(timestamp)>:<b64url(nonce)>:<base64(signature)>, signed over
+    // `<canonical payload>\n<timestamp>\n<nonce>`. A stream GET declares no
+    // action and no fields, so the payload is the empty canonical envelope.
+    let token = headers
+        .get("x-tinyplace-signature")
+        .expect("signature header");
+    let parts: Vec<&str> = token.split(':').collect();
+    assert_eq!(parts.len(), 4, "got: {token}");
+    assert_eq!(parts[0], "v1");
+
+    let url_safe = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let timestamp = String::from_utf8(url_safe.decode(parts[1]).unwrap()).unwrap();
+    let nonce = String::from_utf8(url_safe.decode(parts[2]).unwrap()).unwrap();
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(parts[3])
+        .unwrap();
+    assert!(
+        timestamp.contains('T') && timestamp.ends_with('Z'),
+        "{timestamp}"
+    );
+    assert!(!nonce.is_empty());
+
+    let payload = format!("{{\"action\":\"\",\"fields\":{{}}}}\n{timestamp}\n{nonce}");
+    let verifying = VerifyingKey::from_bytes(signer.public_key()).unwrap();
+    verifying
+        .verify(
+            payload.as_bytes(),
+            &Signature::from_slice(&signature).unwrap(),
+        )
+        .expect("upgrade signature verifies against the signer's key");
+}
+
+#[tokio::test]
+async fn ws_upgrade_headers_without_a_signer_carry_only_the_sdk_tag() {
+    let client = client("https://api.example.com", false);
+    let headers = header_map(
+        client
+            .activity
+            .stream(None)
+            .upgrade_headers()
+            .await
+            .expect("upgrade headers"),
+    );
+    assert_eq!(headers.len(), 1);
+    assert!(headers.contains_key("x-tinyplace-sdk"));
+}
+
+// The handshake callback's error type is tungstenite's own `ErrorResponse`.
+#[allow(clippy::result_large_err)]
+#[tokio::test]
+async fn ws_handshake_sends_the_signed_headers_to_the_server() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (sender, receiver) = mpsc::channel::<HashMap<String, String>>();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws =
+            tokio_tungstenite::accept_hdr_async(tcp, |request: &Request, response: Response| {
+                let seen = request
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_lowercase(),
+                            value.to_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect();
+                sender.send(seen).unwrap();
+                Ok(response)
+            })
+            .await
+            .unwrap();
+        let _ = ws.close(None).await;
+    });
+
+    let client = client(&format!("http://{addr}"), true);
+    let conn = client.inbox.stream().connect().await.unwrap();
+    conn.close().await.unwrap();
+    server.await.unwrap();
+
+    let seen = receiver.recv().unwrap();
+    assert!(
+        seen.get("x-tinyplace-signature")
+            .is_some_and(|value| value.starts_with("siws:")),
+        "handshake reached the server without a signature header: {seen:?}"
+    );
+    assert!(seen.contains_key("x-tinyplace-public-key"));
+    assert!(seen.contains_key("x-tinyplace-crypto-id"));
+    assert_eq!(
+        seen.get("x-tinyplace-sdk").map(String::as_str),
+        Some(tinyplace::SDK_CLIENT)
+    );
 }
 
 #[tokio::test]

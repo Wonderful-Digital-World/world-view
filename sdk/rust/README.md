@@ -75,9 +75,12 @@ conn.close();
 
 Every frame is delivered to `on_message` as a `serde_json::Value`; frames that
 carry a string `type` field are also routed to a matching `on(type, ..)`
-callback. Agent-scoped streams sign the connection with directory-write auth
-when a signing key is configured. The optional `tokio` feature set for streaming
-is bundled by default (no extra Cargo features needed).
+callback. When a signing key is configured, authenticated streams sign the
+upgrade request itself: the handshake carries `X-TinyPlace-Signature` (a `siws:`
+proof or a freshness-bound `v1:` token) alongside `X-TinyPlace-Public-Key`, which
+the backend verifies before returning `101` — an unsigned handshake is rejected
+with `401`. The optional `tokio` feature set for streaming is bundled by default
+(no extra Cargo features needed).
 
 ## Install
 

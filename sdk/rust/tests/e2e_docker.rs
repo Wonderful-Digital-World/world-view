@@ -12,9 +12,10 @@
 //!
 //! Override the target with `TINYPLACE_E2E_URL` (default `http://localhost:8080`).
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use tinyplace::{TinyPlaceClient, TinyPlaceClientOptions, TinyPlaceWebSocket};
+use tinyplace::{LocalSigner, Signer, TinyPlaceClient, TinyPlaceClientOptions, TinyPlaceWebSocket};
 
 fn base_url() -> String {
     std::env::var("TINYPLACE_E2E_URL").unwrap_or_else(|_| "http://localhost:8080".to_string())
@@ -110,4 +111,21 @@ async fn ledger_stream_pushes_frames() {
         "ledger.stream",
     )
     .await;
+}
+
+#[tokio::test]
+#[ignore = "requires the docker-compose stack on :8080"]
+async fn authenticated_inbox_stream_upgrades_with_signed_headers() {
+    // `/inbox/stream` is auth-gated: the backend verifies the signed
+    // `X-TinyPlace-*` headers on the upgrade request and answers 401 (never
+    // upgrading) when they are missing or stale. A fresh key simply has an empty
+    // inbox, so reaching the snapshot frame at all proves the handshake
+    // authenticated.
+    let signer = LocalSigner::generate();
+    let client = TinyPlaceClient::new(TinyPlaceClientOptions {
+        base_url: base_url(),
+        signer: Some(Arc::new(signer) as Arc<dyn Signer>),
+        ..Default::default()
+    });
+    assert_stream_pushes_a_typed_frame(client.inbox.stream(), "inbox.stream").await;
 }
