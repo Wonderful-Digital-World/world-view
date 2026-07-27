@@ -4,29 +4,39 @@
 //! their `stream()` methods. Call [`TinyPlaceWebSocket::connect`] to open the
 //! socket and obtain a [`WebSocketConnection`], then `recv()` messages in a loop.
 //!
-//! Auth travels in the URL (a WebSocket upgrade can't carry the usual custom
-//! headers): directory-write credentials as signed query params, or the agent
-//! `Authorization` header as a single `authorization=` query param.
+//! Auth travels on the upgrade request as `X-TinyPlace-*` headers — the same
+//! credential the REST routes carry, verified by the backend's auth middleware
+//! before the socket is upgraded (see [`sign_websocket_upgrade`]). The legacy
+//! URL-borne credentials (directory-write query params, or the agent
+//! `Authorization` as an `authorization=` param) are still appended, so the same
+//! handle authenticates against backends that only read the query string.
 
 use std::sync::Arc;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
-use crate::auth::{sign_directory_write_query, sign_request_query};
+use crate::auth::{
+    sign_directory_write_query, sign_request_query, sign_websocket_upgrade, Headers,
+};
 use crate::error::{Error, Result};
+use crate::http::{SDK_CLIENT, SDK_CLIENT_HEADER};
 use crate::signer::Signer;
 
-/// How a WebSocket upgrade is authenticated.
+/// How a WebSocket upgrade is authenticated. Both authenticated modes send the
+/// `X-TinyPlace-*` upgrade headers; they differ only in the legacy URL-borne
+/// credential they append for query-string backends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WsAuth {
     /// No auth (public stream, or no signer configured).
     None,
-    /// Agent `Authorization` carried as an `authorization=` query param.
+    /// Agent `Authorization` also carried as an `authorization=` query param.
     Agent,
-    /// Directory-write credentials carried as signed `X-TinyPlace-*` query params.
+    /// Directory-write credentials also carried as signed `X-TinyPlace-*` query params.
     Directory,
 }
 
@@ -81,10 +91,34 @@ impl TinyPlaceWebSocket {
         Ok(format!("{}{}", self.origin, uri))
     }
 
+    /// The headers sent on the upgrade request: the SDK client tag, plus the
+    /// signed `X-TinyPlace-*` credential when this stream is authenticated.
+    /// Exposed for testing and diagnostics.
+    pub async fn upgrade_headers(&self) -> Result<Headers> {
+        let mut headers: Headers = vec![(SDK_CLIENT_HEADER.to_string(), SDK_CLIENT.to_string())];
+        if let (WsAuth::Agent | WsAuth::Directory, Some(signer), Some(public_key)) =
+            (self.auth, &self.signer, &self.public_key)
+        {
+            headers.extend(sign_websocket_upgrade(signer.as_ref(), public_key).await?);
+        }
+        Ok(headers)
+    }
+
     /// Open the WebSocket and return a connection to read/write messages.
     pub async fn connect(&self) -> Result<WebSocketConnection> {
         let url = self.signed_url().await?;
-        let (stream, _response) = connect_async(&url)
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|error| Error::WebSocket(error.to_string()))?;
+        for (name, value) in self.upgrade_headers().await? {
+            let name = HeaderName::try_from(name.as_str())
+                .map_err(|error| Error::WebSocket(error.to_string()))?;
+            let value = HeaderValue::try_from(value.as_str())
+                .map_err(|error| Error::WebSocket(error.to_string()))?;
+            request.headers_mut().insert(name, value);
+        }
+        let (stream, _response) = connect_async(request)
             .await
             .map_err(|error| Error::WebSocket(error.to_string()))?;
         Ok(WebSocketConnection { inner: stream })

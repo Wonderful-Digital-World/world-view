@@ -7,7 +7,7 @@
 
 use rand::RngCore as _;
 
-use crate::crypto::{sha256_hex, to_base64, to_base64_url};
+use crate::crypto::{canonical_payload, sha256_hex, to_base64, to_base64_url};
 use crate::error::Result;
 use crate::signer::Signer;
 use crate::util::encode;
@@ -167,9 +167,43 @@ pub async fn sign_directory_write_query(
     ))
 }
 
+/// The signature header the backend authenticates a WebSocket upgrade with.
+pub const WS_SIGNATURE_HEADER: &str = "X-TinyPlace-Signature";
+/// The public-key header presented alongside [`WS_SIGNATURE_HEADER`].
+pub const WS_PUBLIC_KEY_HEADER: &str = "X-TinyPlace-Public-Key";
+/// The optional crypto-id header naming the identity the signer acts as.
+pub const WS_CRYPTO_ID_HEADER: &str = "X-TinyPlace-Crypto-Id";
+
+/// Sign a WebSocket upgrade, returning the `X-TinyPlace-*` headers the backend
+/// verifies on the handshake request itself.
+///
+/// A WebSocket upgrade is a plain HTTP `GET`, so it carries the same credential
+/// the REST routes use, and the server's auth middleware runs on it *before* the
+/// 101 response — an unsigned or badly signed handshake is rejected with 401 and
+/// never upgrades. The value of [`WS_SIGNATURE_HEADER`] is either a reusable
+/// `siws:` ownership proof or a freshness-bound
+/// `v1:<b64url(timestamp)>:<b64url(nonce)>:<base64(signature)>` token over the
+/// canonical payload `{"action":"","fields":{}}` — a stream `GET` declares no
+/// action and no fields, so the payload is the empty canonical envelope.
+pub async fn sign_websocket_upgrade(
+    signer: &dyn Signer,
+    public_key_base64: &str,
+) -> Result<Headers> {
+    let payload = canonical_payload("", serde_json::json!({}));
+    let signature = sign_fresh_canonical_payload(signer, &payload).await?;
+    Ok(vec![
+        (
+            WS_PUBLIC_KEY_HEADER.to_string(),
+            public_key_base64.to_string(),
+        ),
+        (WS_CRYPTO_ID_HEADER.to_string(), signer.agent_id()),
+        (WS_SIGNATURE_HEADER.to_string(), signature),
+    ])
+}
+
 /// Build the query string the agent `Authorization` header is carried in for
-/// WebSocket upgrades (`?authorization=<urlencoded>`), since headers can't be
-/// set on a browser/standard WS handshake.
+/// WebSocket upgrades (`?authorization=<urlencoded>`), for backends (and
+/// browser clients) that read the credential from the URL instead of a header.
 pub async fn sign_request_query(signer: &dyn Signer, request_uri: &str) -> Result<String> {
     let headers = sign_request(signer, "").await?;
     let authorization = headers
