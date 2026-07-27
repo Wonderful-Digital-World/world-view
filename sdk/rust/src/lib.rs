@@ -55,7 +55,7 @@ pub use solana::{
     build_exact_svm_transfer_transaction, derive_associated_token_address, get_recent_blockhash,
     ExactSvmTransfer, ExactSvmTransferOptions,
 };
-pub use websocket::{TinyPlaceWebSocket, WebSocketConnection, WsAuth};
+pub use websocket::{ReconnectPolicy, TinyPlaceWebSocket, WebSocketConnection, WsAuth};
 pub use x402_standard::{
     build_exact_svm_payment_payload, decode_payment_required, decode_settlement_response,
     encode_payment_signature, select_exact_svm_requirement, X402PaymentPayload,
