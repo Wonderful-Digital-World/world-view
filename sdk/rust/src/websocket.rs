@@ -10,8 +10,16 @@
 //! URL-borne credentials (directory-write query params, or the agent
 //! `Authorization` as an `authorization=` param) are still appended, so the same
 //! handle authenticates against backends that only read the query string.
+//!
+//! A dropped stream is re-established transparently by [`WebSocketConnection::recv`]
+//! under a [`ReconnectPolicy`], whose defaults match the TypeScript SDK's
+//! `reconnect` / `reconnectInterval` / `maxReconnectAttempts` options. Each
+//! attempt re-runs the full dial, so the upgrade carries a **freshly signed**
+//! credential — replaying the original request would present a stale
+//! timestamp/nonce and be rejected with a 401.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use tokio::net::TcpStream;
@@ -40,14 +48,54 @@ pub enum WsAuth {
     Directory,
 }
 
+/// How a stream that drops mid-flight is re-established.
+///
+/// Defaults mirror the TypeScript SDK's `TinyPlaceWebSocketOptions`: reconnect
+/// enabled, a 3s pause between attempts, and at most 10 attempts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReconnectPolicy {
+    /// Whether a dropped stream is re-dialled at all.
+    pub enabled: bool,
+    /// How long to wait before each attempt.
+    pub interval: Duration,
+    /// How many consecutive attempts to make before giving up.
+    ///
+    /// The counter resets once the re-established stream delivers a message, so
+    /// this bounds a run of *consecutive* failures rather than the lifetime
+    /// total.
+    pub max_attempts: u32,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval: Duration::from_millis(3_000),
+            max_attempts: 10,
+        }
+    }
+}
+
+impl ReconnectPolicy {
+    /// A policy that never reconnects: `recv` reports the drop instead.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+}
+
 /// An un-connected WebSocket handle. Cheap to build; opens the socket on
 /// [`connect`](TinyPlaceWebSocket::connect).
+#[derive(Clone)]
 pub struct TinyPlaceWebSocket {
     origin: String,
     request_uri: String,
     signer: Option<Arc<dyn Signer>>,
     public_key: Option<String>,
     auth: WsAuth,
+    reconnect: ReconnectPolicy,
 }
 
 impl TinyPlaceWebSocket {
@@ -66,7 +114,29 @@ impl TinyPlaceWebSocket {
             signer,
             public_key,
             auth,
+            reconnect: ReconnectPolicy::default(),
         }
+    }
+
+    /// Override how a dropped stream is re-established.
+    ///
+    /// ```no_run
+    /// # use tinyplace::{ReconnectPolicy, TinyPlaceClient};
+    /// # async fn run(client: TinyPlaceClient) -> tinyplace::Result<()> {
+    /// // Give up immediately, surfacing the drop to the caller.
+    /// let mut conn = client
+    ///     .inbox
+    ///     .stream()
+    ///     .with_reconnect(ReconnectPolicy::disabled())
+    ///     .connect()
+    ///     .await?;
+    /// # let _ = conn.recv().await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_reconnect(mut self, reconnect: ReconnectPolicy) -> Self {
+        self.reconnect = reconnect;
+        self
     }
 
     /// The fully-qualified WebSocket URL that would be opened, with auth applied.
@@ -105,7 +175,26 @@ impl TinyPlaceWebSocket {
     }
 
     /// Open the WebSocket and return a connection to read/write messages.
+    ///
+    /// This is a single attempt: a refused or unauthenticated upgrade returns
+    /// the error rather than retrying, so a misconfigured client fails fast.
+    /// [`ReconnectPolicy`] governs what happens to an *established* stream that
+    /// later drops.
     pub async fn connect(&self) -> Result<WebSocketConnection> {
+        let stream = self.dial().await?;
+        Ok(WebSocketConnection {
+            inner: stream,
+            dialer: self.clone(),
+            attempts: 0,
+        })
+    }
+
+    /// Run one full dial: sign the URL and the upgrade headers, then handshake.
+    ///
+    /// Every reconnect goes through here rather than replaying a stored request:
+    /// [`sign_websocket_upgrade`] binds a timestamp and nonce, so a replayed
+    /// upgrade would be rejected as stale.
+    async fn dial(&self) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
         let url = self.signed_url().await?;
         let mut request = url
             .as_str()
@@ -121,7 +210,7 @@ impl TinyPlaceWebSocket {
         let (stream, _response) = connect_async(request)
             .await
             .map_err(|error| Error::WebSocket(error.to_string()))?;
-        Ok(WebSocketConnection { inner: stream })
+        Ok(stream)
     }
 }
 
@@ -129,25 +218,75 @@ impl TinyPlaceWebSocket {
 /// push with [`send`](Self::send), and shut down with [`close`](Self::close).
 pub struct WebSocketConnection {
     inner: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    /// The handle this was opened from, kept so a drop can be re-dialled.
+    dialer: TinyPlaceWebSocket,
+    /// Consecutive reconnect attempts since the last delivered message.
+    attempts: u32,
 }
 
 impl WebSocketConnection {
-    /// Await the next message, parsed as JSON. Returns `None` when the stream
-    /// closes. Ping/pong control frames are handled transparently and skipped.
+    /// Await the next message, parsed as JSON. Ping/pong control frames are
+    /// handled transparently and skipped.
+    ///
+    /// If the stream drops, it is re-dialled per the handle's
+    /// [`ReconnectPolicy`] and the wait resumes — transparently to the caller.
+    /// Returns `None` once the stream has closed and reconnecting is disabled or
+    /// exhausted. A transport error is likewise reported only after reconnecting
+    /// has been given up on.
+    ///
+    /// Note that a reconnect re-subscribes: anything the server published while
+    /// the socket was down is not replayed, and a stream that opens with a
+    /// snapshot frame will deliver a fresh one.
     pub async fn recv(&mut self) -> Option<Result<serde_json::Value>> {
         loop {
             match self.inner.next().await {
                 Some(Ok(Message::Text(text))) => {
+                    // A delivered message proves the stream is healthy, so the
+                    // budget for the *next* outage starts over. The TS SDK
+                    // instead resets on open, which lets a server that accepts
+                    // and immediately drops be retried forever.
+                    self.attempts = 0;
                     return Some(serde_json::from_str(&text).map_err(Error::from));
                 }
                 Some(Ok(Message::Binary(bytes))) => {
+                    self.attempts = 0;
                     return Some(serde_json::from_slice(&bytes).map_err(Error::from));
                 }
-                Some(Ok(Message::Close(_))) | None => return None,
+                Some(Ok(Message::Close(_))) | None => {
+                    if self.reconnect().await {
+                        continue;
+                    }
+                    return None;
+                }
                 Some(Ok(_)) => continue,
-                Some(Err(error)) => return Some(Err(Error::WebSocket(error.to_string()))),
+                Some(Err(error)) => {
+                    if self.reconnect().await {
+                        continue;
+                    }
+                    return Some(Err(Error::WebSocket(error.to_string())));
+                }
             }
         }
+    }
+
+    /// Re-dial the stream, reporting whether a fresh one was established.
+    ///
+    /// Pauses `interval` *before* each attempt so a server that drops
+    /// connections instantly cannot be hammered.
+    async fn reconnect(&mut self) -> bool {
+        let policy = self.dialer.reconnect;
+        if !policy.enabled {
+            return false;
+        }
+        while self.attempts < policy.max_attempts {
+            self.attempts += 1;
+            tokio::time::sleep(policy.interval).await;
+            if let Ok(stream) = self.dialer.dial().await {
+                self.inner = stream;
+                return true;
+            }
+        }
+        false
     }
 
     /// Send a JSON message to the server.
