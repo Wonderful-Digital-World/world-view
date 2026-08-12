@@ -7,15 +7,16 @@ This document records the trusted local baseline for World View before any WDW i
 | Field | Value |
 | --- | --- |
 | Product name | World View |
-| Intended GitHub repository | `WDW/world-view` |
-| Intended repository URL | <https://github.com/WDW/world-view> |
+| GitHub organization | `Wonderful-Digital-World` (WDW) |
+| Intended GitHub repository | `Wonderful-Digital-World/world-view` |
+| Intended repository URL | <https://github.com/Wonderful-Digital-World/world-view> |
 | Upstream repository | <https://github.com/tinyhumansai/tiny.place> |
 | Baseline commit | `a28827be6c1d6aee8108a5d27b0f9df5fb0b40c4` |
 | Imported | 2026-08-12 |
 | License | GPL-3.0-or-later, preserved from upstream |
 | Local branch | `codex/wp1-world-view` |
 
-The complete upstream Git history was imported locally. The working tree is based on upstream `main` at the commit above. Upstream copyright, license files, and notices remain in place. The WDW organization was not visible to the authenticated GitHub account during this work, so publication to `WDW/world-view` could not be completed; no personal fork or substitute repository was created.
+The complete upstream Git history was imported locally. The working tree is based on upstream `main` at the commit above. Upstream copyright, license files, and notices remain in place. The repository is intended for the `Wonderful-Digital-World` organization, abbreviated WDW; it is not a personal fork or a repository under the upstream Tiny Place organization.
 
 ## Local setup and validation
 
