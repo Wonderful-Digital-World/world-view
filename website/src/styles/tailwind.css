@@ -1,5 +1,4 @@
 @import "tailwindcss";
-@plugin "@tailwindcss/typography";
 
 @theme {
 	--font-heading: "Google Sans Flex", sans-serif;
@@ -240,6 +239,8 @@
 }
 
 body {
+	height: 100%;
+	overflow: hidden;
 	background: var(--theme-bg);
 	color: var(--theme-front);
 }

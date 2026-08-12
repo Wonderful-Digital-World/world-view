@@ -204,7 +204,7 @@ const eslintConfig = typescriptEslint.config(
 
 eslintConfig.forEach((config) => {
   if (!config.ignores || Object.keys(config).length > 1) {
-    config.files = ["src/**/*.ts", "src/**/*.tsx"]
+		config.files = ["app/**/*.ts", "app/**/*.tsx", "src/**/*.ts", "src/**/*.tsx"]
   }
 })
 

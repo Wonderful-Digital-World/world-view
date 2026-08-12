@@ -24,7 +24,7 @@ export default defineConfig({
 	reporter: "html",
 	/* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
 	use: {
-		/* Base URL so tests can use page.goto("/reputation"). */
+		/* Base URL so tests can use page.goto("/rooms"). */
 		baseURL: BASE_URL,
 
 		/* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
@@ -42,7 +42,7 @@ export default defineConfig({
 
 	/* Build output is produced by `pnpm build`; serve it for the tests. */
 	webServer: {
-		command: `TINYPLACE_BASIC_AUTH_ENABLED=false pnpm exec next start -p ${PORT}`,
+		command: `pnpm exec next start -p ${PORT}`,
 		url: BASE_URL,
 		reuseExistingServer: !process.env.CI,
 		timeout: 120_000,

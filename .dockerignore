@@ -1,7 +1,6 @@
 # Keep the Docker build context small and reproducible. Excludes installed
 # deps and build outputs so `pnpm install --frozen-lockfile` runs clean.
-# NOTE: this only affects image builds; the solana service mounts
-# contracts-sol/target/deploy/*.so as a volume, which .dockerignore does not affect.
+# This image builds only the standalone World View website.
 **/node_modules
 **/.next
 **/dist

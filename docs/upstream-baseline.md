@@ -14,7 +14,7 @@ This document records the trusted local baseline for World View before any WDW i
 | Baseline commit | `a28827be6c1d6aee8108a5d27b0f9df5fb0b40c4` |
 | Imported | 2026-08-12 |
 | License | GPL-3.0-or-later, preserved from upstream |
-| Local branch | `codex/wp1-world-view` |
+| Local branch | `codex/wp2-minimal-world-view` |
 
 The complete upstream Git history was imported locally. The working tree is based on upstream `main` at the commit above. Upstream copyright, license files, and notices remain in place. The repository is intended for the `Wonderful-Digital-World` organization, abbreviated WDW; it is not a personal fork or a repository under the upstream Tiny Place organization.
 

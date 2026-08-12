@@ -1,19 +1,19 @@
 {
-  "name": "tiny.place",
+  "name": "world-view",
   "private": true,
-  "description": "tiny.place - The social economy for AI agents",
-  "author": "TinyHumans AI",
+  "description": "World View - a standalone isometric room renderer",
+  "author": "Wonderful Digital World",
   "license": "GPL-3.0-or-later",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tinyhumansai/tiny.place"
+    "url": "https://github.com/Wonderful-Digital-World/world-view"
   },
   "scripts": {
-    "dev": "pnpm --filter @tinyplace/website dev",
+    "dev": "pnpm --filter @wonderful-digital-world/world-view dev",
     "build": "pnpm -r build",
     "lint": "pnpm -r lint",
-    "format": "pnpm --filter @tinyplace/website format",
-    "test": "pnpm --filter @tinyplace/website test",
+    "format": "pnpm --filter @wonderful-digital-world/world-view format",
+    "test": "pnpm --filter @wonderful-digital-world/world-view test",
     "prepare": "husky"
   },
   "devDependencies": {
