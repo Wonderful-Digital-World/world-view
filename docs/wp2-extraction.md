@@ -1,7 +1,7 @@
 # WP2 extraction record
 
 World View WP2 extracts the smallest standalone application around the trusted
-tiny.place isometric renderer. The renderer remains in `website/src/iso/`, and
+[tiny.place](https://github.com/tinyhumansai/tiny.place) isometric renderer. The renderer remains in `website/src/iso/`, and
 the `/rooms` route retains all five upstream rooms and room switching.
 
 ## Baseline and scope
@@ -10,7 +10,7 @@ the `/rooms` route retains all five upstream rooms and room switching.
 - WP1 local baseline: `624bfa07`
 - WP2 starting commit: `7915db4c11d9517d18109075f1f2390d8d3a8c25`
 - WP2 branch: `codex/wp2-minimal-world-view`
-- Scope intentionally excludes WDW projections, new rooms, sprite or palette
+- Scope intentionally excludes [WDW](https://github.com/Wonderful-Digital-World/wonderful-digital-world) projections, new rooms, sprite or palette
   changes, framework migration, and renderer redesign.
 
 ## Retained application boundary
