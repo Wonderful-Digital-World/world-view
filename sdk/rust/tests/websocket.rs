@@ -250,9 +250,11 @@ async fn ws_connect_recv_send_close_round_trip() {
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-        ws.send(Message::Text("{\"type\":\"hello\",\"n\":1}".to_string()))
-            .await
-            .unwrap();
+        ws.send(Message::Text(
+            "{\"type\":\"hello\",\"n\":1}".to_string().into(),
+        ))
+        .await
+        .unwrap();
         // Echo back whatever the client sends, then close.
         if let Some(Ok(incoming)) = ws.next().await {
             if incoming.is_text() {
@@ -288,9 +290,11 @@ async fn flapping_server(rounds: usize) -> (String, tokio::task::JoinHandle<()>)
         for n in 1..=rounds {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-            ws.send(Message::Text(format!("{{\"type\":\"tick\",\"n\":{n}}}")))
-                .await
-                .unwrap();
+            ws.send(Message::Text(
+                format!("{{\"type\":\"tick\",\"n\":{n}}}").into(),
+            ))
+            .await
+            .unwrap();
             let _ = ws.close(None).await;
         }
         drop(listener);
@@ -333,11 +337,11 @@ async fn ws_keepalive_traffic_resets_the_retry_budget() {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
             if round == 3 {
-                ws.send(Message::Text("{\"n\":3}".to_string()))
+                ws.send(Message::Text("{\"n\":3}".to_string().into()))
                     .await
                     .unwrap();
             } else {
-                ws.send(Message::Ping(Vec::new())).await.unwrap();
+                ws.send(Message::Ping(Vec::new().into())).await.unwrap();
             }
             let _ = ws.close(None).await;
         }
@@ -372,7 +376,7 @@ async fn ws_reconnect_bounds_a_stalled_handshake() {
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-        ws.send(Message::Text("{\"n\":1}".to_string()))
+        ws.send(Message::Text("{\"n\":1}".to_string().into()))
             .await
             .unwrap();
         let _ = ws.close(None).await;
@@ -524,7 +528,7 @@ async fn ws_reconnect_signs_a_fresh_upgrade() {
             )
             .await
             .unwrap();
-            ws.send(Message::Text(format!("{{\"n\":{n}}}")))
+            ws.send(Message::Text(format!("{{\"n\":{n}}}").into()))
                 .await
                 .unwrap();
             let _ = ws.close(None).await;
