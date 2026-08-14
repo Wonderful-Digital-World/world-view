@@ -1,6 +1,6 @@
 # World View — WP1 upstream baseline
 
-This document records the trusted local baseline for World View before any WDW integration or renderer extraction. The source remains the upstream Tiny Place application at this stage; “World View” is the WDW product/repository name, not a source rebrand.
+This document records the trusted local baseline for World View before any [WDW](https://github.com/Wonderful-Digital-World/wonderful-digital-world) integration or renderer extraction. The source remains the upstream [Tiny Place](https://github.com/tinyhumansai/tiny.place) application at this stage; “World View” is the WDW product/repository name, not a source rebrand.
 
 ## Identity and provenance
 

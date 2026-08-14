@@ -24,7 +24,7 @@ The frontend-owned model lives under `website/src/world`:
 - Activity is intentionally broad: `idle`, `working`, `waiting`, `reviewing`, `communicating`, or `offline`.
 - Attention is intentionally UI-facing: `none`, `info`, `needs-user`, or `blocked`.
 
-These are view-model types, not a canonical backend contract. The fixture is the current data source. There is no live WDW source, backend call, database, Airtable integration, or projection service in WP3.
+These are view-model types, not a canonical backend contract. The fixture is the current data source. There is no live [WDW](https://github.com/Wonderful-Digital-World/wonderful-digital-world) source, backend call, database, Airtable integration, or projection service in WP3.
 
 `GameWorld` remains renderer-focused. The adapter owns the semantic-to-renderer boundary, including room selection, renderer actions, station coordinates, facing, labels, tints, and practical fallbacks. The React room shell owns the active fixture, selected place, status surface, and development controls.
 

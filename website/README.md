@@ -1,6 +1,6 @@
 # World View
 
-World View is a standalone Next.js application for the retained tiny.place isometric renderer. It renders the five upstream rooms and supports switching between them without Tiny Place product services, wallet providers, or API initialization.
+World View is a standalone Next.js application for the retained [tiny.place](https://github.com/tinyhumansai/tiny.place) isometric renderer. It renders the five upstream rooms and supports switching between them without Tiny Place product services, wallet providers, or API initialization.
 
 ## Development
 

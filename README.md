@@ -1,6 +1,6 @@
 # World View
 
-World View is the standalone isometric world viewer extracted from the tiny.place renderer for Wonderful Digital World.
+World View is the standalone isometric world viewer extracted from the [tiny.place](https://github.com/tinyhumansai/tiny.place) renderer for [Wonderful Digital World](https://github.com/Wonderful-Digital-World/wonderful-digital-world).
 
 The website retains the PixiJS renderer, its state-control APIs, and all five upstream rooms:
 
@@ -37,4 +37,4 @@ The standalone website is the only active pnpm workspace package. The upstream S
 
 ## Provenance and license
 
-World View preserves the upstream tiny.place renderer and GPL-3.0-or-later licensing. See [`docs/upstream-baseline.md`](docs/upstream-baseline.md) for the trusted baseline and provenance record.
+World View preserves the upstream [tiny.place](https://github.com/tinyhumansai/tiny.place) renderer and GPL-3.0-or-later licensing. See [`docs/upstream-baseline.md`](docs/upstream-baseline.md) for the trusted baseline and provenance record.
