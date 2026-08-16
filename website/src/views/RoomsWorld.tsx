@@ -9,7 +9,7 @@ import {
 	useState,
 } from "react";
 
-import { GameWorld } from "@src/iso";
+import { GameWorld, MAX_ZOOM, MIN_ZOOM, ZOOM_STEP } from "@src/iso";
 import {
 	createRendererCommands,
 	getFixtureForScenario,
@@ -53,6 +53,7 @@ export const RoomsWorld = (): ReactElement => {
 	const [fixtureScenario, setFixtureScenario] =
 		useState<WorldFixtureScenario>("normal-workday");
 	const [selectedPlaceId, setSelectedPlaceId] = useState("workshop");
+	const [zoom, setZoom] = useState(WDW_ROOM_REGISTRY[0]?.defaultZoom ?? 1);
 
 	const fixture = useMemo(
 		() => getFixtureForScenario(fixtureScenario),
@@ -86,6 +87,7 @@ export const RoomsWorld = (): ReactElement => {
 				world.destroy();
 				return;
 			}
+			setZoom(world.getZoom());
 			setReady(true);
 		});
 
@@ -104,6 +106,7 @@ export const RoomsWorld = (): ReactElement => {
 		}
 
 		world.setRoom(rendererRoomKey);
+		setZoom(world.getZoom());
 		world.setAutonomous(false);
 		for (const command of rendererCommands) {
 			world.updateAgentState(command.resident.agentId, command.state);
@@ -118,6 +121,35 @@ export const RoomsWorld = (): ReactElement => {
 		setSelectedPlaceId(event.target.value);
 	};
 
+	const handleZoomChange = (event: ChangeEvent<HTMLInputElement>): void => {
+		const world = worldRef.current;
+		if (!world) {
+			return;
+		}
+		setZoom(world.setZoom(Number(event.target.value)));
+	};
+
+	const handleZoomIn = (): void => {
+		const world = worldRef.current;
+		if (world) {
+			setZoom(world.zoomIn());
+		}
+	};
+
+	const handleZoomOut = (): void => {
+		const world = worldRef.current;
+		if (world) {
+			setZoom(world.zoomOut());
+		}
+	};
+
+	const handleFit = (): void => {
+		const world = worldRef.current;
+		if (world) {
+			setZoom(world.resetZoom());
+		}
+	};
+
 	const projectedRoomKey = getRendererRoomKey(selectedPlaceId);
 
 	return (
@@ -128,6 +160,54 @@ export const RoomsWorld = (): ReactElement => {
 					Loading World View…
 				</div>
 			)}
+
+			<div
+				aria-label="World zoom controls"
+				className="absolute bottom-3 left-3 z-10 flex items-center gap-2 rounded-xl border border-border bg-surface/85 p-2 shadow-xl backdrop-blur-md"
+				role="group"
+			>
+				<button
+					aria-label="Zoom out"
+					className="h-9 w-9 rounded-md border border-border bg-bg text-lg text-front transition hover:bg-surface disabled:opacity-50"
+					data-testid="zoom-out"
+					disabled={!ready || zoom <= MIN_ZOOM}
+					type="button"
+					onClick={handleZoomOut}
+				>
+					−
+				</button>
+				<input
+					aria-label="World zoom"
+					className="w-28 accent-primary sm:w-40"
+					data-testid="zoom-slider"
+					disabled={!ready}
+					max={MAX_ZOOM}
+					min={MIN_ZOOM}
+					step={ZOOM_STEP}
+					type="range"
+					value={zoom}
+					onChange={handleZoomChange}
+				/>
+				<button
+					aria-label="Zoom in"
+					className="h-9 w-9 rounded-md border border-border bg-bg text-lg text-front transition hover:bg-surface disabled:opacity-50"
+					data-testid="zoom-in"
+					disabled={!ready || zoom >= MAX_ZOOM}
+					type="button"
+					onClick={handleZoomIn}
+				>
+					+
+				</button>
+				<button
+					className="h-9 rounded-md border border-border bg-bg px-3 text-sm font-medium text-front transition hover:bg-surface disabled:opacity-50"
+					data-testid="zoom-fit"
+					disabled={!ready}
+					type="button"
+					onClick={handleFit}
+				>
+					Fit
+				</button>
+			</div>
 
 			<div className="pointer-events-none absolute left-3 top-3 z-10 max-w-sm rounded-xl border border-border bg-surface/80 px-4 py-3 shadow-xl backdrop-blur-md">
 				<h1 className="text-lg font-semibold text-front">World View</h1>

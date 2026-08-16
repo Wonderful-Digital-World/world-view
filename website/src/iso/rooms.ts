@@ -483,6 +483,7 @@ export interface RoomEntry {
 	key: string;
 	name: string;
 	description: string;
+	defaultZoom?: number;
 	create: (factory: TextureFactory) => BaseRoom;
 }
 

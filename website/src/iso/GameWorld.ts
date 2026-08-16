@@ -53,10 +53,16 @@ const FONT_CHARACTERS: Array<Array<string> | string> = [
 const CAMERA_PADDING = 28;
 // Pull the camera back a little now that the world renders full-screen, so the
 // room reads at a comfortable scale instead of filling every pixel.
-const ZOOM_BOOST = 0.5;
+const FIT_SCALE_MULTIPLIER = 0.5;
 const TAP_THRESHOLD = 6;
 const AGENT_PICK_RADIUS = 26;
 const PAN_LIMIT = 360;
+const MIN_NAMEPLATE_SCALE = 0.7;
+const MAX_NAMEPLATE_SCALE = 1.6;
+
+export const MIN_ZOOM = 0.75;
+export const MAX_ZOOM = 2.5;
+export const ZOOM_STEP = 0.25;
 
 // Live traffic: cars cruise along the city's horizontal street rows (where the
 // 2x1 car sprite is already correctly oriented). Only the "outside" city has
@@ -224,6 +230,8 @@ export class GameWorld {
 	private lastPointerY = 0;
 	private panRangeX = PAN_LIMIT;
 	private panRangeY = PAN_LIMIT;
+	private fitScale = 1;
+	private zoomMultiplier: number;
 	// "contain" frames the whole world inside the viewport (the world page);
 	// "cover" fills the viewport, cropping the overflow (the home banner strip).
 	private readonly fillMode: "contain" | "cover";
@@ -237,6 +245,7 @@ export class GameWorld {
 		if (!this.roomRegistry.some((entry) => entry.key === this.roomKey)) {
 			throw new Error(`Unknown initial room key: ${this.roomKey}`);
 		}
+		this.zoomMultiplier = this.getDefaultZoom(this.roomKey);
 		this.fillMode = options.fillMode ?? "contain";
 	}
 
@@ -252,7 +261,7 @@ export class GameWorld {
 		await app.init({
 			width: NATIVE_RESOLUTION,
 			height: NATIVE_RESOLUTION,
-			antialias: true,
+			antialias: false,
 			preference: "webgpu",
 			powerPreference: "high-performance",
 			resolution: globalThis.devicePixelRatio || 1,
@@ -344,14 +353,46 @@ export class GameWorld {
 		return this.roomKey;
 	}
 
+	public getZoom(): number {
+		return this.zoomMultiplier;
+	}
+
+	public setZoom(zoom: number): number {
+		if (!Number.isFinite(zoom)) {
+			return this.zoomMultiplier;
+		}
+		this.zoomMultiplier = clamp(zoom, MIN_ZOOM, MAX_ZOOM);
+		this.applyCameraScale();
+		this.notifyChange();
+		return this.zoomMultiplier;
+	}
+
+	public zoomIn(): number {
+		return this.setZoom(this.zoomMultiplier + ZOOM_STEP);
+	}
+
+	public zoomOut(): number {
+		return this.setZoom(this.zoomMultiplier - ZOOM_STEP);
+	}
+
+	public resetZoom(): number {
+		return this.setZoom(this.getDefaultZoom(this.roomKey));
+	}
+
 	public setRoom(key: string): void {
 		const entry = this.roomRegistry.find((candidate) => candidate.key === key);
 		if (!entry) {
 			throw new Error(`Unknown room key: "${key}"`);
 		}
+		const roomChanged = this.roomKey !== key;
+		this.roomKey = key;
+		if (roomChanged) {
+			this.zoomMultiplier = this.getDefaultZoom(key);
+		}
 		const factory = this.factory;
 		const app = this.app;
 		if (!factory || !app) {
+			this.notifyChange();
 			return;
 		}
 		this.clearAgents();
@@ -362,7 +403,6 @@ export class GameWorld {
 			this.world.removeChild(this.room.view);
 			this.room.view.destroy({ children: true });
 		}
-		this.roomKey = key;
 		this.room = entry.create(factory);
 		this.world.addChild(this.room.view);
 		this.room.entityLayer.addChild(this.selectionRing);
@@ -378,21 +418,54 @@ export class GameWorld {
 		const size = this.room.pixelSize;
 		// Fit the room into the viewport, then nudge it up a touch so the world
 		// fills more of the frame (panning covers any slight overflow).
-		const zoom = clamp(
+		this.fitScale = clamp(
 			Math.min(
 				(NATIVE_RESOLUTION - CAMERA_PADDING * 2) / size.width,
 				(NATIVE_RESOLUTION - CAMERA_PADDING * 2) / size.height
-			) * ZOOM_BOOST,
+			) * FIT_SCALE_MULTIPLIER,
 			0.34,
 			1.6
 		);
-		this.camera.scale.set(zoom);
 		this.camera.position.set(NATIVE_RESOLUTION / 2, NATIVE_RESOLUTION / 2);
-		// Allow panning far enough to reach the edges of a large room/city.
-		this.panRangeX = Math.max(PAN_LIMIT, (size.width * zoom) / 2);
-		this.panRangeY = Math.max(PAN_LIMIT, (size.height * zoom) / 2);
+		this.applyCameraScale();
 		this.spawnTraffic();
 		this.notifyChange();
+	}
+
+	private getDefaultZoom(key: string): number {
+		const defaultZoom =
+			this.roomRegistry.find((entry) => entry.key === key)?.defaultZoom ?? 1;
+		return clamp(defaultZoom, MIN_ZOOM, MAX_ZOOM);
+	}
+
+	private applyCameraScale(): void {
+		const effectiveScale = this.fitScale * this.zoomMultiplier;
+		this.camera.scale.set(effectiveScale);
+		const size = this.room?.pixelSize;
+		if (size) {
+			this.panRangeX = Math.max(PAN_LIMIT, (size.width * effectiveScale) / 2);
+			this.panRangeY = Math.max(PAN_LIMIT, (size.height * effectiveScale) / 2);
+		}
+		this.camera.position.set(
+			clamp(
+				this.camera.position.x,
+				NATIVE_RESOLUTION / 2 - this.panRangeX,
+				NATIVE_RESOLUTION / 2 + this.panRangeX
+			),
+			clamp(
+				this.camera.position.y,
+				NATIVE_RESOLUTION / 2 - this.panRangeY,
+				NATIVE_RESOLUTION / 2 + this.panRangeY
+			)
+		);
+		const nameplateScale = clamp(
+			1 / effectiveScale,
+			MIN_NAMEPLATE_SCALE,
+			MAX_NAMEPLATE_SCALE
+		);
+		for (const agent of this.agents.values()) {
+			agent.setNameplateScale(nameplateScale);
+		}
 	}
 
 	// ---- Traffic ------------------------------------------------------------
@@ -744,6 +817,13 @@ export class GameWorld {
 			label,
 			spawn,
 		});
+		agent.setNameplateScale(
+			clamp(
+				1 / (this.fitScale * this.zoomMultiplier),
+				MIN_NAMEPLATE_SCALE,
+				MAX_NAMEPLATE_SCALE
+			)
+		);
 		// Agents live in the room's structure layer so they sort against walls
 		// and furniture; they always render above the ground layer.
 		(this.room?.entityLayer ?? this.world).addChild(agent);

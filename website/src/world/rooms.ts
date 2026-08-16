@@ -107,12 +107,14 @@ export class LabRoom extends BaseRoom {
 export const WDW_ROOM_REGISTRY: ReadonlyArray<RoomEntry> = [
 	{
 		create: (factory: TextureFactory): BaseRoom => new WorkshopRoom(factory),
+		defaultZoom: 1.5,
 		description: "Shared workroom for Bridget and Banjo.",
 		key: "workshop",
 		name: "Workshop",
 	},
 	{
 		create: (factory: TextureFactory): BaseRoom => new LabRoom(factory),
+		defaultZoom: 1.5,
 		description: "Research room for Coach and Mini Me.",
 		key: "lab",
 		name: "Lab",
@@ -120,6 +122,7 @@ export const WDW_ROOM_REGISTRY: ReadonlyArray<RoomEntry> = [
 	{
 		create: (factory: TextureFactory): BaseRoom =>
 			new OutsideWorldRoom(factory),
+		defaultZoom: 1,
 		description: "Outdoor commons for residents between rooms.",
 		key: "outside",
 		name: "Outside",

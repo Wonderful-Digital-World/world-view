@@ -122,6 +122,10 @@ export class Agent extends Container {
 		this.nameplate.text = label;
 	}
 
+	public setNameplateScale(scale: number): void {
+		this.nameplate.scale.set(scale);
+	}
+
 	public setTint(tint: number): void {
 		this.body.tint = tint;
 	}
