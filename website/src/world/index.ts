@@ -14,6 +14,7 @@ export {
 	type RendererPlacement,
 	type RendererRoomKey,
 } from "./placement";
+export { LabRoom, WDW_ROOM_REGISTRY, WorkshopRoom } from "./rooms";
 export type {
 	PlaceProjection,
 	ResidentActivity,

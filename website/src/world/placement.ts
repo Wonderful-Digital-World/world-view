@@ -2,7 +2,7 @@ import type { AgentAction, Facing } from "@src/iso";
 
 import type { ResidentActivity } from "./types";
 
-export type RendererRoomKey = "poker" | "court" | "office" | "home" | "outside";
+export type RendererRoomKey = "workshop" | "lab" | "outside";
 
 export interface RendererPlacement {
 	action: AgentAction;
@@ -13,57 +13,30 @@ export interface RendererPlacement {
 
 type PlacementCandidate = Omit<RendererPlacement, "action">;
 
+const INDOOR_PLACEMENT_CANDIDATES: Partial<
+	Record<ResidentActivity, Array<PlacementCandidate>>
+> = {
+	communicating: [
+		{ facing: "right", x: 3, y: 8 },
+		{ facing: "left", x: 4, y: 8 },
+	],
+	idle: [{ facing: "right", x: 6, y: 9 }],
+	offline: [{ facing: "right", x: 6, y: 9 }],
+	reviewing: [{ facing: "left", x: 10, y: 2 }],
+	waiting: [{ facing: "right", x: 6, y: 9 }],
+	working: [
+		{ facing: "right", x: 2, y: 4 },
+		{ facing: "right", x: 7, y: 4 },
+	],
+};
+
 const PLACEMENT_CANDIDATES: Readonly<
 	Record<
 		RendererRoomKey,
 		Partial<Record<ResidentActivity, Array<PlacementCandidate>>>
 	>
 > = {
-	court: {
-		communicating: [
-			{ facing: "right", x: 3, y: 10 },
-			{ facing: "left", x: 4, y: 10 },
-		],
-		idle: [{ facing: "right", x: 6, y: 8 }],
-		offline: [{ facing: "right", x: 6, y: 8 }],
-		reviewing: [
-			{ facing: "right", x: 7, y: 10 },
-			{ facing: "left", x: 8, y: 10 },
-		],
-		waiting: [{ facing: "right", x: 6, y: 8 }],
-		working: [{ facing: "right", x: 6, y: 8 }],
-	},
-	home: {
-		communicating: [{ facing: "left", x: 7, y: 4 }],
-		idle: [{ facing: "right", x: 6, y: 9 }],
-		offline: [{ facing: "right", x: 6, y: 9 }],
-		reviewing: [{ facing: "left", x: 7, y: 4 }],
-		waiting: [{ facing: "right", x: 6, y: 9 }],
-		working: [{ facing: "left", x: 7, y: 4 }],
-	},
-	office: {
-		communicating: [
-			{ facing: "right", x: 2, y: 10 },
-			{ facing: "right", x: 6, y: 10 },
-			{ facing: "right", x: 10, y: 10 },
-		],
-		idle: [
-			{ facing: "right", x: 2, y: 10 },
-			{ facing: "right", x: 6, y: 10 },
-			{ facing: "right", x: 10, y: 10 },
-		],
-		offline: [{ facing: "right", x: 6, y: 10 }],
-		reviewing: [{ facing: "left", x: 11, y: 2 }],
-		waiting: [{ facing: "right", x: 2, y: 10 }],
-		working: [
-			{ facing: "right", x: 1, y: 3 },
-			{ facing: "right", x: 5, y: 3 },
-			{ facing: "right", x: 9, y: 3 },
-			{ facing: "right", x: 1, y: 7 },
-			{ facing: "right", x: 5, y: 7 },
-			{ facing: "right", x: 9, y: 7 },
-		],
-	},
+	lab: INDOOR_PLACEMENT_CANDIDATES,
 	outside: {
 		communicating: [
 			{ facing: "right", x: 30, y: 32 },
@@ -79,9 +52,7 @@ const PLACEMENT_CANDIDATES: Readonly<
 		waiting: [{ facing: "right", x: 30, y: 24 }],
 		working: [{ facing: "right", x: 30, y: 24 }],
 	},
-	poker: {
-		idle: [{ facing: "right", x: 6, y: 9 }],
-	},
+	workshop: INDOOR_PLACEMENT_CANDIDATES,
 };
 
 const DEFAULT_PLACEMENT: PlacementCandidate = { facing: "right", x: 6, y: 9 };
