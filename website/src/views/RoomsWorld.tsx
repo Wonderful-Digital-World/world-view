@@ -9,20 +9,15 @@ import {
 	useState,
 } from "react";
 
-import { GameWorld, ROOM_REGISTRY } from "@src/iso";
+import { GameWorld } from "@src/iso";
 import {
 	createRendererCommands,
 	getFixtureForScenario,
 	getRendererRoomKey,
 	type ResidentAttention,
 	type WorldFixtureScenario,
+	WDW_ROOM_REGISTRY,
 } from "@src/world";
-
-// The renderer retains five rooms; the projection deliberately selects one
-// semantic place at a time so the fixture remains easy to inspect.
-const WORLD_ROOM_KEY = "outside";
-const WORLD_POPULATION = 100;
-const ROOM_POPULATION = 8;
 
 const FIXTURE_OPTIONS: Array<{
 	label: string;
@@ -33,16 +28,6 @@ const FIXTURE_OPTIONS: Array<{
 	{ label: "Blocked", value: "blocked" },
 	{ label: "Quiet", value: "quiet" },
 ];
-
-const populationFor = (key: string): number =>
-	key === WORLD_ROOM_KEY ? WORLD_POPULATION : ROOM_POPULATION;
-
-const toggleClass = (active: boolean): string =>
-	`rounded-lg border px-3 py-2 text-sm transition ${
-		active
-			? "border-primary bg-primary text-white"
-			: "border-border bg-bg text-front hover:border-primary"
-	}`;
 
 const attentionLabel = (attention: ResidentAttention): string => {
 	if (attention === "needs-user") {
@@ -65,13 +50,9 @@ export const RoomsWorld = (): ReactElement => {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const worldRef = useRef<GameWorld | null>(null);
 	const [ready, setReady] = useState(false);
-	const [roomKey, setRoomKey] = useState(WORLD_ROOM_KEY);
 	const [fixtureScenario, setFixtureScenario] =
 		useState<WorldFixtureScenario>("normal-workday");
-	const [selectedPlaceId, setSelectedPlaceId] = useState("main-square");
-	const [viewMode, setViewMode] = useState<"projection" | "renderer-demo">(
-		"projection"
-	);
+	const [selectedPlaceId, setSelectedPlaceId] = useState("workshop");
 
 	const fixture = useMemo(
 		() => getFixtureForScenario(fixtureScenario),
@@ -93,7 +74,10 @@ export const RoomsWorld = (): ReactElement => {
 		if (!container) {
 			return;
 		}
-		const world = new GameWorld();
+		const world = new GameWorld({
+			initialRoomKey: "workshop",
+			roomRegistry: WDW_ROOM_REGISTRY,
+		});
 		worldRef.current = world;
 		let disposed = false;
 
@@ -102,15 +86,11 @@ export const RoomsWorld = (): ReactElement => {
 				world.destroy();
 				return;
 			}
-			world.setChangeListener(() => {
-				setRoomKey(world.currentRoomKey);
-			});
 			setReady(true);
 		});
 
 		return (): void => {
 			disposed = true;
-			world.setChangeListener(null);
 			world.destroy();
 			worldRef.current = null;
 		};
@@ -128,8 +108,6 @@ export const RoomsWorld = (): ReactElement => {
 		for (const command of rendererCommands) {
 			world.updateAgentState(command.resident.agentId, command.state);
 		}
-		setRoomKey(rendererRoomKey);
-		setViewMode("projection");
 	}, [ready, rendererCommands, selectedPlaceId]);
 
 	const handleFixtureChange = (event: ChangeEvent<HTMLSelectElement>): void => {
@@ -140,23 +118,7 @@ export const RoomsWorld = (): ReactElement => {
 		setSelectedPlaceId(event.target.value);
 	};
 
-	const handleRoom = (key: string): void => {
-		const world = worldRef.current;
-		if (!world) {
-			return;
-		}
-		world.setRoom(key);
-		world.spawnAgents(populationFor(key));
-		world.setAutonomous(true);
-		setRoomKey(key);
-		setViewMode("renderer-demo");
-	};
-
-	const activeRoom = ROOM_REGISTRY.find((entry) => entry.key === roomKey);
 	const projectedRoomKey = getRendererRoomKey(selectedPlaceId);
-	const projectedRoom = ROOM_REGISTRY.find(
-		(entry) => entry.key === projectedRoomKey
-	);
 
 	return (
 		<div className="fixed inset-0 overflow-hidden bg-black">
@@ -170,7 +132,7 @@ export const RoomsWorld = (): ReactElement => {
 			<div className="pointer-events-none absolute left-3 top-3 z-10 max-w-sm rounded-xl border border-border bg-surface/80 px-4 py-3 shadow-xl backdrop-blur-md">
 				<h1 className="text-lg font-semibold text-front">World View</h1>
 				<p className="mt-1 text-xs leading-relaxed text-muted">
-					Semantic fixture projection over the retained five-room renderer.
+					A native view of the Workshop, Lab, and Outside.
 				</p>
 			</div>
 
@@ -181,7 +143,7 @@ export const RoomsWorld = (): ReactElement => {
 				>
 					<div>
 						<h2 className="text-xs font-semibold uppercase tracking-wide text-muted">
-							Semantic fixture (development only)
+							Deterministic fixture state (development only)
 						</h2>
 						<p className="mt-1 text-[11px] leading-relaxed text-muted">
 							No backend or network data is used on this page.
@@ -191,7 +153,7 @@ export const RoomsWorld = (): ReactElement => {
 						className="flex flex-col gap-1 text-xs text-muted"
 						htmlFor="fixture-selector"
 					>
-						Scenario
+						Fixture state
 						<select
 							className="rounded-md border border-border bg-surface px-2 py-2 text-sm text-front"
 							data-testid="fixture-selector"
@@ -232,15 +194,13 @@ export const RoomsWorld = (): ReactElement => {
 						</select>
 					</label>
 					<p className="text-xs text-front" data-testid="active-place">
-						{selectedPlace?.name ?? "Unknown place"} →{" "}
-						{projectedRoom?.name ?? "Unavailable"}
+						{selectedPlace?.name ?? "Unknown place"}
 					</p>
 					<p
 						className="text-[11px] text-muted"
 						data-testid="active-renderer-room"
 					>
-						Renderer room: {projectedRoomKey ?? "unmapped"} ·{" "}
-						{viewMode === "projection" ? "projection active" : "demo active"}
+						Renderer room: {projectedRoomKey ?? "unmapped"} · native WDW room
 					</p>
 
 					<div className="flex flex-col gap-2" data-testid="resident-statuses">
@@ -273,31 +233,6 @@ export const RoomsWorld = (): ReactElement => {
 							))
 						)}
 					</div>
-				</section>
-
-				<section className="flex flex-col gap-2 rounded-lg border border-border bg-bg/60 p-3">
-					<h2 className="text-xs font-semibold uppercase tracking-wide text-muted">
-						Renderer rooms (demo)
-					</h2>
-					<div className="grid grid-cols-2 gap-2">
-						{ROOM_REGISTRY.map((entry) => (
-							<button
-								key={entry.key}
-								aria-pressed={entry.key === roomKey}
-								className={toggleClass(entry.key === roomKey)}
-								data-testid="renderer-room-button"
-								type="button"
-								onClick={() => {
-									handleRoom(entry.key);
-								}}
-							>
-								{entry.name}
-							</button>
-						))}
-					</div>
-					<p className="text-[11px] leading-relaxed text-muted">
-						{activeRoom?.description}
-					</p>
 				</section>
 			</aside>
 		</div>

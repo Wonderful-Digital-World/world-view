@@ -187,6 +187,12 @@ export interface AgentSummary {
 	label: string;
 }
 
+export interface GameWorldOptions {
+	fillMode?: "contain" | "cover";
+	initialRoomKey?: string;
+	roomRegistry?: ReadonlyArray<RoomEntry>;
+}
+
 export class GameWorld {
 	private app: Application | null = null;
 	private factory: TextureFactory | null = null;
@@ -199,7 +205,8 @@ export class GameWorld {
 	private readonly selectionRing = new Graphics();
 
 	private room: BaseRoom | null = null;
-	private roomKey = ROOM_REGISTRY[0]!.key;
+	private roomKey: string;
+	private readonly roomRegistry: ReadonlyArray<RoomEntry>;
 	private readonly agents = new Map<string, Agent>();
 	private readonly bubbles = new Map<string, ChatBubble>();
 	private readonly wanderTimers = new Map<string, number>();
@@ -221,7 +228,15 @@ export class GameWorld {
 	// "cover" fills the viewport, cropping the overflow (the home banner strip).
 	private readonly fillMode: "contain" | "cover";
 
-	public constructor(options: { fillMode?: "contain" | "cover" } = {}) {
+	public constructor(options: GameWorldOptions = {}) {
+		this.roomRegistry = options.roomRegistry ?? ROOM_REGISTRY;
+		if (this.roomRegistry.length === 0) {
+			throw new Error("GameWorld requires at least one room");
+		}
+		this.roomKey = options.initialRoomKey ?? this.roomRegistry[0]!.key;
+		if (!this.roomRegistry.some((entry) => entry.key === this.roomKey)) {
+			throw new Error(`Unknown initial room key: ${this.roomKey}`);
+		}
 		this.fillMode = options.fillMode ?? "contain";
 	}
 
@@ -322,7 +337,7 @@ export class GameWorld {
 	// ---- Room management ----------------------------------------------------
 
 	public get rooms(): ReadonlyArray<RoomEntry> {
-		return ROOM_REGISTRY;
+		return this.roomRegistry;
 	}
 
 	public get currentRoomKey(): string {
@@ -330,10 +345,13 @@ export class GameWorld {
 	}
 
 	public setRoom(key: string): void {
-		const entry = ROOM_REGISTRY.find((candidate) => candidate.key === key);
+		const entry = this.roomRegistry.find((candidate) => candidate.key === key);
+		if (!entry) {
+			throw new Error(`Unknown room key: "${key}"`);
+		}
 		const factory = this.factory;
 		const app = this.app;
-		if (!entry || !factory || !app) {
+		if (!factory || !app) {
 			return;
 		}
 		this.clearAgents();

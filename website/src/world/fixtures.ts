@@ -4,24 +4,21 @@ const GENERATED_AT = "2026-08-12T09:00:00.000Z";
 
 export const WORLD_PLACES: WorldFixture["places"] = [
 	{
-		description: "The shared gathering point for messages and coordination.",
-		id: "main-square",
-		name: "Main Square",
-	},
-	{
-		description: "A focused workspace for building and reviewing work.",
+		description:
+			"The shared building workspace where Bridget and Banjo spend a normal workday.",
 		id: "workshop",
 		name: "Workshop",
 	},
 	{
-		description: "A practice space for coaching and structured review.",
-		id: "coachs-gym",
-		name: "Coach’s Gym",
+		description:
+			"The research and review space where Coach and Mini Me spend a normal workday.",
+		id: "lab",
+		name: "Lab",
 	},
 	{
-		description: "A quieter personal space for Mini Me.",
-		id: "mini-mes-place",
-		name: "Mini Me’s Place",
+		description: "The outdoor commons connecting the building's rooms.",
+		id: "outside",
+		name: "Outside",
 	},
 ];
 
@@ -31,7 +28,7 @@ const baseResidents: WorldFixture["residents"] = [
 		agentId: "bridget",
 		attention: "none",
 		displayName: "Bridget",
-		placeId: "main-square",
+		placeId: "workshop",
 		summary: "Keeping the group in sync.",
 	},
 	{
@@ -47,16 +44,16 @@ const baseResidents: WorldFixture["residents"] = [
 		agentId: "coach",
 		attention: "none",
 		displayName: "Coach",
-		placeId: "coachs-gym",
+		placeId: "lab",
 		summary: "Reviewing the latest practice notes.",
 	},
 	{
-		activity: "idle",
+		activity: "working",
 		agentId: "mini-me",
 		attention: "none",
 		displayName: "Mini Me",
-		placeId: "mini-mes-place",
-		summary: "Taking a quiet break.",
+		placeId: "lab",
+		summary: "Building alongside Coach in the lab.",
 	},
 ];
 

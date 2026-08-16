@@ -10,10 +10,9 @@ import type {
 } from "./types";
 
 export const PLACE_ROOM_MAP: Readonly<Record<string, RendererRoomKey>> = {
-	"coachs-gym": "court",
-	"main-square": "outside",
-	"mini-mes-place": "home",
-	workshop: "office",
+	lab: "lab",
+	outside: "outside",
+	workshop: "workshop",
 };
 
 export interface ResidentVisualIdentity {

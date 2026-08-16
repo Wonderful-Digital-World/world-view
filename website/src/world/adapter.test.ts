@@ -11,11 +11,11 @@ import { getWorldFixture } from "./fixtures";
 import type { ResidentActivity } from "./types";
 
 describe("world fixture adapter", (): void => {
-	it("maps semantic places to the existing renderer rooms", (): void => {
-		expect(getRendererRoomKey("main-square")).toBe("outside");
-		expect(getRendererRoomKey("workshop")).toBe("office");
-		expect(getRendererRoomKey("coachs-gym")).toBe("court");
-		expect(getRendererRoomKey("mini-mes-place")).toBe("home");
+	it("maps native WDW places directly to renderer rooms", (): void => {
+		expect(getRendererRoomKey("workshop")).toBe("workshop");
+		expect(getRendererRoomKey("lab")).toBe("lab");
+		expect(getRendererRoomKey("outside")).toBe("outside");
+		expect(getRendererRoomKey("main-square")).toBeNull();
 	});
 
 	it("fails safely for an unknown semantic place", (): void => {
@@ -53,8 +53,16 @@ describe("world fixture adapter", (): void => {
 		const coach = fixture.residents.find(
 			(resident) => resident.agentId === "coach"
 		);
+		const miniMe = fixture.residents.find(
+			(resident) => resident.agentId === "mini-me"
+		);
 
-		if (bridget === undefined || banjo === undefined || coach === undefined) {
+		if (
+			bridget === undefined ||
+			banjo === undefined ||
+			coach === undefined ||
+			miniMe === undefined
+		) {
 			throw new Error("Expected all named fixture residents.");
 		}
 
@@ -65,6 +73,10 @@ describe("world fixture adapter", (): void => {
 		expect(getResidentVisualIdentity(banjo).tint).not.toBe(
 			getResidentVisualIdentity(coach).tint
 		);
+		expect(getResidentVisualIdentity(miniMe)).toMatchObject({
+			label: "Mini Me",
+			tint: 0xa78bfa,
+		});
 	});
 
 	it("keeps coordinates in the adapter rather than semantic fixtures", (): void => {
@@ -72,7 +84,9 @@ describe("world fixture adapter", (): void => {
 		const banjo = fixture.residents.find(
 			(resident) => resident.agentId === "banjo"
 		);
-		const command = createRendererCommands(fixture, "workshop")[0];
+		const command = createRendererCommands(fixture, "workshop").find(
+			({ resident }) => resident.agentId === "banjo"
+		);
 
 		if (banjo === undefined || command === undefined) {
 			throw new Error("Expected Banjo and a Workshop renderer command.");
@@ -90,7 +104,9 @@ describe("world fixture adapter", (): void => {
 		const bridget = fixture.residents.find(
 			(resident) => resident.agentId === "bridget"
 		);
-		const command = createRendererCommands(fixture, "main-square")[0];
+		const command = createRendererCommands(fixture, "workshop").find(
+			({ resident }) => resident.agentId === "bridget"
+		);
 
 		expect(bridget?.attention).toBe("needs-user");
 		expect(command?.resident.attention).toBe("needs-user");

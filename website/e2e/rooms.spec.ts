@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("renders all five rooms without external requests", async ({
+test("renders the three native WDW rooms without external requests", async ({
 	page,
 }): Promise<void> => {
 	const externalRequests: Array<string> = [];
@@ -18,15 +18,17 @@ test("renders all five rooms without external requests", async ({
 	await expect(page.getByRole("heading", { name: "World View" })).toBeVisible();
 	await expect(page.locator("canvas")).toBeVisible();
 
-	const roomButtons = page.getByTestId("renderer-room-button");
+	const placeSelector = page.getByTestId("place-selector");
 
-	await expect(roomButtons).toHaveCount(5);
+	await expect(placeSelector.locator("option")).toHaveText([
+		"Workshop",
+		"Lab",
+		"Outside",
+	]);
 
-	for (let index = 0; index < 5; index += 1) {
-		const roomButton = roomButtons.nth(index);
-
-		await roomButton.click();
-		await expect(roomButton).toHaveAttribute("aria-pressed", "true");
+	for (const room of ["workshop", "lab", "outside"]) {
+		await placeSelector.selectOption(room);
+		await expect(page.getByTestId("active-renderer-room")).toContainText(room);
 	}
 
 	expect(externalRequests).toEqual([]);
@@ -56,25 +58,27 @@ test("projects fixtures into mapped rooms and preserves attention state", async 
 	);
 
 	await placeSelector.selectOption("workshop");
-	await expect(page.getByTestId("active-place")).toHaveText(
-		"Workshop → Office"
-	);
+	await expect(page.getByTestId("active-place")).toHaveText("Workshop");
 	await expect(page.getByTestId("active-renderer-room")).toContainText(
-		"office"
+		"workshop"
 	);
+	await expect(page.getByTestId("resident-card-bridget")).toBeVisible();
 	await expect(page.getByTestId("resident-card-banjo")).toContainText(
 		"working"
 	);
 	await page.screenshot({
 		fullPage: true,
-		path: "test-results/wp3-normal-workday-workshop.png",
+		path: test.info().outputPath("wp3-normal-workday-workshop.png"),
 	});
+	await placeSelector.selectOption("lab");
+	await expect(page.getByTestId("resident-card-coach")).toBeVisible();
+	await expect(page.getByTestId("resident-card-mini-me")).toBeVisible();
 
 	await fixtureSelector.selectOption("needs-haley");
 	await expect(page.getByTestId("fixture-description")).toContainText(
 		"Needs Haley"
 	);
-	await placeSelector.selectOption("main-square");
+	await placeSelector.selectOption("workshop");
 	await expect(page.getByTestId("resident-card-bridget")).toContainText(
 		"Needs user"
 	);
@@ -95,7 +99,7 @@ test("projects fixtures into mapped rooms and preserves attention state", async 
 	);
 	await page.screenshot({
 		fullPage: true,
-		path: "test-results/wp3-blocked-workshop.png",
+		path: test.info().outputPath("wp3-blocked-workshop.png"),
 	});
 
 	expect(externalRequests).toEqual([]);

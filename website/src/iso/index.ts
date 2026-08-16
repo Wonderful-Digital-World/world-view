@@ -1,7 +1,7 @@
 /** Public surface of the isometric agent world engine. */
 
 export { GameWorld } from "./GameWorld";
-export type { AgentSummary } from "./GameWorld";
+export type { AgentSummary, GameWorldOptions } from "./GameWorld";
 export { BaseRoom } from "./BaseRoom";
 export {
 	ROOM_REGISTRY,
