@@ -1,6 +1,6 @@
 /** Public surface of the isometric agent world engine. */
 
-export { GameWorld } from "./GameWorld";
+export { GameWorld, MAX_ZOOM, MIN_ZOOM, ZOOM_STEP } from "./GameWorld";
 export type { AgentSummary, GameWorldOptions } from "./GameWorld";
 export { BaseRoom } from "./BaseRoom";
 export {

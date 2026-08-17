@@ -4,6 +4,7 @@ test("renders the three native WDW rooms without external requests", async ({
 	page,
 }): Promise<void> => {
 	const externalRequests: Array<string> = [];
+	const consoleErrors: Array<string> = [];
 
 	page.on("request", (request): void => {
 		const url = new URL(request.url());
@@ -11,6 +12,14 @@ test("renders the three native WDW rooms without external requests", async ({
 		if (!["127.0.0.1", "localhost"].includes(url.hostname)) {
 			externalRequests.push(request.url());
 		}
+	});
+	page.on("console", (message): void => {
+		if (message.type() === "error") {
+			consoleErrors.push(message.text());
+		}
+	});
+	page.on("pageerror", (error): void => {
+		consoleErrors.push(error.message);
 	});
 
 	await page.goto("/rooms");
@@ -25,13 +34,29 @@ test("renders the three native WDW rooms without external requests", async ({
 		"Lab",
 		"Outside",
 	]);
+	await expect(page.getByTestId("zoom-slider")).toHaveValue("1.5");
 
-	for (const room of ["workshop", "lab", "outside"]) {
+	await page.getByTestId("zoom-in").click();
+	await expect(page.getByTestId("zoom-slider")).toHaveValue("1.75");
+	await page.getByTestId("zoom-out").click();
+	await expect(page.getByTestId("zoom-slider")).toHaveValue("1.5");
+	await page.getByTestId("zoom-slider").fill("2");
+	await expect(page.getByTestId("zoom-slider")).toHaveValue("2");
+	await page.getByTestId("zoom-fit").click();
+	await expect(page.getByTestId("zoom-slider")).toHaveValue("1.5");
+
+	for (const [room, expectedZoom] of [
+		["workshop", "1.5"],
+		["lab", "1.5"],
+		["outside", "1"],
+	] as const) {
 		await placeSelector.selectOption(room);
 		await expect(page.getByTestId("active-renderer-room")).toContainText(room);
+		await expect(page.getByTestId("zoom-slider")).toHaveValue(expectedZoom);
 	}
 
 	expect(externalRequests).toEqual([]);
+	expect(consoleErrors).toEqual([]);
 });
 
 test("projects fixtures into mapped rooms and preserves attention state", async ({
