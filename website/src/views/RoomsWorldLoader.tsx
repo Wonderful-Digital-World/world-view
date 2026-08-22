@@ -11,6 +11,12 @@ const RoomsWorld = dynamic(
 	{ ssr: false }
 );
 
-export const RoomsWorldLoader = (): ReactElement => {
-	return <RoomsWorld />;
+interface RoomsWorldLoaderProps {
+	displayOnly?: boolean;
+}
+
+export const RoomsWorldLoader = ({
+	displayOnly = false,
+}: RoomsWorldLoaderProps): ReactElement => {
+	return <RoomsWorld displayOnly={displayOnly} />;
 };

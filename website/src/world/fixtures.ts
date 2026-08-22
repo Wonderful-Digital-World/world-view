@@ -24,7 +24,7 @@ export const WORLD_PLACES: WorldFixture["places"] = [
 
 const baseResidents: WorldFixture["residents"] = [
 	{
-		activity: "communicating",
+		activity: "working",
 		agentId: "bridget",
 		attention: "none",
 		displayName: "Bridget",
@@ -40,7 +40,7 @@ const baseResidents: WorldFixture["residents"] = [
 		summary: "Making progress on a small task.",
 	},
 	{
-		activity: "reviewing",
+		activity: "thinking",
 		agentId: "coach",
 		attention: "none",
 		displayName: "Coach",
@@ -79,16 +79,15 @@ export const WORLD_FIXTURES: Readonly<
 		"Blocked",
 		"A focused workday with one resident blocked on a decision.",
 		baseResidents.map((resident) => {
-			if (resident.agentId === "banjo") {
+			if (resident.agentId === "banjo")
 				return {
 					...resident,
+					activity: "blocked",
 					attention: "blocked",
 					summary: "Waiting for a decision before continuing.",
 				};
-			}
-			if (resident.agentId === "bridget") {
+			if (resident.agentId === "bridget")
 				return { ...resident, activity: "waiting", attention: "info" };
-			}
 			return { ...resident, attention: "none" };
 		})
 	),
@@ -97,19 +96,17 @@ export const WORLD_FIXTURES: Readonly<
 		"Needs Haley",
 		"A workday with a resident explicitly asking for Haley’s attention.",
 		baseResidents.map((resident) => {
-			if (resident.agentId === "bridget") {
+			if (resident.agentId === "bridget")
 				return {
 					...resident,
+					activity: "needs_human",
 					attention: "needs-user",
 					summary: "Needs Haley to confirm the next step.",
 				};
-			}
-			if (resident.agentId === "banjo") {
+			if (resident.agentId === "banjo")
 				return { ...resident, attention: "none" };
-			}
-			if (resident.agentId === "mini-me") {
+			if (resident.agentId === "mini-me")
 				return { ...resident, attention: "info" };
-			}
 			return { ...resident, attention: "none" };
 		})
 	),
@@ -124,13 +121,11 @@ export const WORLD_FIXTURES: Readonly<
 		"Quiet",
 		"A low-activity snapshot where the group is mostly offline or resting.",
 		baseResidents.map((resident) => {
-			if (resident.agentId === "bridget") {
+			if (resident.agentId === "bridget")
 				return { ...resident, activity: "idle" };
-			}
-			if (resident.agentId === "banjo" || resident.agentId === "coach") {
+			if (resident.agentId === "banjo" || resident.agentId === "coach")
 				return { ...resident, activity: "offline", attention: "none" };
-			}
-			return { ...resident, attention: "none" };
+			return { ...resident, activity: "idle", attention: "none" };
 		})
 	),
 };

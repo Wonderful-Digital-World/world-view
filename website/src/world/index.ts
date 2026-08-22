@@ -9,6 +9,7 @@ export {
 	type ResidentVisualIdentity,
 } from "./adapter";
 export { getWorldFixture, WORLD_FIXTURES, WORLD_PLACES } from "./fixtures";
+export { parseRuntimeOverview } from "./runtime";
 export {
 	resolveRendererPlacement,
 	type RendererPlacement,

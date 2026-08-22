@@ -21,6 +21,13 @@ test("renders the three native WDW rooms without external requests", async ({
 	page.on("pageerror", (error): void => {
 		consoleErrors.push(error.message);
 	});
+	await page.route("**/api/runtime-overview", async (route): Promise<void> => {
+		await route.fulfill({
+			status: 200,
+			contentType: "application/json",
+			body: JSON.stringify({}),
+		});
+	});
 
 	await page.goto("/rooms");
 	await expect(page).toHaveTitle("World View");
@@ -59,10 +66,38 @@ test("renders the three native WDW rooms without external requests", async ({
 	expect(consoleErrors).toEqual([]);
 });
 
+test("strips diagnostic controls from the embedded display", async ({
+	page,
+}): Promise<void> => {
+	await page.route("**/api/runtime-overview", async (route): Promise<void> => {
+		await route.fulfill({
+			status: 200,
+			contentType: "application/json",
+			body: JSON.stringify({}),
+		});
+	});
+	await page.goto("/rooms?mode=display");
+
+	await expect(page.locator("canvas")).toBeVisible();
+	await expect(page.getByRole("heading", { name: "World View" })).toHaveCount(
+		0
+	);
+	await expect(page.getByTestId("fixture-panel")).toHaveCount(0);
+	await expect(page.getByTestId("renderer-room-button")).toHaveCount(0);
+});
+
 test("projects fixtures into mapped rooms and preserves attention state", async ({
 	page,
 }): Promise<void> => {
 	const externalRequests: Array<string> = [];
+
+	await page.route("**/api/runtime-overview", async (route): Promise<void> => {
+		await route.fulfill({
+			status: 200,
+			contentType: "application/json",
+			body: JSON.stringify({}),
+		});
+	});
 
 	page.on("request", (request): void => {
 		const url = new URL(request.url());

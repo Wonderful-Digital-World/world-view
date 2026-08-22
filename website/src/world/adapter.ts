@@ -6,6 +6,7 @@ import type {
 	ResidentActivity,
 	ResidentProjection,
 	WorldFixture,
+	WorldProjection,
 	WorldFixtureScenario,
 } from "./types";
 
@@ -77,12 +78,8 @@ export const getRendererRoomKey = (placeId: string): RendererRoomKey | null =>
 export const activityToRendererAction = (
 	activity: ResidentActivity
 ): AgentAction => {
-	if (activity === "working") {
-		return "sitting";
-	}
-	if (activity === "reviewing") {
-		return "inspecting";
-	}
+	if (activity === "working") return "sitting";
+	if (activity === "thinking" || activity === "reviewing") return "inspecting";
 	return "idle";
 };
 
@@ -92,15 +89,13 @@ export const getResidentVisualIdentity = (
 	RESIDENT_IDENTITIES[resident.agentId] ?? fallbackIdentityFor(resident);
 
 export const createRendererCommands = (
-	fixture: WorldFixture,
+	projection: WorldProjection,
 	placeId: string
 ): Array<RendererResidentCommand> => {
 	const roomKey = getRendererRoomKey(placeId);
-	if (roomKey === null) {
-		return [];
-	}
+	if (roomKey === null) return [];
 
-	return fixture.residents
+	return projection.residents
 		.filter((resident) => resident.placeId === placeId)
 		.map((resident, index) => {
 			const identity = getResidentVisualIdentity(resident);

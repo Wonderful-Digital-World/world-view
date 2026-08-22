@@ -5,9 +5,13 @@
 export type ResidentActivity =
 	| "idle"
 	| "working"
+	| "thinking"
 	| "waiting"
 	| "reviewing"
 	| "communicating"
+	| "blocked"
+	| "needs_human"
+	| "error"
 	| "offline";
 
 export type ResidentAttention = "none" | "info" | "needs-user" | "blocked";

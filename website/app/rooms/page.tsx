@@ -9,6 +9,14 @@ export const metadata: Metadata = {
 	description: "A state-driven 2D isometric world rendered with PixiJS.",
 };
 
-export default function RoomsPage(): React.ReactElement {
-	return <RoomsWorldLoader />;
+interface RoomsPageProps {
+	searchParams: Promise<{ mode?: string | Array<string> }>;
+}
+
+export default async function RoomsPage({
+	searchParams,
+}: RoomsPageProps): Promise<React.ReactElement> {
+	const { mode } = await searchParams;
+	const selectedMode = Array.isArray(mode) ? mode[0] : mode;
+	return <RoomsWorldLoader displayOnly={selectedMode === "display"} />;
 }
