@@ -6,6 +6,16 @@ immediately; the public API returns only the newest verified eligible snapshot.
 The Rooms page fetches that aggregate data at runtime and retains its local
 privacy-safe fixture if the service is unavailable.
 
+This stream is an authorized public projection, not canonical WDW state. It is
+deliberately replaceable and can lag or omit information. An absent resident,
+place, or activity therefore means only that the eligible view does not show
+it; it does not establish absence in the world. World View owns presentation
+and public-safe adaptation, not residents, domains, work routing, or evidence.
+
+Eligible snapshots can support a bounded recent-activity overview using
+coarse place, work-state, and freshness cues. The website treats those fields
+as display inputs and does not promote them into authoritative records.
+
 ## Data flow
 
 1. Private WDW refresh completes.

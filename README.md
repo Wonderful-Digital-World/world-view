@@ -2,6 +2,12 @@
 
 World View is the standalone isometric world viewer extracted from the [tiny.place](https://github.com/tinyhumansai/tiny.place) renderer for [Wonderful Digital World](https://github.com/Wonderful-Digital-World/wonderful-digital-world).
 
+It is an authorized, noncanonical, and replaceable projection of selected WDW
+state. The view may lag, omit details, or be unavailable; absence from World
+View is not evidence that something is absent from the world. World View owns
+presentation, layout, and public-safe adaptation. It does not own residents,
+domain state, work routing, or durable evidence.
+
 The website retains the PixiJS renderer, its state-control APIs, and all five upstream rooms:
 
 - Poker
@@ -9,6 +15,19 @@ The website retains the PixiJS renderer, its state-control APIs, and all five up
 - Office
 - Home
 - Outside
+
+The renderer, geometry, pathfinding, and inherited art are the tiny.place
+foundation. The WDW adaptation adds its own place registry, projection policy,
+view models, privacy delay, and fallback behavior rather than redefining the
+upstream rooms.
+
+## Recent activity
+
+The Rooms experience can present a bounded overview of recent resident
+activity—such as a public-safe place, work state, and freshness indication—from
+an eligible WDW projection. These are visualization cues, not authoritative
+resident or work records. A quiet or missing view leaves the underlying world
+state unknown.
 
 ## Run locally
 
