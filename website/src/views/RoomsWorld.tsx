@@ -9,6 +9,7 @@ import {
 	useState,
 } from "react";
 
+import { PublicProjectionPanel } from "@src/components/PublicProjectionPanel";
 import { GameWorld, MAX_ZOOM, MIN_ZOOM, ZOOM_STEP } from "@src/iso";
 import {
 	createRendererCommands,
@@ -206,6 +207,21 @@ export const RoomsWorld = ({
 	};
 
 	const projectedRoomKey = getRendererRoomKey(activePlaceId);
+	const fixturePublicFallback = useMemo(
+		() => ({
+			active: fixture.residents.filter(
+				(resident) =>
+					resident.activity !== "idle" && resident.activity !== "offline"
+			).length,
+			needsAttention: fixture.residents.filter(
+				(resident) =>
+					resident.attention === "blocked" ||
+					resident.attention === "needs-user"
+			).length,
+			total: fixture.residents.length,
+		}),
+		[fixture]
+	);
 
 	return (
 		<div className="fixed inset-0 overflow-hidden bg-black">
@@ -274,6 +290,7 @@ export const RoomsWorld = ({
 					</div>
 
 					<aside className="absolute right-3 top-3 z-10 flex w-80 max-w-[calc(100%-1.5rem)] flex-col gap-4 overflow-y-auto rounded-xl border border-border bg-surface/80 p-4 shadow-xl backdrop-blur-md">
+						<PublicProjectionPanel fallback={fixturePublicFallback} />
 						<section
 							className="flex flex-col gap-3 rounded-lg border border-border bg-bg/60 p-3"
 							data-testid="fixture-panel"
