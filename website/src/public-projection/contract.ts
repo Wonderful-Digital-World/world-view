@@ -254,7 +254,7 @@ export function parsePublicSnapshot(input: unknown): PublicSnapshot {
 	) {
 		throw new Error("content hash mismatch");
 	}
-  const unsigned: Omit<PublicSnapshot, "snapshotId"> = {
+	const unsigned: Omit<PublicSnapshot, "snapshotId"> = {
 		schema: SNAPSHOT_SCHEMA,
 		generatedAt,
 		eligibleAt,
