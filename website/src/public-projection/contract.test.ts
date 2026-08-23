@@ -30,7 +30,7 @@ function buildSnapshot(generatedAt: string, state = "steady"): PublicSnapshot {
 		Date.parse(generatedAt) + PUBLIC_DELAY_MS
 	).toISOString();
 	const contentHash = sha256(payload);
-	const unsigned = {
+	const unsigned: Omit<PublicSnapshot, "snapshotId"> = {
 		schema: SNAPSHOT_SCHEMA,
 		generatedAt,
 		eligibleAt,

@@ -27,10 +27,14 @@ describe("world fixture adapter", (): void => {
 
 	it("maps every semantic activity to a valid existing renderer action", (): void => {
 		const activities: Record<ResidentActivity, AgentAction> = {
+			blocked: "idle",
 			communicating: "idle",
+			error: "idle",
 			idle: "idle",
+			["needs_human"]: "idle",
 			offline: "idle",
 			reviewing: "inspecting",
+			thinking: "inspecting",
 			waiting: "idle",
 			working: "sitting",
 		};
