@@ -15,6 +15,7 @@ const ACTIVITIES = new Set<ResidentActivity>([
 	"needs_human",
 	"error",
 	"offline",
+	"unavailable",
 ]);
 
 const RESIDENTS = ["bridget", "banjo", "coach", "mini-me"] as const;

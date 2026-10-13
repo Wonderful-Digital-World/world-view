@@ -3,6 +3,7 @@
 import { describe, expect, it } from "vitest";
 
 import { parseRuntimeOverview } from "./runtime";
+import { createRendererCommands } from "./adapter";
 
 const overview = (): Record<string, unknown> => ({
 	generatedAt: "2026-08-21T09:30:00Z",
@@ -36,6 +37,22 @@ const overview = (): Record<string, unknown> => ({
 });
 
 describe("runtime World View adapter", (): void => {
+	it("keeps residents visible when current activity is unavailable", (): void => {
+		const source = overview();
+		source["residents"] = (
+			source["residents"] as Array<Record<string, unknown>>
+		).map((resident) => ({ ...resident, state: "unavailable" }));
+		const projection = parseRuntimeOverview(source);
+		expect(projection.residents).toHaveLength(4);
+		for (const room of ["workshop", "lab"]) {
+			const commands = createRendererCommands(projection, room);
+			expect(commands).toHaveLength(2);
+			expect(
+				new Set(commands.map(({ state }) => `${state.x},${state.y}`)).size
+			).toBe(2);
+			expect(commands.every(({ state }) => state.action === "idle")).toBe(true);
+		}
+	});
 	it("projects the four commissioned residents in canonical order and rooms", (): void => {
 		const projection = parseRuntimeOverview(overview());
 		expect(projection.residents.map((resident) => resident.agentId)).toEqual([

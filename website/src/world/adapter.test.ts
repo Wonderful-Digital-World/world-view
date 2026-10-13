@@ -33,6 +33,7 @@ describe("world fixture adapter", (): void => {
 			idle: "idle",
 			["needs_human"]: "idle",
 			offline: "idle",
+			unavailable: "idle",
 			reviewing: "inspecting",
 			thinking: "inspecting",
 			waiting: "idle",

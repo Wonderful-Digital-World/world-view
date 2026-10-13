@@ -12,7 +12,8 @@ export type ResidentActivity =
 	| "blocked"
 	| "needs_human"
 	| "error"
-	| "offline";
+	| "offline"
+	| "unavailable";
 
 export type ResidentAttention = "none" | "info" | "needs-user" | "blocked";
 
