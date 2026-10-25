@@ -77,3 +77,18 @@ describe("runtime World View adapter", (): void => {
 		expect(() => parseRuntimeOverview(input)).toThrow();
 	});
 });
+
+
+describe("quiet residents", () => {
+	it("shows an expired activity signal as quiet, not offline", () => {
+		const value = overview();
+		(value["residents"] as Array<Record<string, unknown>>)[0] = {
+			display_name: "Coach",
+			resident_id: "coach",
+			state: "offline",
+			status_summary: "Runtime activity signal expired.",
+		};
+		const coach = parseRuntimeOverview(value).residents.find((resident) => resident.agentId === "coach");
+		expect(coach).toMatchObject({ activity: "idle", summary: "Quiet" });
+	});
+});

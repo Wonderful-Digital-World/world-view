@@ -90,7 +90,8 @@ export const getResidentVisualIdentity = (
 
 export const createRendererCommands = (
 	projection: WorldProjection,
-	placeId: string
+	placeId: string,
+	speech: Readonly<Record<string, string>> = {}
 ): Array<RendererResidentCommand> => {
 	const roomKey = getRendererRoomKey(placeId);
 	if (roomKey === null) return [];
@@ -111,8 +112,9 @@ export const createRendererCommands = (
 					action: activityToRendererAction(resident.activity),
 					facing: placement.facing,
 					label: identity.label,
-					say:
-						resident.attention === "needs-user" && resident.summary
+					say: speech[resident.agentId]
+						? { text: speech[resident.agentId] as string }
+						: resident.attention === "needs-user" && resident.summary
 							? { text: resident.summary }
 							: undefined,
 					tint: identity.tint,

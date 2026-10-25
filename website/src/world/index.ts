@@ -9,7 +9,8 @@ export {
 	type ResidentVisualIdentity,
 } from "./adapter";
 export { getWorldFixture, WORLD_FIXTURES, WORLD_PLACES } from "./fixtures";
-export { parseRuntimeOverview } from "./runtime";
+export { parseRuntimeOverview, placeFor } from "./runtime";
+export { type AgentConversation, latestConversations, parseConversation } from "./conversations";
 export {
 	resolveRendererPlacement,
 	type RendererPlacement,

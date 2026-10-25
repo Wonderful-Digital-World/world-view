@@ -20,7 +20,7 @@ const ACTIVITIES = new Set<ResidentActivity>([
 const RESIDENTS = ["bridget", "banjo", "coach", "mini-me"] as const;
 const RESIDENT_SET = new Set<string>(RESIDENTS);
 
-const placeFor = (residentId: string): "workshop" | "lab" =>
+export const placeFor = (residentId: string): "workshop" | "lab" =>
 	residentId === "bridget" || residentId === "banjo" ? "workshop" : "lab";
 
 const attentionFor = (activity: ResidentActivity): ResidentAttention => {
@@ -53,8 +53,10 @@ const toResident = (value: unknown): ResidentProjection | null => {
 	if (!ACTIVITIES.has(activity as ResidentActivity)) {
 		throw new Error(`Runtime overview has invalid activity for ${agentId}.`);
 	}
-	const canonicalActivity = activity as ResidentActivity;
-	const summary = value["status_summary"];
+	// Command Center calls a resident offline after 15 quiet minutes; quiet is not down.
+	const expired = activity === "offline" && value["status_summary"] === "Runtime activity signal expired.";
+	const canonicalActivity = expired ? "idle" : (activity as ResidentActivity);
+	const summary = expired ? "Quiet" : value["status_summary"];
 	return {
 		activity: canonicalActivity,
 		agentId,
