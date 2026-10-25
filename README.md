@@ -21,6 +21,8 @@ foundation. The WDW adaptation adds its own place registry, projection policy,
 view models, privacy delay, and fallback behavior rather than redefining the
 upstream rooms.
 
+![World View: two agents in the Lab; Coach's note to Banjo plays as a speech bubble](docs/images/world-view-rooms.png)
+
 ## What I built on top of tiny.place
 
 Most of this repository's history is the upstream tiny.place project. My work

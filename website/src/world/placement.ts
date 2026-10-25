@@ -15,24 +15,32 @@ export interface RendererPlacement {
 
 type PlacementCandidate = Omit<RendererPlacement, "action">;
 
+// Several quiet residents often share a room; each needs its own tile.
+const INDOOR_IDLE: Array<PlacementCandidate> = [
+	{ facing: "right", x: 6, y: 9 },
+	{ facing: "left", x: 8, y: 9 },
+	{ facing: "right", x: 5, y: 7 },
+	{ facing: "left", x: 9, y: 7 },
+];
+
 const INDOOR_PLACEMENT_CANDIDATES: Partial<
 	Record<ResidentActivity, Array<PlacementCandidate>>
 > = {
-	blocked: [{ facing: "right", x: 6, y: 9 }],
+	blocked: INDOOR_IDLE,
 	communicating: [
 		{ facing: "right", x: 3, y: 8 },
 		{ facing: "left", x: 4, y: 8 },
 	],
-	error: [{ facing: "right", x: 6, y: 9 }],
-	idle: [{ facing: "right", x: 6, y: 9 }],
+	error: INDOOR_IDLE,
+	idle: INDOOR_IDLE,
 	needs_human: [
 		{ facing: "right", x: 3, y: 8 },
 		{ facing: "left", x: 4, y: 8 },
 	],
-	offline: [{ facing: "right", x: 6, y: 9 }],
+	offline: INDOOR_IDLE,
 	reviewing: [{ facing: "left", x: 10, y: 2 }],
 	thinking: [{ facing: "left", x: 10, y: 2 }],
-	waiting: [{ facing: "right", x: 6, y: 9 }],
+	waiting: INDOOR_IDLE,
 	working: [
 		{ facing: "right", x: 2, y: 4 },
 		{ facing: "right", x: 7, y: 4 },
