@@ -184,9 +184,10 @@ jobs:
         working-directory: sdk/rust
 
       - name: Clippy
+        # double_must_use fires inside async_trait's generated code since a newer stable Clippy.
         run: |
-          cargo clippy --all-targets -- -D warnings
-          cargo clippy --all-targets --features cli -- -D warnings
+          cargo clippy --all-targets -- -D warnings -A clippy::double_must_use
+          cargo clippy --all-targets --features cli -- -D warnings -A clippy::double_must_use
         working-directory: sdk/rust
 
       - name: Build
