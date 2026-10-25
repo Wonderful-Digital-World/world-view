@@ -16,6 +16,8 @@ import {
 	getFixtureForScenario,
 	getRendererRoomKey,
 	parseRuntimeOverview,
+	placeFor,
+	type AgentConversation,
 	type ResidentAttention,
 	type WorldProjection,
 	type WorldFixtureScenario,
@@ -85,10 +87,53 @@ export const RoomsWorld = ({
 	const selectedResidents = projection.residents.filter(
 		(resident) => resident.placeId === activePlaceId
 	);
+	const [conversations, setConversations] = useState<Array<AgentConversation>>([]);
+	const [speech, setSpeech] = useState<Record<string, string>>({});
 	const rendererCommands = useMemo(
-		() => createRendererCommands(projection, activePlaceId),
-		[projection, activePlaceId]
+		() => createRendererCommands(projection, activePlaceId, speech),
+		[projection, activePlaceId, speech]
 	);
+
+	// Agent-to-agent messages from the Library, replayed one at a time as speech bubbles.
+	useEffect(() => {
+		let disposed = false;
+		const load = async (): Promise<void> => {
+			try {
+				const response = await fetch("/api/agent-conversations", { cache: "no-store" });
+				const data = (await response.json()) as { conversations?: Array<AgentConversation> };
+				if (!disposed) setConversations(data.conversations ?? []);
+			} catch {
+				if (!disposed) setConversations([]);
+			}
+		};
+		void load();
+		const timer = window.setInterval(() => void load(), 60000);
+		return (): void => {
+			disposed = true;
+			window.clearInterval(timer);
+		};
+	}, []);
+
+	useEffect(() => {
+		if (conversations.length === 0) return;
+		let index = 0;
+		const names = new Map(projection.residents.map((resident) => [resident.agentId, resident.displayName]));
+		const play = (): void => {
+			const item = conversations[index % conversations.length];
+			index += 1;
+			if (!item) return;
+			const to = item.to.map((agent) => names.get(agent) ?? agent).join(", ");
+			setSelectedPlaceId(placeFor(item.from));
+			setSpeech({ [item.from]: `→ ${to}: ${item.excerpt || item.title}` });
+		};
+		play();
+		const timer = window.setInterval(play, 7000);
+		return (): void => {
+			window.clearInterval(timer);
+		};
+		// Replay restarts only when the set of conversations changes.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [conversations]);
 
 	useEffect(() => {
 		const controller = new AbortController();
